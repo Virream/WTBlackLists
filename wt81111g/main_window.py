@@ -620,8 +620,8 @@ class MainWindow(QMainWindow):
                 self.store.remove_at(r)
                 self.table.removeRow(r)
         # 删除对应的证据文件夹(默认勾选)
+        removed_ev = 0
         if del_ev.isChecked():
-            removed_ev = 0
             for e in deleted:
                 pid = (e.player_id or "").strip()
                 eid = (e.entry_id or "").strip()
@@ -634,19 +634,19 @@ class MainWindow(QMainWindow):
                         removed_ev += 1
                 except Exception:  # noqa: BLE001
                     pass
-            if removed_ev:
-                self.statusBar().showMessage(
-                    f"已删除 {len(deleted)} 行及 {removed_ev} 个证据文件夹", 4000
-                )
-                return
-        # 若备注编辑器关联的条目被删除, 清空编辑器
+        # 若备注编辑器关联的条目被删除, 清空编辑器(无论是否删了证据都要清理)
         if self._remark_entry is not None and self._remark_entry in deleted:
             self._remark_entry = None
             self._remark_locked = True
             self.remark_editor.clear()
             self._remark_locked = False
             self._update_remark_counter()
-        self.statusBar().showMessage("已删除勾选条目", 3000)
+        if removed_ev:
+            self.statusBar().showMessage(
+                f"已删除 {len(deleted)} 行及 {removed_ev} 个证据文件夹", 4000
+            )
+        else:
+            self.statusBar().showMessage("已删除勾选条目", 3000)
 
     def _detect_unused_evidence(self) -> None:
         """检测证据目录中没有对应条目的文件夹, 询问是否删除并列出目录。"""
@@ -788,6 +788,8 @@ class MainWindow(QMainWindow):
         self._remark_locked = True
         self.remark_editor.setPlainText(e.remarks)
         self._remark_locked = False
+        # 服务器锁定条目: 备注编辑器同样只读(防止右侧编辑绕过锁定)
+        self.remark_editor.setReadOnly(bool(e.locked) or self._locked)
         self._update_remark_counter()
 
     def _update_remark_counter(self) -> None:
@@ -797,6 +799,8 @@ class MainWindow(QMainWindow):
     def _on_remark_editor_changed(self) -> None:
         if self._remark_locked or self._remark_entry is None:
             return
+        if self._remark_entry.locked:
+            return  # 服务器锁定条目不可编辑(数据层保护, 双保险)
         text = self.remark_editor.toPlainText()
         # 正常输入已被 _RemarkEditor 拦截, 这里兜底处理 undo/redo 等边缘超长
         if len(text) > _REMARK_MAX:
@@ -888,15 +892,23 @@ class MainWindow(QMainWindow):
 
     def _apply_lock_state(self) -> None:
         locked = self._locked
-        for w in self._row_widgets.values():
-            w["nick"].setReadOnly(locked)
-            w["pid"].setReadOnly(locked)
-            w["link"].setReadOnly(locked)
-            w["remark"].setReadOnly(locked)
-            w["combo"].setEnabled(not locked)
-            w["btn"].setEnabled(not locked)
-            w["date"].setEnabled(not locked)
-        self.remark_editor.setReadOnly(locked)
+        # 每行只读 = 全局锁定 或 该条目本身是服务器锁定条目(叠加, 互不覆盖)
+        for e in self.store.entries:
+            w = self._row_widgets.get(id(e))
+            if w is None:
+                continue
+            row_locked = locked or bool(e.locked)
+            w["nick"].setReadOnly(row_locked)
+            w["pid"].setReadOnly(row_locked)
+            w["link"].setReadOnly(row_locked)
+            w["remark"].setReadOnly(row_locked)
+            w["combo"].setEnabled(not row_locked)
+            w["btn"].setEnabled(not row_locked)
+            w["date"].setEnabled(not row_locked)
+        # 备注编辑器只读: 全局锁定, 或当前关联条目是服务器锁定条目
+        editor_locked = locked or bool(self._remark_entry is not None
+                                       and self._remark_entry.locked)
+        self.remark_editor.setReadOnly(editor_locked)
         self._lock_action.setText("🔓 解锁条目" if locked else "🔒 锁定条目")
         self._add_action.setEnabled(not locked)
         self._delete_action.setEnabled(not locked)

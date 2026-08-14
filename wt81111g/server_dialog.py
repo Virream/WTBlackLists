@@ -205,6 +205,8 @@ class ServerSettingsDialog(QDialog):
 
     def _apply_login_result(self, row: int, username: str | None,
                             method: str, params: dict, err: str) -> None:
+        if row < 0 or row >= len(self._settings.audit_servers):
+            return  # 验证期间该服务器已被删除, 忽略结果
         if username:
             s = self._settings.audit_servers[row]
             # 清空旧登录信息后按方式保存
