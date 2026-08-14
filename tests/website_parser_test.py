@@ -6,7 +6,6 @@ import io
 import os
 import sys
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wt81111g.warthunder import _parse_website_nickname
@@ -23,6 +22,7 @@ def check(name: str, cond: bool) -> None:
 
 
 def main() -> int:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # GBK 控制台兼容
     # 查找用户保存的真实页面快照(战争雷霆*.html)
     pages = glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    "战争雷霆*.html"))

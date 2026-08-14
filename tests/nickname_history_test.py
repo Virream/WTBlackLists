@@ -50,7 +50,7 @@ def test_monitor_fresh_only() -> None:
     store.add(BlacklistEntry(player_id="222"))   # 无缓存 → 抓
     cache.set("333", "Nick333", now)            # 有缓存 → 不抓(缓存库而非黑名单条目)
     import wt81111g.monitor as mon
-    mon.fetch_profile_with_status = lambda pid, timeout=8: (f"Nick{pid}", 200)
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (f"Nick{pid}", 200)
     worker = MonitorWorker(store, nickname_cache=cache)
     emitted = []
     worker.profiles_updated.connect(
@@ -84,7 +84,7 @@ def test_cache_survives_entry_delete() -> None:
     store1 = BlacklistStore(os.path.join(tmpdir, "b1.json"))
     store1.add(BlacklistEntry(player_id="999"))
     mon = __import__("wt81111g.monitor", fromlist=["MonitorWorker"])
-    mon.fetch_profile_with_status = lambda pid, timeout=8: (f"Fresh{pid}", 200)
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (f"Fresh{pid}", 200)
     w1 = MonitorWorker(store1, nickname_cache=cache)
     w1._start_prefetch()
     deadline = time.time() + 8
@@ -107,7 +107,7 @@ def test_cache_survives_entry_delete() -> None:
     # 缓存窗口直接读缓存库, 依然能看到该ID的昵称
     from wt81111g.cache_dialog import CacheDialog
     from PyQt6.QtWidgets import QApplication as _QA
-    app = _QA([])
+    app = _QA.instance() or _QA([])  # 复用已有实例, 避免重复创建崩溃
     dlg = CacheDialog(cache)
     dlg.refresh()
     rows = dlg.table.rowCount()
@@ -131,7 +131,7 @@ def test_wtlive_optimization() -> None:
     cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
     store.add(BlacklistEntry(player_id="900"))
     calls = []
-    mon.fetch_profile_with_status = lambda pid, timeout=8: (calls.append(pid) or (None, 404))
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (calls.append(pid) or (None, 404))
     w = MonitorWorker(store, nickname_cache=cache)
     w._start_prefetch()
     deadline = time.time() + 8
@@ -154,7 +154,7 @@ def test_wtlive_optimization() -> None:
     cache2 = NicknameCache(os.path.join(tmpdir, "nc2.json"))
     for pid in ("11", "22", "33", "44"):
         store2.add(BlacklistEntry(player_id=pid))
-    mon.fetch_profile_with_status = lambda pid, timeout=8: (None, 0)  # 网络错误
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (None, 0)  # 网络错误
     w2 = MonitorWorker(store2, nickname_cache=cache2)
     statuses = []
     w2.feed_status.connect(
@@ -176,7 +176,7 @@ def test_wtlive_optimization() -> None:
 
 
 def test_main_window_history_and_reminder() -> None:
-    app = QApplication([])
+    app = QApplication.instance() or QApplication([])  # 复用已有实例
     tmpdir = tempfile.mkdtemp()
     store_path = os.path.join(tmpdir, "blacklist.json")
     win = MainWindow(store_path, start_monitor=False)

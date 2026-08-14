@@ -5,7 +5,6 @@ import io
 import os
 import sys
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import wt81111g.browser_capture as bc
@@ -98,6 +97,7 @@ def test_patchright_launch_fail_fallback_playwright() -> None:
 
 
 def main() -> int:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # GBK 控制台兼容
     test_patchright_success()
     test_patchright_unavailable_fallback_playwright()
     test_playwright_unavailable_fallback_system()

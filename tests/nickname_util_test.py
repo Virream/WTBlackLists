@@ -5,9 +5,7 @@ import io
 import os
 import sys
 
-# 兼容 GBK 控制台: ⋇(U+22C7)等字符无法在 GBK 下打印
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-
+# 兼容 GBK 控制台的重定向放在 main() 入口(见 main), 避免破坏 pytest 捕获
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wt81111g.nickname_util import (
@@ -68,6 +66,7 @@ def test_matches() -> None:
 
 
 def main() -> int:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # GBK 控制台兼容
     test_clean_wtlive()
     test_clean_battle()
     test_variants()
