@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+pip_install.log
+evidences/
+data/
+build/
+dist/
+build_assets/
+logs/
+*.spec
