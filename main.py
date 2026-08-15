@@ -11,6 +11,11 @@ from wt81111g.single_instance import ensure_single_instance
 
 
 def main() -> int:
+    # 应用内浏览器(WebView2)子进程模式: 独立 GUI 循环, 避免与 Qt 冲突
+    if len(sys.argv) >= 4 and sys.argv[1] == "--webview2-capture":
+        from wt81111g.webview2_capture import child_main
+        return child_main(sys.argv[2], sys.argv[3])
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",

@@ -8,9 +8,8 @@ Write-Host "== 1/5 生成图标(app.ico) =="
 & $py "tools\png_to_ico.py"
 
 Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
-# 方案: 真人浏览器兜底(启动系统真实 Edge/Chrome 并读取 DOM), 不依赖
-# playwright/patchright, 无需打包浏览器库(体积大减)。若本机无系统浏览器, 软件
-# 提示用户自行在浏览器中打开官网昵称页。
+# 方案: 真人浏览器兜底(启动系统真实 Edge/Chrome 并读取 DOM) + 应用内
+# WebView2 浏览器(pywebview/pythonnet, 子进程抓取, 通常自动过验证)。
 & $py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -19,6 +18,11 @@ Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
     --name WTBlackList `
     --icon app.ico `
     --add-data "app.ico;." `
+    --collect-all pywebview `
+    --collect-all pythonnet `
+    --collect-all clr_loader `
+    --collect-all bottle `
+    --collect-all proxy_tools `
     --version-file version_info.txt `
     main.py
 

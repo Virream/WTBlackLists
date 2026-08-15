@@ -49,11 +49,16 @@ class BrowserCaptureDialog(QDialog):
 
         row = QHBoxLayout()
         self._open_btn = QPushButton("🌐 打开浏览器并开始检测")
+        self._open_btn.setToolTip("启动本机系统浏览器(Edge/Chrome)手动验证")
         self._open_btn.clicked.connect(self._start)
+        self._wv2_btn = QPushButton("🔷 应用内浏览器")
+        self._wv2_btn.setToolTip("使用应用内 WebView2 浏览器, 通常可自动通过人机验证")
+        self._wv2_btn.clicked.connect(self._start_webview2)
         self._close_btn = QPushButton("取消")
         self._close_btn.clicked.connect(self.reject)
         row.addStretch(1)
         row.addWidget(self._open_btn)
+        row.addWidget(self._wv2_btn)
         row.addWidget(self._close_btn)
         lay.addLayout(row)
 
@@ -64,6 +69,7 @@ class BrowserCaptureDialog(QDialog):
             return
         self._running = True
         self._open_btn.setEnabled(False)
+        self._wv2_btn.setEnabled(False)
         self._open_btn.setText("⏳ 正在检测浏览器页面…")
         self._status.setText(
             "浏览器已打开, 请在浏览器窗口中完成人机验证(若有)。\n"
@@ -75,14 +81,34 @@ class BrowserCaptureDialog(QDialog):
         nick, state = capture_nickname_via_browser(self._player_id)
         self.nickname_captured.emit(self._player_id, nick, state)
 
+    def _start_webview2(self) -> None:
+        """应用内浏览器(WebView2): 子进程抓取, 通常可自动过验证。"""
+        if self._running:
+            return
+        self._running = True
+        self._open_btn.setEnabled(False)
+        self._wv2_btn.setEnabled(False)
+        self._open_btn.setText("⏳ 正在检测…")
+        self._status.setText(
+            "正在启动应用内浏览器(WebView2), 会自动通过验证并抓取昵称…"
+        )
+        threading.Thread(target=self._work_wv2, daemon=True).start()
+
+    def _work_wv2(self) -> None:
+        from .webview2_capture import run_capture
+        nick, state = run_capture(self._player_id)
+        self.nickname_captured.emit(self._player_id, nick, state)
+
     def _on_captured(self, pid: str, nick: object, state: str) -> None:
         self._running = False
+        self._wv2_btn.setEnabled(True)
         if nick:
             self._status.setText(f"✅ 已抓取昵称: {nick}")
             self._open_btn.setText("完成")
             self._open_btn.setEnabled(True)
             self._open_btn.clicked.disconnect()
             self._open_btn.clicked.connect(self.accept)
+            self._wv2_btn.setEnabled(False)
         else:
             self._status.setText(f"❌ {state}")
             self._open_btn.setText("重试")
