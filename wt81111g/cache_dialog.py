@@ -51,7 +51,7 @@ class CacheDialog(QDialog):
             f"· 缓存有效期 {ttl_h} 小时, 失效后进入新对局会自动重新抓取;\n"
             "· 命中缓存不访问 WT Live, 不增加「WT Live 访问(本次)」次数;\n"
             "· 缓存与黑名单条目相互独立, 删除条目后缓存仍保留, 重新添加相同ID也可看到已缓存的昵称;\n"
-            "· 窗口不会自动关闭, 可随时点「刷新」查看最新剩余时间。"
+            "· 窗口不会自动关闭, 每次打开自动刷新, 也可点「刷新」查看最新剩余时间。"
         )
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#8a8a9a;")
@@ -95,6 +95,11 @@ class CacheDialog(QDialog):
             self._settings.auto_browser = bool(checked)
             self._settings.save()
         self.auto_changed.emit(bool(checked))
+        self.refresh()
+
+    def showEvent(self, event) -> None:
+        """每次打开窗口时自动刷新缓存表格, 无需手动点「刷新」。"""
+        super().showEvent(event)
         self.refresh()
 
     def refresh(self) -> None:
