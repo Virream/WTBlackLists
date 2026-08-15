@@ -36,27 +36,20 @@ def _capture_js() -> str:
 def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
     """子进程入口: 运行 pywebview 窗口抓取昵称, 结果写入 outfile。
 
-    hidden=True 时窗口先隐藏(不打断游戏/不抢焦点), 若超过一定时间未自动
-    通过验证(可能需要人工点击), 再显示窗口让用户处理。
+    hidden=True 时窗口全程隐藏(自动模式, 不打断游戏、不抢焦点、不打扰用户);
+    无论是否通过验证都不显示, 结果(成功或超时)写入 outfile, 用户游戏结束后
+    从应用界面状态即可看到结果。
     """
     import webview
 
     url = WEBSITE_USERINFO_TEMPLATE.format(player_id=uid)
     js = _capture_js()
     nickname = ""
-    _shown = [hidden]  # 隐藏模式下是否已转显示
 
     def poll(window) -> None:
         nonlocal nickname
         start = time.time()
         while time.time() - start < _TIMEOUT:
-            # 隐藏模式: 15 秒仍未自动通过验证 → 显示窗口让用户处理
-            if hidden and not _shown[0] and time.time() - start > 15:
-                _shown[0] = True
-                try:
-                    window.show()
-                except Exception:  # noqa: BLE001
-                    pass
             try:
                 res = window.evaluate_js(js)
             except Exception:  # noqa: BLE001
