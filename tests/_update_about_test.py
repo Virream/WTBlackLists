@@ -43,13 +43,21 @@ def main() -> int:
     assert update_check.parse_version("2.0") == (2, 0)
     assert update_check.parse_version("") == ()
 
-    # 3) main_window: 连接检测区控件 + 检查更新按钮 + 代理标示
+    # 3) main_window: 连接检测区控件 + 检查更新按钮 + 代理标示 + 通知栏
     d = tempfile.mkdtemp()
     win = MainWindow(os.path.join(d, "bl.json"), start_monitor=False)
     win.show()
     for attr in ("conn_label", "feed_label", "wtlive_label",
                  "github_label", "proxy_state_label"):
         assert hasattr(win, attr), f"缺少 {attr}"
+    # 通知栏: 🔔 按钮 + 当前活动标签 + 通知记录
+    assert hasattr(win, "_notify_btn") and hasattr(win, "_current_notify")
+    assert win._current_notify.text() == "就绪"
+    win._notify("测试通知 A", "good")
+    assert win._current_notify.text() == "测试通知 A"
+    assert len(win._notifications) == 1
+    win._notify("测试通知 B", "bad")
+    assert len(win._notifications) == 2
     texts = {b.text() for b in win.findChildren(QPushButton)}
     assert "🔄 检查更新" in texts, "缺少检查更新按钮"
     assert win._update_btn is not None and win._update_btn.text() == "🔄 检查更新"

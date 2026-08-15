@@ -56,6 +56,7 @@ from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
 from .nickname_sync_dialog import NicknameSyncDialog
+from .notifications_dialog import NotificationsDialog
 from .proxy_config import get_proxy as _get_proxy, set_proxy as _apply_proxy
 from .proxy_dialog import ProxyDialog
 from .update_check import check_latest as _check_latest, ping as _github_ping
@@ -413,6 +414,28 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
 
         self.setCentralWidget(splitter)
+        # 底部通知栏(左下角): 🔔 通知: 当前活动; 点击 🔔 查看通知记录
+        self._notifications: list[tuple[str, str]] = []
+        sb = self.statusBar()
+        notify_box = QWidget()
+        nl = QHBoxLayout(notify_box)
+        nl.setContentsMargins(0, 0, 0, 0)
+        nl.setSpacing(4)
+        self._notify_btn = QToolButton()
+        self._notify_btn.setText("🔔")
+        self._notify_btn.setAutoRaise(True)
+        self._notify_btn.setToolTip("查看通知记录")
+        self._notify_btn.clicked.connect(self._open_notifications)
+        nl.addWidget(self._notify_btn)
+        nl.addWidget(QLabel("通知:"))
+        self._current_notify = QLabel("就绪")
+        self._current_notify.setStyleSheet("color:#8a8a8a;")
+        self._current_notify.setMinimumWidth(320)
+        self._current_notify.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        nl.addWidget(self._current_notify, 1)
+        sb.addWidget(notify_box, 1)
         self.statusBar().showMessage("就绪")
         self._update_checked.connect(self._on_update_checked)
         self._github_checked.connect(self._on_github_checked)
@@ -1464,6 +1487,8 @@ class MainWindow(QMainWindow):
         self.conn_label.setStyleSheet(
             "font-weight:bold;" + ("color:#27ae60;" if ok else "color:#c0392b;")
         )
+        self._notify("8111 连接状态: " + ("已连接" if ok else "未连接"),
+                     "good" if ok else "bad")
 
     @pyqtSlot()
     def _on_new_battle(self) -> None:
@@ -1507,6 +1532,7 @@ class MainWindow(QMainWindow):
 
     def _start_auto_webview2(self, player_id: str) -> None:
         """后台启动应用内浏览器(隐藏窗口)自动抓取, 不打断游戏。"""
+        self._notify(f"玩家ID '{player_id}' 正从 战雷官网 更新昵称信息(后台自动)…")
         self.statusBar().showMessage(f"正在后台自动获取玩家 {player_id} 昵称…", 4000)
 
         def work() -> None:
@@ -1549,6 +1575,7 @@ class MainWindow(QMainWindow):
         """浏览器兜底抓到昵称 → 替换玩家昵称 + 维护曾用昵称 + 缓存。"""
         nick_str = str(nick) if nick else ""
         if not nick_str:
+            self._notify(f"玩家ID '{player_id}' 昵称抓取失败: {state}", "bad")
             self.statusBar().showMessage(f"玩家ID {player_id} 昵称抓取失败: {state}", 5000)
             return
         from .nickname_util import clean_wtlive_nickname
@@ -1563,6 +1590,7 @@ class MainWindow(QMainWindow):
             self.store.save()
             self._refresh_cache_dialog()
             self._update_nickname_reminder()
+            self._notify(f"玩家ID '{player_id}' 昵称已更新: {nick_clean}", "good")
             self.statusBar().showMessage(f"已通过浏览器更新昵称: {nick_clean}", 5000)
         else:
             self.statusBar().showMessage(f"未找到玩家ID {player_id} 的条目", 5000)
@@ -1584,6 +1612,7 @@ class MainWindow(QMainWindow):
             self.store.save()
             self._refresh_cache_dialog()
             self._update_nickname_reminder()
+        self._notify(f"已从 WTLive/官网 获取 {len(result)} 个黑名单玩家昵称", "good")
         self.statusBar().showMessage(f"已获取 {len(result)} 个黑名单玩家昵称", 4000)
 
     def _update_nickname_reminder(self) -> None:
@@ -1638,9 +1667,11 @@ class MainWindow(QMainWindow):
         if ok:
             self.github_label.setText(f"GitHub 访问: {ms * 1000:.0f}ms")
             self.github_label.setStyleSheet("color:#5ab0ff;")
+            self._notify(f"GitHub 访问: 正常 ({ms * 1000:.0f}ms)", "good")
         else:
             self.github_label.setText("GitHub 访问: 不可达")
             self.github_label.setStyleSheet("color:#e06c75;")
+            self._notify("GitHub 访问: 不可达", "bad")
 
     def _start_update_check(self) -> None:
         """后台检测 GitHub 是否有新版本; 有则按钮加红点。"""
@@ -1663,9 +1694,11 @@ class MainWindow(QMainWindow):
             self._update_btn.setToolTip(
                 f"发现新版本 {info.get('version', '')}, 点击查看更新日志"
             )
+            self._notify(f"发现新版本 {info.get('version', '')}", "good")
             if manual:
                 UpdateDialog(info, self).exec()
         elif manual:
+            self._notify("已是最新版本", "good")
             self.statusBar().showMessage("已是最新版本", 3000)
 
     def _on_update_clicked(self) -> None:
@@ -1678,6 +1711,22 @@ class MainWindow(QMainWindow):
         self._update_manual = True
         self.statusBar().showMessage("正在检查更新…", 2000)
         self._start_update_check()
+
+    def _notify(self, msg: str, level: str = "info") -> None:
+        """记录通知并更新底部通知栏的当前活动显示。"""
+        ts = time.strftime("%H:%M:%S")
+        self._notifications.append((ts, msg))
+        if len(self._notifications) > 500:
+            self._notifications = self._notifications[-500:]
+        self._current_notify.setText(msg)
+        color = {"good": "#27ae60", "warn": "#e67e22",
+                 "bad": "#c0392b"}.get(level, "#8a8a8a")
+        self._current_notify.setStyleSheet(f"color:{color};")
+
+    def _open_notifications(self) -> None:
+        """打开通知记录窗口。"""
+        dlg = NotificationsDialog(list(self._notifications), self)
+        dlg.exec()
 
     def _open_cache(self) -> None:
         dlg = getattr(self, "_cache_dialog", None)
@@ -1702,6 +1751,7 @@ class MainWindow(QMainWindow):
         self.feed_label.setText(f"WT Live 访问: {text}")
         color = {"good": "#27ae60", "warn": "#e67e22", "bad": "#c0392b"}.get(level, "#7f8c8d")
         self.feed_label.setStyleSheet(f"font-weight:bold;color:{color};")
+        self._notify(f"WT Live 连通性检测: {text}", level)
         self.statusBar().showMessage(f"WT Live 连通性检测: {text}", 4000)
 
     @pyqtSlot(int)
@@ -1711,6 +1761,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(int, int)
     def _on_prefetch_progress(self, done: int, total: int) -> None:
         if total > 0:
+            self._notify(f"正在从 WTLive/战雷官网 更新昵称信息; 进度: {done}/{total}")
             self.statusBar().showMessage(f"正在抓取黑名单昵称 {done}/{total}…", 2000)
 
     # ------------------------------------------------------------------
