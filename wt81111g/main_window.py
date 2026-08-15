@@ -56,8 +56,10 @@ from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
 from .nickname_sync_dialog import NicknameSyncDialog
-from .proxy_config import set_proxy as _apply_proxy
+from .proxy_config import get_proxy as _get_proxy, set_proxy as _apply_proxy
 from .proxy_dialog import ProxyDialog
+from .update_check import check_latest as _check_latest, ping as _github_ping
+from .update_dialog import UpdateDialog
 from .overlay import OverlayWindow
 from .overlay_settings_dialog import OverlaySettingsDialog
 from .server_dialog import ServerSettingsDialog
@@ -102,6 +104,9 @@ class MainWindow(QMainWindow):
     # 后台导入/导出完成信号: (stats 或 None, error 字符串)
     _export_finished = pyqtSignal(object, str)
     _import_finished = pyqtSignal(object, str)
+    # 后台检测信号: GitHub 连通性(bool, 耗时秒) / 版本更新检查结果(dict 或 None)
+    _github_checked = pyqtSignal(bool, float)
+    _update_checked = pyqtSignal(object)
 
     def __init__(self, store_path: str | None = None, start_monitor: bool = True,
                  nickname_cache: NicknameCache | None = None):
@@ -124,6 +129,9 @@ class MainWindow(QMainWindow):
         self._overlay = OverlayWindow(self.app_settings.overlay)
         self._overlay_enabled = True
         self._really_quit = False
+        self._update_info: dict | None = None
+        self._update_manual = False
+        self._checking_update = False
         self._locked = False
         self._row_widgets: dict[int, dict] = {}
         self._remark_entry: BlacklistEntry | None = None  # 备注编辑器当前关联的条目
@@ -235,9 +243,52 @@ class MainWindow(QMainWindow):
         g3, g3g = _func_group("界面")
         _fill_grid(g3g, [
             ("⚙ 叠加层设置", "配置叠加层外观与显示文本", self._open_overlay_settings),
+            ("🔄 检查更新", "检测 GitHub 是否有新版本", self._on_update_clicked),
             ("ℹ 关于", "查看版本与使用说明", self._show_about),
         ])
+        self._update_btn = g3g.itemAt(1).widget()
         tf.addLayout(g3)
+
+        tf.addWidget(_vline())
+
+        # 连接检测区: 8111 / WT Live / GitHub 状态与计数器 + 代理标示
+        g4 = QVBoxLayout()
+        g4.setSpacing(4)
+        g4.addWidget(_glabel("连接检测"))
+        self.conn_label = QLabel("8111 连接状态: 未连接")
+        self.conn_label.setStyleSheet("color:#8a8a8a;")
+        g4.addWidget(self.conn_label)
+        self.feed_label = QLabel("WT Live 访问: 未检测")
+        self.feed_label.setWordWrap(True)
+        feed_check_btn = QPushButton("检测")
+        feed_check_btn.setFixedWidth(48)
+        feed_check_btn.setToolTip("手动检测 WT Live 连通性")
+        feed_check_btn.clicked.connect(self._check_feed)
+        feed_row = QWidget()
+        feed_lay = QHBoxLayout(feed_row)
+        feed_lay.setContentsMargins(0, 0, 0, 0)
+        feed_lay.setSpacing(4)
+        feed_lay.addWidget(self.feed_label, 1)
+        feed_lay.addWidget(feed_check_btn)
+        g4.addWidget(feed_row)
+        self.wtlive_label = QLabel("WT Live 访问(本次): 0 次")
+        g4.addWidget(self.wtlive_label)
+        self.github_label = QLabel("GitHub 访问: 未检测")
+        github_check_btn = QPushButton("检测")
+        github_check_btn.setFixedWidth(48)
+        github_check_btn.setToolTip("检测 GitHub API 连通性(共享表/更新)")
+        github_check_btn.clicked.connect(self._check_github)
+        github_row = QWidget()
+        github_lay = QHBoxLayout(github_row)
+        github_lay.setContentsMargins(0, 0, 0, 0)
+        github_lay.setSpacing(4)
+        github_lay.addWidget(self.github_label, 1)
+        github_lay.addWidget(github_check_btn)
+        g4.addWidget(github_row)
+        self.proxy_state_label = QLabel("代理: 未开启")
+        self.proxy_state_label.setStyleSheet("color:#8a8a8a;")
+        g4.addWidget(self.proxy_state_label)
+        tf.addLayout(g4)
 
         tf.addStretch(1)
         ll.addWidget(top_func)
@@ -320,29 +371,12 @@ class MainWindow(QMainWindow):
             "#rightPane { border-left: 1px solid #34445a; padding-left: 8px; }"
         )
         rl = QVBoxLayout(right)
-        self.conn_label = QLabel("8111 连接状态: 未连接")
-        self.feed_label = QLabel("WT Live 访问: 未检测")
-        self.feed_label.setWordWrap(True)
-        feed_check_btn = QPushButton("检测")
-        feed_check_btn.setFixedWidth(56)
-        feed_check_btn.setToolTip("手动检测 WT Live 连通性")
-        feed_check_btn.clicked.connect(self._check_feed)
-        feed_row = QWidget()
-        feed_lay = QHBoxLayout(feed_row)
-        feed_lay.setContentsMargins(0, 0, 0, 0)
-        feed_lay.setSpacing(4)
-        feed_lay.addWidget(self.feed_label, 1)
-        feed_lay.addWidget(feed_check_btn)
-        self.wtlive_label = QLabel("WT Live 访问(本次): 0 次")
         self.battle_label = QLabel("对局状态: 等待检测")
         self.battle_label.setWordWrap(True)
         group = QGroupBox("当前对局已收集昵称")
         gl = QVBoxLayout(group)
         self.nick_list = QListWidget()
         gl.addWidget(self.nick_list)
-        rl.addWidget(self.conn_label)
-        rl.addWidget(feed_row)
-        rl.addWidget(self.wtlive_label)
         rl.addWidget(self.battle_label)
         rl.addWidget(group)
         # 条目备注编辑窗口: 与表格选中条目的备注联动
@@ -380,6 +414,10 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(splitter)
         self.statusBar().showMessage("就绪")
+        self._update_checked.connect(self._on_update_checked)
+        self._github_checked.connect(self._on_github_checked)
+        self._refresh_proxy_state()
+        self._start_update_check()  # 每次启动自动检测 GitHub 是否有新版本
 
     # ------------------------------------------------------------------
     # 表格
@@ -1560,6 +1598,70 @@ class MainWindow(QMainWindow):
         """打开代理设置对话框: 设置后所有网络请求走代理。"""
         dlg = ProxyDialog(self.app_settings, self)
         dlg.exec()
+        self._refresh_proxy_state()
+
+    def _refresh_proxy_state(self) -> None:
+        """刷新全局代理开关标示。"""
+        p = _get_proxy()
+        if p:
+            self.proxy_state_label.setText(f"代理: 已开启 ({p})")
+            self.proxy_state_label.setStyleSheet("color:#5ab0ff;")
+        else:
+            self.proxy_state_label.setText("代理: 未开启")
+            self.proxy_state_label.setStyleSheet("color:#8a8a8a;")
+
+    def _check_github(self) -> None:
+        """检测 GitHub API 连通性(后台线程)。"""
+        def work() -> None:
+            ok, ms = _github_ping()
+            self._github_checked.emit(ok, ms)
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(bool, float)
+    def _on_github_checked(self, ok: bool, ms: float) -> None:
+        if ok:
+            self.github_label.setText(f"GitHub 访问: 正常 ({ms * 1000:.0f}ms)")
+            self.github_label.setStyleSheet("color:#5ab0ff;")
+        else:
+            self.github_label.setText("GitHub 访问: 不可达")
+            self.github_label.setStyleSheet("color:#e06c75;")
+
+    def _start_update_check(self) -> None:
+        """后台检测 GitHub 是否有新版本; 有则按钮加红点。"""
+        if self._checking_update:
+            return
+        self._checking_update = True
+
+        def work() -> None:
+            self._update_checked.emit(_check_latest())
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(object)
+    def _on_update_checked(self, info) -> None:
+        self._checking_update = False
+        manual = self._update_manual
+        self._update_manual = False
+        if info:
+            self._update_info = info
+            self._update_btn.setText("🔴 有新版本")
+            self._update_btn.setToolTip(
+                f"发现新版本 {info.get('version', '')}, 点击查看更新日志"
+            )
+            if manual:
+                UpdateDialog(info, self).exec()
+        elif manual:
+            self.statusBar().showMessage("已是最新版本", 3000)
+
+    def _on_update_clicked(self) -> None:
+        """点击检查更新按钮: 有新版弹更新日志, 否则手动检测一次。"""
+        if self._update_info:
+            UpdateDialog(self._update_info, self).exec()
+            return
+        if self._checking_update:
+            return
+        self._update_manual = True
+        self.statusBar().showMessage("正在检查更新…", 2000)
+        self._start_update_check()
 
     def _open_cache(self) -> None:
         dlg = getattr(self, "_cache_dialog", None)

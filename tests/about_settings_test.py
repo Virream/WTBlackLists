@@ -1,4 +1,4 @@
-"""关于对话框(白字/阴影/分段/客服对话链接) + 客服对话窗口 + first_run + 按钮改名验证。"""
+"""关于对话框(白字/阴影/分段) + first_run + 按钮改名验证。"""
 import os
 import re
 import sys
@@ -7,16 +7,15 @@ import tempfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt6.QtGui import QAction
 from PyQt6.QtWidgets import (
     QApplication,
     QGraphicsDropShadowEffect,
     QLabel,
-    QTextBrowser,
+    QPushButton,
 )
 
 from wt81111g import about_dialog
-from wt81111g.about_dialog import AboutDialog, ConversationDialog, _DESC
+from wt81111g.about_dialog import AboutDialog, _DESC
 from wt81111g.main_window import MainWindow
 from wt81111g.settings import AppSettings
 
@@ -24,47 +23,21 @@ from wt81111g.settings import AppSettings
 def main() -> int:
     app = QApplication([])
 
-    # 1. 关于对话框
+    # 1. 关于对话框(免责声明句保留 + 新说明 + 无客服对话链接)
     dlg = AboutDialog()
     label = dlg.findChildren(QLabel)[0]
     txt = label.text()
     assert "color:#ffffff" in txt, "白字缺失"
     assert "&emsp;&emsp;" in txt, "制表符缩进缺失"
-    assert "点击查看作者与gaijin客服的对话" in txt, "客服对话链接缺失"
-    assert "已向Gaijin客服进行过确认" not in txt, "应已删除该表述"
+    assert "点击查看作者" not in txt, "客服对话链接应已删除"
+    assert "使用本软件造成的任何不良后果均由用户承担" in txt, "免责声明句应保留"
+    assert "8111" in _DESC, "应含我生成的8111说明"
     n_semi = len(re.findall(r"[;；]", _DESC))
     n_paras = txt.count('<p style="margin:4px 0; color:#ffffff;">&emsp;&emsp;')
-    assert n_paras == n_semi + 2, (n_paras, n_semi)  # 分句段数 + 客服对话链接段
+    assert n_paras == n_semi + 1, (n_paras, n_semi)  # 分句段数(无额外链接段)
     effect = label.graphicsEffect()
     assert isinstance(effect, QGraphicsDropShadowEffect), "阴影缺失"
     print(f"about dialog OK: paras={n_paras} shadow={type(effect).__name__}")
-
-    # 2. 客服对话窗口内容
-    cd = ConversationDialog()
-    browser = cd.findChildren(QTextBrowser)[0]
-    plain = browser.toPlainText()
-    assert "尊敬的管理员你好" in plain, "提问缺失"
-    assert "祝您生活愉快" in plain, "提问结尾缺失"
-    assert "Support Specialist" in plain, "客服落款缺失"
-    assert "termsofservice" in plain, "ToS 链接缺失"
-    print("conversation dialog OK")
-
-    # 3. 链接路由: about:conversation -> 打开对话窗口
-    calls = []
-    original = about_dialog.ConversationDialog
-
-    class _FakeDialog:
-        def __init__(self, parent=None):
-            calls.append("open")
-
-        def exec(self):
-            calls.append("exec")
-
-    about_dialog.ConversationDialog = _FakeDialog
-    dlg._on_link("about:conversation")
-    assert calls == ["open", "exec"], calls
-    about_dialog.ConversationDialog = original
-    print("link routing OK")
 
     # 4. first_run 持久化
     td = tempfile.mkdtemp()
@@ -76,11 +49,12 @@ def main() -> int:
     assert s2.first_run is False
     print("first_run persistence OK")
 
-    # 5. 按钮改名
+    # 5. 数据维护区按钮齐全
     win = MainWindow(os.path.join(tempfile.mkdtemp(), "bl.json"), start_monitor=False)
-    actions = win.findChildren(QAction)
-    assert any("刷新ID对应昵称" in a.text() for a in actions), "按钮未改名"
-    print("button renamed OK")
+    texts = {b.text() for b in win.findChildren(QPushButton)}
+    assert "🔁 刷新昵称" in texts, "缺少刷新昵称按钮"
+    assert "🔄 检查更新" in texts, "缺少检查更新按钮"
+    print("buttons OK")
 
     print("ALL TESTS PASSED")
     return 0
