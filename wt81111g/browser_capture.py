@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -43,8 +44,49 @@ def _cdp_pages(port: int) -> list[dict]:
     return []
 
 
+_CHROMIUM_MARKS = ("msedge", "edge", "chrome", "brave", "opera",
+                   "centbrowser", "vivaldi", "chromium")
+
+
+def _is_chromium(path: str) -> bool:
+    """是否 Chromium 系浏览器(支持 Chrome 调试协议 CDP)。"""
+    name = os.path.basename(path or "").lower()
+    return any(m in name for m in _CHROMIUM_MARKS)
+
+
+def _default_browser_path() -> str | None:
+    """解析 Windows 系统默认浏览器 exe 路径(注册表 UserChoice → ProgId → 命令)。"""
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\Shell\Associations"
+                             r"\UrlAssociations\http\UserChoice")
+        try:
+            prog_id, _ = winreg.QueryValueEx(key, "ProgId")
+        finally:
+            winreg.CloseKey(key)
+        key = winreg.OpenKey(winreg.HKEY_CLASSES_ROOT,
+                             r"%s\shell\open\command" % prog_id)
+        try:
+            cmd, _ = winreg.QueryValueEx(key, "")
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return None
+    m = re.search(r'"([^"]+\.exe)"', cmd)
+    if not m:
+        m = re.search(r'([A-Za-z]:[\\/][^"]*?\.exe)', cmd)
+    return m.group(1) if m else None
+
+
 def _find_browser_candidates() -> list[str]:
-    """返回按优先级排列的可用浏览器列表(Edge 优先, 其次 Chrome)。"""
+    """返回按优先级排列的可用浏览器: 系统默认浏览器(Chromium 系)优先, 其次 Edge/Chrome。"""
+    out: list[str] = []
+    default = _default_browser_path()
+    if default and _is_chromium(default) and os.path.isfile(default):
+        out.append(default)
     edge = [
         os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
         os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
@@ -55,12 +97,22 @@ def _find_browser_candidates() -> list[str]:
         os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
         os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
     ]
-    out = [c for c in edge + chrome if c and os.path.isfile(c)]
+    for c in edge + chrome:
+        if c and os.path.isfile(c):
+            out.append(c)
     for name in ("msedge", "chrome"):
         w = shutil.which(name)
-        if w and w not in out:
+        if w and os.path.isfile(w):
             out.append(w)
-    return out
+    # 去重(保留第一次出现的顺序)
+    seen: set[str] = set()
+    dedup: list[str] = []
+    for c in out:
+        key = c.lower()
+        if key not in seen:
+            seen.add(key)
+            dedup.append(c)
+    return dedup
 
 
 def capture_nickname_via_browser(player_id: str,
