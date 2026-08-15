@@ -52,6 +52,8 @@ class AppSettings:
         self.fetch_servers: list[dict] = []
         # 审核服务器: [{"url": ..., "platform": ..., "name": ..., "token": "", "logged_in": False, "username": ""}]
         self.audit_servers: list[dict] = []
+        # 网络同步开关: 抓取到新昵称后是否上传到共享表(需登录 GitHub)
+        self.sync_enabled = False
         existed = os.path.exists(self.path)
         self._load()
         # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换
@@ -88,6 +90,7 @@ class AppSettings:
                 au = data.get("audit_servers")
                 if isinstance(au, list):
                     self.audit_servers = [d for d in au if isinstance(d, dict)]
+                self.sync_enabled = bool(data.get("sync_enabled", False))
         except Exception:  # noqa: BLE001
             pass
 
@@ -98,6 +101,7 @@ class AppSettings:
                 "overlay": asdict(self.overlay),
                 "fetch_servers": self.fetch_servers,
                 "audit_servers": self.audit_servers,
+                "sync_enabled": self.sync_enabled,
             }
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

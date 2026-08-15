@@ -54,6 +54,7 @@ from .import_export import export_zip, format_size, import_zip
 from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
+from .nickname_sync_dialog import NicknameSyncDialog
 from .overlay import OverlayWindow
 from .overlay_settings_dialog import OverlaySettingsDialog
 from .server_dialog import ServerSettingsDialog
@@ -207,6 +208,10 @@ class MainWindow(QMainWindow):
         _b = QPushButton("🧹 未使用证据检测")
         _b.setToolTip("检测证据目录中没有对应条目的文件夹")
         _b.clicked.connect(self._detect_unused_evidence)
+        g2.addWidget(_b)
+        _b = QPushButton("☁️ 共享昵称表")
+        _b.setToolTip("拉取公开仓库的 nickname.json 合并到本地 / 上传抓取到的昵称(需登录)")
+        _b.clicked.connect(self._open_nickname_sync)
         g2.addWidget(_b)
         tf.addLayout(g2)
 
@@ -1519,6 +1524,11 @@ class MainWindow(QMainWindow):
         else:
             self.reminder_label.clear()
             self.reminder_label.hide()
+
+    def _open_nickname_sync(self) -> None:
+        """打开共享昵称表同步对话框(拉取合并 / 开关 / issue 上传)。"""
+        dlg = NicknameSyncDialog(self.app_settings, self.nickname_cache, self)
+        dlg.exec()
 
     def _open_cache(self) -> None:
         dlg = getattr(self, "_cache_dialog", None)
