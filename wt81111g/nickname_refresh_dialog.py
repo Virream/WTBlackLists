@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import threading
+import time
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
@@ -19,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .browser_capture import capture_nickname_via_browser
+from .monitor import MonitorWorker
 from .webview2_capture import run_capture
 from .warthunder import fetch_profile_best_effort
 
@@ -43,33 +45,48 @@ class NicknameRefreshDialog(QDialog):
         self.setWindowTitle("刷新昵称")
         self.setMinimumSize(680, 500)
 
-        # 统计: 有玩家ID 的条目
-        self._items = [
-            ((e.player_id or "").strip(), (e.nickname or "").strip())
-            for e in store.entries if (e.player_id or "").strip()
-        ]
+        # 统计: 有玩家ID 且 24h 内未抓取过的条目(移除未超过24h的ID, 减少重复抓取)
+        now = time.time()
+        ttl = MonitorWorker.PROFILE_FETCH_TTL
+        self._items: list[tuple[str, str, float]] = []
+        self._skipped = 0
+        for e in store.entries:
+            pid = (e.player_id or "").strip()
+            if not pid:
+                continue
+            fetched_at = float(getattr(e, "fetched_at", 0) or 0)
+            if fetched_at and (now - fetched_at) < ttl:
+                self._skipped += 1  # 24h 内已抓取 → 跳过
+                continue
+            self._items.append((pid, (e.nickname or "").strip(), fetched_at))
 
         lay = QVBoxLayout(self)
+        skip_note = (f"(已跳过 {self._skipped} 个 24h 内已抓取的)"
+                     if self._skipped else "")
         head = QLabel(
-            f"共 {len(self._items)} 个条目将逐一更新昵称:\n"
+            f"共 {len(self._items)} 个条目需要更新昵称{skip_note}:\n"
             "先通过 WTLive/战雷官网 获取, 失败后按下方选择走浏览器兜底。"
         )
         head.setWordWrap(True)
         lay.addWidget(head)
 
-        self._table = QTableWidget(len(self._items), 3)
-        self._table.setHorizontalHeaderLabels(["玩家ID", "当前昵称", "状态"])
+        self._table = QTableWidget(len(self._items), 4)
+        self._table.setHorizontalHeaderLabels(
+            ["玩家ID", "当前昵称", "剩余有效时间", "状态"]
+        )
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.verticalHeader().setVisible(False)
         header = self._table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        for c in (0, 2, 3):
+            header.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        for i, (pid, nick) in enumerate(self._items):
+        for i, (pid, nick, fetched_at) in enumerate(self._items):
             self._table.setItem(i, 0, QTableWidgetItem(pid))
             self._table.setItem(i, 1, QTableWidgetItem(nick))
-            self._table.setItem(i, 2, QTableWidgetItem(_STATUS_PENDING))
+            self._table.setItem(i, 2,
+                                QTableWidgetItem(self._fmt_remaining(fetched_at)))
+            self._table.setItem(i, 3, QTableWidgetItem(_STATUS_PENDING))
         lay.addWidget(self._table, 1)
 
         # ---- 选项区 ----
@@ -111,6 +128,18 @@ class NicknameRefreshDialog(QDialog):
         self.progress_updated.connect(self._on_progress)
         self.finished.connect(self._on_finished)
 
+    @staticmethod
+    def _fmt_remaining(fetched_at: float) -> str:
+        """返回距离 24h 缓存过期的剩余时间描述(与昵称缓存窗口一致)。"""
+        if not fetched_at:
+            return "未抓取过"
+        remaining = MonitorWorker.PROFILE_FETCH_TTL - (time.time() - fetched_at)
+        if remaining <= 0:
+            return "已过期"
+        h = int(remaining // 3600)
+        m = int((remaining % 3600) // 60)
+        return f"{h}小时{m}分"
+
     def _on_auto_toggled(self, checked: bool) -> None:
         if self._settings is not None:
             self._settings.auto_browser = bool(checked)
@@ -130,7 +159,7 @@ class NicknameRefreshDialog(QDialog):
     def _work(self) -> None:
         ok = 0
         total = len(self._items)
-        for i, (pid, _nick) in enumerate(self._items):
+        for i, (pid, _nick, _fetched_at) in enumerate(self._items):
             self.status_updated.emit(i, _STATUS_FETCHING)
             nick, status = fetch_profile_best_effort(pid)
             if nick:

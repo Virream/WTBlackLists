@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -37,10 +38,19 @@ def main() -> int:
     win._make_row(e2)
 
     dlg = NicknameRefreshDialog(win.store, win.nickname_cache, win.app_settings, win)
-    # 1) 统计只含"有玩家ID"的条目
+    # 1) 统计只含"有玩家ID"且24h内未抓取过的条目
     assert len(dlg._items) == 1, dlg._items
     assert dlg._items[0][0] == "1001"
     assert dlg._table.rowCount() == 1
+    assert dlg._table.columnCount() == 4, "应有4列(对齐缓存窗口)"
+
+    # 1.5) 24h 内已抓取的 ID 应被跳过
+    e1.fetched_at = time.time() - 3600  # 1小时前抓过
+    dlg2 = NicknameRefreshDialog(win.store, win.nickname_cache, win.app_settings, win)
+    assert len(dlg2._items) == 0, "24h内已抓取应被跳过"
+    assert dlg2._skipped == 1, dlg2._skipped
+    dlg2.close()
+    e1.fetched_at = 0.0
 
     # 2) 勾选框: 读 settings + 勾选写回(可在此取消)
     assert dlg._auto_check.isChecked() is False
