@@ -79,6 +79,9 @@ class MonitorWorker(QObject):
         self.auto_update = True  # 是否自动更新24h过期的昵称(缓存窗口'自动更新'控制, 默认开启)
         self._wtlive_count = 0
         self._count_lock = threading.Lock()
+        # 跟踪后台 daemon 线程(prefetch/feed_check), 退出时 join 避免对象销毁后仍 emit
+        self._bg_threads: list[threading.Thread] = []
+        self._bg_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     def stop(self) -> None:
@@ -255,7 +258,7 @@ class MonitorWorker(QObject):
                 now = time.time()
                 # 只处理真正需要抓取的 ID(缓存未命中/过期)
                 pending: list[str] = []
-                for e in list(self.store.entries):
+                for e in self.store.snapshot():
                     pid = (e.player_id or "").strip()
                     if pid and self._needs_fetch(pid, now):
                         pending.append(pid)
@@ -281,6 +284,8 @@ class MonitorWorker(QObject):
                     nick, status = fetch_profile_best_effort(pid)
                     fetched_at = time.time()
                     self._bump_wtlive_count()  # 实际访问了一次 WT Live 玩家页
+                    if self._stop.is_set():
+                        return  # 退出中, 不再 emit(避免对象销毁后崩溃)
                     with lock:
                         if nick:
                             self._profile_cache[pid] = (nick, fetched_at)
@@ -311,7 +316,7 @@ class MonitorWorker(QObject):
                                 # WTLive 与官网都 404 → 提示用户用浏览器手动兜底
                                 self._manual_asked.add(pid)
                                 nick_manual = next(
-                                    (e.nickname for e in self.store.entries
+                                    (e.nickname for e in self.store.snapshot()
                                      if (e.player_id or "").strip() == pid), ""
                                 )
                                 self.nickname_manual_needed.emit(pid, nick_manual)
@@ -364,7 +369,22 @@ class MonitorWorker(QObject):
             finally:
                 self._prefetch_running = False
 
-        threading.Thread(target=work, daemon=True).start()
+        t = threading.Thread(target=work, daemon=True)
+        self._track_bg(t)
+        t.start()
+
+    def _track_bg(self, t: threading.Thread) -> None:
+        with self._bg_lock:
+            self._bg_threads.append(t)
+
+    def join_background(self, timeout: float = 2.0) -> None:
+        """退出前等待后台 daemon 线程结束, 避免其仍 emit 已销毁对象而崩溃。"""
+        with self._bg_lock:
+            threads = list(self._bg_threads)
+        for t in threads:
+            t.join(timeout)
+        with self._bg_lock:
+            self._bg_threads = [t for t in threads if t.is_alive()]
 
     # ------------------------------------------------------------------
     # WT Live 连通性检测(仅由用户点击"检测"触发一次)
@@ -376,6 +396,8 @@ class MonitorWorker(QObject):
 
         def work() -> None:
             ok, sec = check_feed_latency()
+            if self._stop.is_set():
+                return  # 退出中, 不再 emit
             self._bump_wtlive_count()  # 访问了一次 WT Live 首页
             if not ok:
                 level, text = "bad", "不可达"
@@ -388,13 +410,15 @@ class MonitorWorker(QObject):
             log.info("feed latency: %s %s", level, text)
             self.feed_status.emit(level, text)
 
-        threading.Thread(target=work, daemon=True).start()
+        t = threading.Thread(target=work, daemon=True)
+        self._track_bg(t)
+        t.start()
 
     def _compare(self) -> None:
         """把当前对局已收集昵称与黑名单昵称做比对,命中则告警。"""
         if not self._collected:
             return
-        for e in list(self.store.entries):
+        for e in self.store.snapshot():
             pid = (e.player_id or "").strip()
             key = pid or (e.nickname or "").strip()
             if not key or key in self._alerted:

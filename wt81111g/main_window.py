@@ -120,6 +120,8 @@ class MainWindow(QMainWindow):
     _update_checked = pyqtSignal(object)
     # 自动浏览器抓取完成: (player_id, nickname 或 None, 状态)
     _auto_capture_done = pyqtSignal(str, object, str)
+    # 上传后重新拉取服务器条目完成: (all_entries, errors) 回主线程合并(避免 UI 冻结)
+    _refetch_done = pyqtSignal(list, list)
 
     def __init__(self, store_path: str | None = None, start_monitor: bool = True,
                  nickname_cache: NicknameCache | None = None):
@@ -156,6 +158,7 @@ class MainWindow(QMainWindow):
         self._active_review: tuple[str, str] | None = None  # (待审核仓库URL, 条目ID) 正在审核的一条
         self._export_finished.connect(self._on_export_done)
         self._import_finished.connect(self._on_import_done)
+        self._refetch_done.connect(self._on_refetch_done)
         self._build_ui()
         self._reload_table()
         self._setup_tray()
@@ -1505,20 +1508,34 @@ class MainWindow(QMainWindow):
         self._complete_active_review()
 
     def _refetch_after_upload(self, result: dict) -> None:
-        """上传成功后, 从上传目标服务器重新拉取, 把刚上传的条目作为锁定条目追加。"""
+        """上传成功后, 后台从服务器重新拉取, 完成后再回主线程合并(避免阻塞 UI)。"""
         servers = result.get("servers", [])
         if not servers:
             return
-        # 拉取(不弹窗, 静默合并)
-        all_entries: list[dict] = []
-        errors: list[str] = []
-        for s in servers:
-            try:
-                from .server_sync import fetch_entries
-                all_entries.extend(fetch_entries(s.get("url", "")))
-            except Exception as exc:  # noqa: BLE001
-                errors.append(str(exc))
+        urls = [str(s.get("url") or "") for s in servers if s.get("url")]
+        if not urls:
+            return
+
+        def work() -> None:
+            all_entries: list[dict] = []
+            errors: list[str] = []
+            for u in urls:
+                try:
+                    from .server_sync import fetch_entries
+                    all_entries.extend(fetch_entries(u))
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"{u}: {exc}")
+            self._refetch_done.emit(all_entries, errors)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(list, list)
+    def _on_refetch_done(self, all_entries: list, errors: list) -> None:
+        """后台拉取完成 → 主线程合并追加为锁定条目(不阻塞 UI)。"""
         if not all_entries:
+            if errors:
+                self.statusBar().showMessage(
+                    f"上传后重新拉取失败: {'; '.join(errors)}", 5000)
             return
         added = 0
         for rd in all_entries:
@@ -1539,6 +1556,9 @@ class MainWindow(QMainWindow):
             self._reload_table()
             self._audit_panel._refresh_auditors()
             self.statusBar().showMessage(f"已从服务器追加 {added} 条审核条目", 5000)
+        elif errors:
+            self.statusBar().showMessage(
+                f"上传后重新拉取: 无新条目({'；'.join(errors)})", 5000)
 
     def _on_delete_done(self, result: object) -> None:
         self._set_io_busy("audit", False)
@@ -1993,6 +2013,8 @@ class MainWindow(QMainWindow):
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(5000)
+        if self._worker is not None:
+            self._worker.join_background(3.0)  # 等后台抓取线程结束, 避免销毁后仍 emit
         try:
             self._overlay.close()
         except Exception:  # noqa: BLE001

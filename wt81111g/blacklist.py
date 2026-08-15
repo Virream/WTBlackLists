@@ -128,6 +128,18 @@ class BlacklistStore:
             self.entries.append(entry)
             self.save()
 
+    def append(self, entry: BlacklistEntry, save: bool = True) -> None:
+        """线程安全追加; save=False 时不落盘(由调用方稍后统一 save, 供批量导入)。"""
+        with self._lock:
+            self.entries.append(entry)
+            if save:
+                self.save()
+
+    def snapshot(self) -> list[BlacklistEntry]:
+        """返回条目列表的线程安全快照副本(后台线程读取时避免 size 变化异常)。"""
+        with self._lock:
+            return list(self.entries)
+
     def remove_at(self, index: int) -> None:
         with self._lock:
             if 0 <= index < len(self.entries):

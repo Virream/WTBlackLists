@@ -266,7 +266,7 @@ def import_zip(zip_path: str, store: BlacklistStore, mode: str = "append",
             if pid and pid not in existing_pids:
                 new_ids += 1
                 existing_pids.add(pid)
-        store.entries.append(e)
+        store.append(e, save=False)
         imported += 1
         done += 1
         if progress_callback:
