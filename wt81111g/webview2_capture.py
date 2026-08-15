@@ -33,6 +33,29 @@ def _capture_js() -> str:
     )
 
 
+# 页面顶部悬浮工具条: 显示当前连接地址 + 刷新按钮(幂等, 已存在则不重复注入)
+_BAR_JS = (
+    "(() => {"
+    " if (document.getElementById('wtbl-bar')) return;"
+    " var bar = document.createElement('div');"
+    " bar.id = 'wtbl-bar';"
+    " bar.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:999999;'"
+    "  + 'background:rgba(20,20,40,0.92);color:#fff;font:12px \\'Microsoft YaHei\\',sans-serif;'"
+    "  + 'padding:4px 8px;display:flex;align-items:center;gap:6px;';"
+    " var url = document.createElement('span');"
+    " url.style.cssText = 'flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';"
+    " url.textContent = location.href;"
+    " var btn = document.createElement('button');"
+    " btn.textContent = '\\u27F3 刷新';"
+    " btn.style.cssText = 'background:#1a6fb0;color:#fff;border:none;border-radius:4px;'"
+    "  + 'padding:2px 12px;cursor:pointer;';"
+    " btn.onclick = function(){ location.reload(); };"
+    " bar.appendChild(url); bar.appendChild(btn);"
+    " if (document.body) { document.body.prepend(bar); }"
+    "})()"
+)
+
+
 def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
     """子进程入口: 运行 pywebview 窗口抓取昵称, 结果写入 outfile。
 
@@ -56,6 +79,12 @@ def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
         nonlocal nickname
         start = time.time()
         while not closed.is_set() and time.time() - start < _TIMEOUT:
+            # 非隐藏模式: 注入页面顶部悬浮工具条(地址栏 + 刷新按钮, 幂等)
+            if not hidden:
+                try:
+                    window.evaluate_js(_BAR_JS)
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 res = window.evaluate_js(js)
             except Exception:  # noqa: BLE001
@@ -69,7 +98,7 @@ def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
         except Exception:  # noqa: BLE001
             pass
 
-    def on_ready() -> None:
+    def on_ready(_window) -> None:
         # GUI 事件循环启动后, 在后台线程轮询, 避免阻塞窗口关闭事件
         threading.Thread(target=poll_worker, daemon=True).start()
 
