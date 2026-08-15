@@ -39,32 +39,48 @@ def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
     hidden=True 时窗口全程隐藏(自动模式, 不打断游戏、不抢焦点、不打扰用户);
     无论是否通过验证都不显示, 结果(成功或超时)写入 outfile, 用户游戏结束后
     从应用界面状态即可看到结果。
+
+    轮询在独立线程进行(不阻塞 GUI 事件循环), 并监听窗口关闭事件——
+    用户主动关闭浏览器窗口时立即结束并写出结果, 主进程不会长时间卡住。
     """
+    import threading
+
     import webview
 
     url = WEBSITE_USERINFO_TEMPLATE.format(player_id=uid)
     js = _capture_js()
     nickname = ""
+    closed = threading.Event()
 
-    def poll(window) -> None:
+    def poll_worker() -> None:
         nonlocal nickname
         start = time.time()
-        while time.time() - start < _TIMEOUT:
+        while not closed.is_set() and time.time() - start < _TIMEOUT:
             try:
                 res = window.evaluate_js(js)
             except Exception:  # noqa: BLE001
                 res = None
             if res:
                 nickname = str(res)
-                window.destroy()
-                return
+                break
             time.sleep(1)
-        window.destroy()
+        try:
+            window.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_ready() -> None:
+        # GUI 事件循环启动后, 在后台线程轮询, 避免阻塞窗口关闭事件
+        threading.Thread(target=poll_worker, daemon=True).start()
+
+    def on_closed() -> None:
+        closed.set()
 
     window = webview.create_window(
         _WINDOW_TITLE, url, width=1100, height=850, hidden=hidden,
     )
-    webview.start(poll, window)
+    window.events.closed += on_closed
+    webview.start(on_ready, window)
 
     try:
         with open(outfile, "w", encoding="utf-8") as f:
