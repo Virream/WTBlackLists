@@ -20,6 +20,7 @@ import time
 import requests
 
 from .config import WEBSITE_USERINFO_TEMPLATE
+from .proxy_config import proxies as _proxies
 
 _NICK_SELECTOR = "li.user-profile__data-nick"
 
@@ -88,14 +89,8 @@ def capture_nickname_via_browser(player_id: str,
     return None, last_err or "浏览器抓取失败"
 
 
-def _capture_with_browser(browser: str, url: str, player_id: str) -> tuple[str | None, str]:
-    """用系统真实浏览器启动并轮询抓取昵称(真人验证兜底)。
-
-    注意: 不添加 --disable-blink-features=AutomationControlled 等隐藏自动化特征
-    参数, 保持浏览器真实原样——验证完全交给真实浏览器环境与用户。
-    """
-    port = _pick_free_port()
-    user_data = tempfile.mkdtemp(prefix="wtbl_capture_")
+def _build_browser_args(browser: str, port: int, user_data: str, url: str) -> list:
+    """构造浏览器启动参数; 软件设置了代理时, 浏览器也通过该代理转发流量。"""
     args = [
         browser,
         "--remote-debugging-port=%d" % port,
@@ -105,6 +100,22 @@ def _capture_with_browser(browser: str, url: str, player_id: str) -> tuple[str |
         "--new-window",
         url,
     ]
+    p = _proxies()
+    if p:
+        # Chrome/Edge: --proxy-server 统一代理(取 http 形式, 无 scheme 已自动补 http://)
+        args.insert(-1, "--proxy-server=%s" % p["http"])
+    return args
+
+
+def _capture_with_browser(browser: str, url: str, player_id: str) -> tuple[str | None, str]:
+    """用系统真实浏览器启动并轮询抓取昵称(真人验证兜底)。
+
+    注意: 不添加 --disable-blink-features=AutomationControlled 等隐藏自动化特征
+    参数, 保持浏览器真实原样——验证完全交给真实浏览器环境与用户。
+    """
+    port = _pick_free_port()
+    user_data = tempfile.mkdtemp(prefix="wtbl_capture_")
+    args = _build_browser_args(browser, port, user_data, url)
     proc = None
     try:
         try:
