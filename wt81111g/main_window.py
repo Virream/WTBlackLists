@@ -436,7 +436,6 @@ class MainWindow(QMainWindow):
         )
         nl.addWidget(self._current_notify, 1)
         sb.addWidget(notify_box, 1)
-        self.statusBar().showMessage("就绪")
         self._update_checked.connect(self._on_update_checked)
         self._github_checked.connect(self._on_github_checked)
         self._auto_capture_done.connect(self._on_browser_nickname_captured)
