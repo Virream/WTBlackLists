@@ -37,21 +37,23 @@ class AuditPanel(QGroupBox):
         row0.addWidget(self._auditor_combo, 1)
         lay.addLayout(row0)
 
-        # 上传 / 删除 / 拉取审核
-        row1 = QHBoxLayout()
-        self._upload_btn = QPushButton("⬆ 上传到服务器")
-        self._upload_btn.clicked.connect(self._upload_checked)
-        self._delete_btn = QPushButton("⬇ 从服务器中删除")
-        self._delete_btn.clicked.connect(self._delete_checked)
+        # 拉取审核请求(放在上传/删除上方)
         self._pull_review_btn = QPushButton("📥 拉取审核请求")
         self._pull_review_btn.setToolTip(
             "从待审核队列拉取 1 条(自动标记为正在审核, 防止多人拉同一条);\n"
             "一次只能审核一条, 审核完上传后自动移除待审核请求"
         )
         self._pull_review_btn.clicked.connect(self._pull_review)
+        lay.addWidget(self._pull_review_btn)
+
+        # 上传 / 删除
+        row1 = QHBoxLayout()
+        self._upload_btn = QPushButton("⬆ 上传到服务器")
+        self._upload_btn.clicked.connect(self._upload_checked)
+        self._delete_btn = QPushButton("⬇ 从服务器中删除")
+        self._delete_btn.clicked.connect(self._delete_checked)
         row1.addWidget(self._upload_btn)
         row1.addWidget(self._delete_btn)
-        row1.addWidget(self._pull_review_btn)
         lay.addLayout(row1)
 
         hint = QLabel(
