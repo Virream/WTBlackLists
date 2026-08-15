@@ -36,6 +36,10 @@ class OverlaySettings:
         return (r, g, b, self.bg_alpha)
 
 
+# 官方默认共享仓库(黑名单共享 + 审核 + nickname.json 共享表)
+DEFAULT_REPO = "https://github.com/Virream/WTBlackLists.git"
+
+
 class AppSettings:
     """保存/读取应用设置(保存到 data/config.json)。"""
 
@@ -48,7 +52,22 @@ class AppSettings:
         self.fetch_servers: list[dict] = []
         # 审核服务器: [{"url": ..., "platform": ..., "name": ..., "token": "", "logged_in": False, "username": ""}]
         self.audit_servers: list[dict] = []
+        existed = os.path.exists(self.path)
         self._load()
+        # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换
+        if not existed:
+            if not self.fetch_servers:
+                self.fetch_servers = [self._default_repo_entry()]
+            if not self.audit_servers:
+                self.audit_servers = [self._default_repo_entry()]
+
+    def _default_repo_entry(self) -> dict:
+        """官方默认仓库条目(黑名单共享/审核 + nickname.json 共享表)。"""
+        return {
+            "url": DEFAULT_REPO,
+            "platform": "github",
+            "name": "官方共享仓库 (Virream/WTBlackLists)",
+        }
 
     def _load(self) -> None:
         try:
