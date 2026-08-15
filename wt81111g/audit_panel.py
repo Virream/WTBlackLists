@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QVBoxLayout, QWidget,
 )
 
-from .server_sync import delete_entries, list_remote_cloud_ids, upload_entries
+from .server_sync import delete_entries, upload_entries
 
 
 class AuditPanel(QGroupBox):

@@ -159,11 +159,3 @@ def submit_issue(repo_url: str, token: str, entries: list[dict]) -> tuple[int, s
         raise ValueError(f"创建 issue 失败 (HTTP {r.status_code}): {r.text[:200]}")
     j = r.json()
     return int(j.get("number") or 0), str(j.get("html_url") or "")
-
-
-def find_github_token(settings) -> str:
-    """从已登录的 GitHub 审核服务器里取第一个 token(用于发 issue)。"""
-    for s in getattr(settings, "audit_servers", []) or []:
-        if s.get("logged_in") and s.get("token"):
-            return str(s.get("token") or "").strip()
-    return ""

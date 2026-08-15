@@ -8,6 +8,8 @@ import random
 import threading
 import time
 
+import requests
+
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
@@ -94,7 +96,15 @@ class MonitorWorker(QObject):
 
     # ------------------------------------------------------------------
     def _tick(self) -> None:
-        connected = self.client.connected()
+        # 用 mission 请求成败判定连通性, 省掉独立的 /state 探测请求(每 tick 少一次请求)
+        try:
+            mission = self.client.mission(raise_on_error=True)
+            connected = True
+        except requests.RequestException:
+            mission, map_info = {}, {}
+            connected = False
+        if connected:
+            map_info = self.client.map_info()
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
@@ -103,9 +113,6 @@ class MonitorWorker(QObject):
                 self._in_battle = False
                 self.battle_ended.emit()
             return
-
-        mission = self.client.mission()
-        map_info = self.client.map_info()
 
         # 是否"在地图中(对局/试车场)":
         # 实测 map_info.json 在地图中返回完整地图几何数据(grid_size/map_max/
@@ -140,7 +147,9 @@ class MonitorWorker(QObject):
             if msgs:
                 max_id = max(int(m.get("id", -1)) for m in msgs)
                 if max_id < self._gamechat_cursor:
-                    self._gamechat_cursor = -1  # 游戏/服务器重启, ID 归零 → 视为新对局
+                    # 游戏/服务器重启, ID 归零 → 从新会话起点收集(不用 -1 哨兵,
+                    # 避免重复收集与 _cursors_init 短暂失效)
+                    self._gamechat_cursor = max_id
             hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
             new_msg = bool(msgs)
             new_dmg = (

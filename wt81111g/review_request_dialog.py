@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QMessageBox,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,

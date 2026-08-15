@@ -52,11 +52,13 @@ class WT8111:
         except requests.RequestException:
             return {}
 
-    def mission(self) -> dict:
+    def mission(self, raise_on_error: bool = False) -> dict:
         try:
             data = self.get("/mission.json")
             return data if isinstance(data, dict) else {}
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return {}
 
     def map_info(self) -> dict:

@@ -396,13 +396,3 @@ def delete_entries(url: str, token: str, cloud_ids: set[str],
             if on_retry:
                 on_retry(retries)
             time.sleep(RETRY_DELAY)
-
-
-def list_remote_cloud_ids(url: str, token: str) -> set[str]:
-    """列出服务器文件里已存在的 cloud_id 集合(用于删除前比对)。"""
-    p = parse_repo_url(url)
-    if not p:
-        return set()
-    plat, owner, repo = p
-    existing, _ = _api_read(plat, owner, repo, token)
-    return {str(e.get("cloud_id") or "").strip() for e in existing if e.get("cloud_id")}

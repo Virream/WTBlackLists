@@ -220,14 +220,14 @@ def _api_write(url: str, token: str, items: list[dict], sha: str | None,
 
 
 def _read_write_with_retry(url: str, token: str, mutate) -> dict | None:
-    """乐观锁读-改-写重试。mutate(items) 返回 (新items, 目标条目或 None)。"""
-    from .server_sync import ConflictError
+    """乐观锁读-改-写重试。mutate(items) 返回 (result, new_items);
+    new_items 为 None 表示无变化不写回。"""
     for attempt in range(MAX_RETRIES + 1):
         items, sha = _api_read(url, token)
         result, new_items = mutate(items)
-        if result is None and new_items is None:
-            # 无变化, 不写回
-            return None
+        if new_items is None:
+            # 无变化, 不写回(避免把 None 写入文件)
+            return result
         try:
             _api_write(url, token, new_items, sha, "审核请求: 更新待审核队列")
             return result

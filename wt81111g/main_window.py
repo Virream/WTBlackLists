@@ -44,7 +44,6 @@ from PyQt6.QtWidgets import (
 from .about_dialog import AboutDialog
 from .audit_panel import AuditPanel
 from .blacklist import DEFAULT_REASON, REASON_CHOICES, BlacklistEntry, BlacklistStore
-from .browser_capture_dialog import BrowserCaptureDialog
 from .cache_dialog import CacheDialog
 from .config import APP_VERSION, evidences_dir, resource_path
 from .datetime_field import DateTimeField
@@ -66,7 +65,6 @@ from .update_dialog import UpdateDialog
 from .overlay import OverlayWindow
 from .overlay_settings_dialog import OverlaySettingsDialog
 from .server_dialog import ServerSettingsDialog
-from .server_sync import merge_entries
 from .sync_dialog import CompareDialog, SyncDialog
 from .settings import AppSettings
 
@@ -577,34 +575,34 @@ class MainWindow(QMainWindow):
             if locked:
                 return
             entry.nickname = text
-            self.store.save()
+            self._schedule_save()  # 防抖: 快速输入不逐键写盘
             self._update_nickname_reminder()
 
         def on_pid(text: str) -> None:
             if locked:
                 return
             entry.player_id = text
-            self._maybe_generate_id(entry)
-            self.store.save()
+            self._maybe_generate_id(entry)  # 首次生成条目ID时内部落盘一次
+            self._schedule_save()  # 防抖保存
 
         def on_link(text: str) -> None:
             if locked:
                 return
             entry.replay_link = text
-            self.store.save()
+            self._schedule_save()  # 防抖保存
 
         def on_date(text: str) -> None:
             if locked:
                 return
             entry.event_date = text
-            self._maybe_generate_id(entry)
-            self.store.save()
+            self._maybe_generate_id(entry)  # 首次生成条目ID时内部落盘一次
+            self._schedule_save()  # 防抖保存
 
         def on_reason(index: int) -> None:
             if locked:
                 return
             entry.reason = REASON_CHOICES[index]
-            self.store.save()
+            self._schedule_save()  # 防抖保存
 
         def on_remark(text: str) -> None:
             if locked:

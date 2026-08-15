@@ -125,7 +125,8 @@ class NicknameSyncDialog(QDialog):
     def _show_status(self, msg: str) -> None:
         self.status.setText(msg)
         self.pull_btn.setEnabled(True)
-        self.upload_btn.setEnabled(True)
+        # 上传按钮状态由所选服务器登录态决定, 避免覆盖禁用状态
+        self._refresh_login_hint()
 
     # ------------------------------------------------------------------
     def _pull(self) -> None:

@@ -243,7 +243,7 @@ class _FakeClient:
     def connected(self):
         return True
 
-    def mission(self):
+    def mission(self, raise_on_error: bool = False):
         return self.missions[min(self.i, len(self.missions) - 1)]
 
     def map_info(self):

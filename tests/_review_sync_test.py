@@ -77,6 +77,11 @@ saved = writes[-1][0]
 assert all(i["id"] != "a1" for i in saved), "应移除该待审核请求"
 assert len(saved) == 1
 
+# complete_review: 条目不存在 → 视为成功且不写回(不得写 None)
+writes.clear()
+assert rs.complete_review("https://github.com/u/r", "tok", "ghost") is True
+assert writes == [], "条目不存在不应写回"
+
 # 空 token 应抛错
 try:
     rs.pull_next_review("https://github.com/u/r", "", "Bob")

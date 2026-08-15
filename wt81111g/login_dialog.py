@@ -1,8 +1,6 @@
 """登录方式选择对话框: Token / 账号密码 / 证书(SSH)。"""
 from __future__ import annotations
 
-import os
-
 from PyQt6.QtWidgets import (
     QButtonGroup, QDialog, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QRadioButton, QStackedWidget, QVBoxLayout, QWidget,

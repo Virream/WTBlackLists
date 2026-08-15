@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QPushButton, QVBoxLayout, QWidget,
