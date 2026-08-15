@@ -36,7 +36,8 @@ class BrowserCaptureDialog(QDialog):
             f"当前昵称: {current_nickname or '(未填写)'}\n\n"
             "该玩家无法通过 WTLive/官网接口直接查询。\n"
             "点击下方按钮打开浏览器, 若页面要求人机验证请手动完成,\n"
-            "软件会自动检测页面加载完成并抓取昵称。"
+            "软件会自动检测页面加载完成并抓取昵称。\n"
+            "卡在人机验证界面通常是网络问题导致, 还请您自行解决。"
         )
         self._info.setWordWrap(True)
         lay.addWidget(self._info)

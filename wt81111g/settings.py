@@ -54,6 +54,8 @@ class AppSettings:
         self.audit_servers: list[dict] = []
         # 网络同步开关: 抓取到新昵称后是否上传到共享表(需登录 GitHub)
         self.sync_enabled = False
+        # 代理: 设置后所有网络请求都走该代理; 空串=直连
+        self.proxy = ""
         existed = os.path.exists(self.path)
         self._load()
         # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换
@@ -91,6 +93,7 @@ class AppSettings:
                 if isinstance(au, list):
                     self.audit_servers = [d for d in au if isinstance(d, dict)]
                 self.sync_enabled = bool(data.get("sync_enabled", False))
+                self.proxy = str(data.get("proxy", "") or "")
         except Exception:  # noqa: BLE001
             pass
 
@@ -102,6 +105,7 @@ class AppSettings:
                 "fetch_servers": self.fetch_servers,
                 "audit_servers": self.audit_servers,
                 "sync_enabled": self.sync_enabled,
+                "proxy": self.proxy,
             }
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -55,6 +56,8 @@ from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
 from .nickname_sync_dialog import NicknameSyncDialog
+from .proxy_config import set_proxy as _apply_proxy
+from .proxy_dialog import ProxyDialog
 from .overlay import OverlayWindow
 from .overlay_settings_dialog import OverlaySettingsDialog
 from .server_dialog import ServerSettingsDialog
@@ -114,6 +117,7 @@ class MainWindow(QMainWindow):
         else:
             self.nickname_cache = NicknameCache()
         self.app_settings = AppSettings()
+        _apply_proxy(self.app_settings.proxy)  # 应用已保存的代理, 所有网络请求走代理
         self._thread: QThread | None = None
         self._worker: MonitorWorker | None = None
         self._id_labels: dict[int, QLabel] = {}  # id(entry) -> 条目ID label
@@ -168,69 +172,71 @@ class MainWindow(QMainWindow):
             v.setStyleSheet("color:#34445a;")
             return v
 
-        # ---- 顶部功能区: 三个分组(用竖分割条分隔) ----
+        # ---- 顶部功能区: 三个分组(用竖分割条分隔, 按钮双排/列优先) ----
         top_func = QWidget()
         tf = QHBoxLayout(top_func)
         tf.setContentsMargins(0, 0, 0, 0)
         tf.setSpacing(12)
 
+        def _func_group(title: str):
+            """创建一个功能区: 顶部标签 + 下方双排按钮网格(列优先, 2行)。"""
+            box = QVBoxLayout()
+            box.setSpacing(2)
+            box.addWidget(_glabel(title))
+            grid = QGridLayout()
+            grid.setSpacing(4)
+            box.addLayout(grid)
+            return box, grid
+
+        def _fill_grid(grid: QGridLayout, buttons: list) -> list:
+            """把按钮按“列优先”填到 2 行网格(先上下排满第一列, 再排第二列)。"""
+            created: list = []
+            col = 0
+            row = 0
+            for text, tip, cb in buttons:
+                b = QPushButton(text)
+                if tip:
+                    b.setToolTip(tip)
+                b.clicked.connect(cb)
+                grid.addWidget(b, row, col)
+                created.append(b)
+                row += 1
+                if row >= 2:
+                    row = 0
+                    col += 1
+            return created
+
         # 左区: 导入导出
-        g1 = QHBoxLayout()
-        g1.setSpacing(6)
-        g1.addWidget(_glabel("导入导出"))
-        self._export_action = QPushButton("📤 导出")
-        self._export_action.setToolTip("导出勾选的条目为文件")
-        self._export_action.clicked.connect(self._export_selected)
-        g1.addWidget(self._export_action)
-        self._import_action = QPushButton("📥 导入")
-        self._import_action.setToolTip("从别人分享的文件导入条目")
-        self._import_action.clicked.connect(self._import_entries)
-        g1.addWidget(self._import_action)
+        g1, g1g = _func_group("导入导出")
+        _made = _fill_grid(g1g, [
+            ("📤 导出", "导出勾选的条目为文件", self._export_selected),
+            ("📥 导入", "从别人分享的文件导入条目", self._import_entries),
+        ])
+        self._export_action, self._import_action = _made
         tf.addLayout(g1)
 
         tf.addWidget(_vline())
 
-        # 中区: 数据维护
-        g2 = QHBoxLayout()
-        g2.setSpacing(6)
-        g2.addWidget(_glabel("数据维护"))
-        _b = QPushButton("🔁 刷新昵称")
-        _b.setToolTip("重新抓取黑名单玩家昵称")
-        _b.clicked.connect(self._manual_check)
-        g2.addWidget(_b)
-        _b = QPushButton("🔄 同步服务器名单")
-        _b.setToolTip("从已配置的服务器下载共享名单并合并到本地")
-        _b.clicked.connect(self._sync_servers)
-        g2.addWidget(_b)
-        _b = QPushButton("🗄 昵称缓存")
-        _b.clicked.connect(self._open_cache)
-        g2.addWidget(_b)
-        _b = QPushButton("🧹 未使用证据检测")
-        _b.setToolTip("检测证据目录中没有对应条目的文件夹")
-        _b.clicked.connect(self._detect_unused_evidence)
-        g2.addWidget(_b)
-        _b = QPushButton("☁️ 共享昵称表")
-        _b.setToolTip("拉取公开仓库的 nickname.json 合并到本地 / 上传抓取到的昵称(需登录)")
-        _b.clicked.connect(self._open_nickname_sync)
-        g2.addWidget(_b)
+        # 中区: 数据维护(按钮顺序: 刷新/同步/缓存/服务器设置/共享表/代理)
+        g2, g2g = _func_group("数据维护")
+        _fill_grid(g2g, [
+            ("🔁 刷新昵称", "重新抓取黑名单玩家昵称", self._manual_check),
+            ("🔄 同步服务器名单", "从已配置的服务器下载共享名单并合并到本地", self._sync_servers),
+            ("🗄 昵称缓存", "查看已抓取的昵称缓存", self._open_cache),
+            ("🌐 服务器设置", "配置名单拉取服务器与审核服务器", self._open_server_settings),
+            ("☁️ 共享昵称表", "拉取公开仓库的 nickname.json 合并到本地 / 上传抓取到的昵称(需登录)", self._open_nickname_sync),
+            ("⚙ 代理设置", "设置代理, 所有网络请求均通过代理发送", self._open_proxy_settings),
+        ])
         tf.addLayout(g2)
 
         tf.addWidget(_vline())
 
         # 右区: 界面
-        g3 = QHBoxLayout()
-        g3.setSpacing(6)
-        g3.addWidget(_glabel("界面"))
-        _b = QPushButton("⚙ 叠加层设置")
-        _b.clicked.connect(self._open_overlay_settings)
-        g3.addWidget(_b)
-        _b = QPushButton("🌐 服务器设置")
-        _b.setToolTip("配置名单拉取服务器与审核服务器")
-        _b.clicked.connect(self._open_server_settings)
-        g3.addWidget(_b)
-        _b = QPushButton("ℹ 关于")
-        _b.clicked.connect(self._show_about)
-        g3.addWidget(_b)
+        g3, g3g = _func_group("界面")
+        _fill_grid(g3g, [
+            ("⚙ 叠加层设置", "配置叠加层外观与显示文本", self._open_overlay_settings),
+            ("ℹ 关于", "查看版本与使用说明", self._show_about),
+        ])
         tf.addLayout(g3)
 
         tf.addStretch(1)
@@ -272,6 +278,10 @@ class MainWindow(QMainWindow):
         tr.addWidget(self._lock_action)
         _b = QPushButton("📁 打开证据根目录")
         _b.clicked.connect(lambda: open_folder(evidences_dir()))
+        tr.addWidget(_b)
+        _b = QPushButton("🧹 未使用证据检测")
+        _b.setToolTip("检测证据目录中没有对应条目的文件夹")
+        _b.clicked.connect(self._detect_unused_evidence)
         tr.addWidget(_b)
         tr.addStretch(1)
         ll.addWidget(table_row)
@@ -1544,6 +1554,11 @@ class MainWindow(QMainWindow):
     def _open_nickname_sync(self) -> None:
         """打开共享昵称表同步对话框(拉取合并 / 开关 / issue 上传)。"""
         dlg = NicknameSyncDialog(self.app_settings, self.nickname_cache, self)
+        dlg.exec()
+
+    def _open_proxy_settings(self) -> None:
+        """打开代理设置对话框: 设置后所有网络请求走代理。"""
+        dlg = ProxyDialog(self.app_settings, self)
         dlg.exec()
 
     def _open_cache(self) -> None:
