@@ -8,9 +8,9 @@ Write-Host "== 1/5 生成图标(app.ico) =="
 & $py "tools\png_to_ico.py"
 
 Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
-# 方案1: patchright 驱动系统真实浏览器(Edge/Chrome), 网络指纹真实, 自动过验证概率最高。
-# 无需打包内置 Chromium(体积大减 ~300MB)。若本机无系统浏览器, 软件自动降级到
-# CDP 方式(仍用系统浏览器)或提示。
+# 方案: 真人浏览器兜底(启动系统真实 Edge/Chrome 并读取 DOM), 不依赖
+# playwright/patchright, 无需打包浏览器库(体积大减)。若本机无系统浏览器, 软件
+# 提示用户自行在浏览器中打开官网昵称页。
 & $py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -19,9 +19,6 @@ Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
     --name WTBlackList `
     --icon app.ico `
     --add-data "app.ico;." `
-    --collect-all playwright `
-    --collect-all patchright `
-    --collect-all greenlet `
     --version-file version_info.txt `
     main.py
 
