@@ -46,6 +46,7 @@ class BlacklistEntry:
     cloud_id: str = ""             # 云端唯一标识(UUID, 上传时生成, 用于跨服务器比对/删除)
     locked: bool = False           # 是否锁定(来自服务器下载的条目, 禁止本地编辑)
     source: str = ""               # 来源标识: "local" 或 "server"
+    review_id: str = ""            # 审核请求条目ID(从待审核队列拉取时记录, 审核完上传后删除待审核请求)
 
     def needs_entry_id(self) -> bool:
         """条目ID需要 玩家ID 与 事件发生日期 都已填写。"""

@@ -1,0 +1,21 @@
+name: review-sync
+on:
+  schedule:
+    - cron: "0 0,6,12,18 * * *"  # 每 6 小时一次(UTC 0/6/12/18 点, 即北京 8/14/20/2 点)
+  workflow_dispatch: {}  # 支持手动触发
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: 处理审核请求 issue 并加入待审核队列
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/review_server.py

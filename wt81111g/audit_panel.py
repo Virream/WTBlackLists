@@ -19,6 +19,8 @@ class AuditPanel(QGroupBox):
     delete_started = pyqtSignal()
     delete_finished = pyqtSignal(object)
     retry_notice = pyqtSignal(str, str)  # (操作名, 重试提示) 供主窗口提醒用户
+    review_pulled = pyqtSignal(object)   # 拉取的待审核条目 dict 或 None
+    review_error = pyqtSignal(str)       # 拉取失败原因
 
     def __init__(self, main_window, parent=None):
         super().__init__("审核功能区", parent)
@@ -35,17 +37,27 @@ class AuditPanel(QGroupBox):
         row0.addWidget(self._auditor_combo, 1)
         lay.addLayout(row0)
 
-        # 上传 / 删除
+        # 上传 / 删除 / 拉取审核
         row1 = QHBoxLayout()
         self._upload_btn = QPushButton("⬆ 上传到服务器")
         self._upload_btn.clicked.connect(self._upload_checked)
         self._delete_btn = QPushButton("⬇ 从服务器中删除")
         self._delete_btn.clicked.connect(self._delete_checked)
+        self._pull_review_btn = QPushButton("📥 拉取审核请求")
+        self._pull_review_btn.setToolTip(
+            "从待审核队列拉取 1 条(自动标记为正在审核, 防止多人拉同一条);\n"
+            "一次只能审核一条, 审核完上传后自动移除待审核请求"
+        )
+        self._pull_review_btn.clicked.connect(self._pull_review)
         row1.addWidget(self._upload_btn)
         row1.addWidget(self._delete_btn)
+        row1.addWidget(self._pull_review_btn)
         lay.addLayout(row1)
 
-        hint = QLabel("上传前请勾选表格中要上传的条目; 删除仅支持服务器下载的不可编辑条目。")
+        hint = QLabel(
+            "上传前请勾选表格中要上传的条目; 删除仅支持服务器下载的不可编辑条目;\n"
+            "拉取审核请求会将一条待审核条目加入表格(锁定), 审核完勾选上传即可。"
+        )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#8a8a9a;font-size:11px;")
         lay.addWidget(hint)
@@ -68,9 +80,11 @@ class AuditPanel(QGroupBox):
             self._auditor_combo.setCurrentIndex(idx)
             self._upload_btn.setEnabled(True)
             self._delete_btn.setEnabled(True)
+            self._pull_review_btn.setEnabled(True)
         else:
             self._upload_btn.setEnabled(False)
             self._delete_btn.setEnabled(False)
+            self._pull_review_btn.setEnabled(False)
             self._auditor_combo.addItem("(未登录审核账号)")
         # 审核员昵称不可编辑
         self._auditor_combo.setEditable(False)
@@ -163,7 +177,7 @@ class AuditPanel(QGroupBox):
         threading.Thread(target=work, daemon=True).start()
         dlg.exec()
         self._mw._set_io_busy("audit", False)
-        self._on_upload_done(dlg.stats)
+        self.upload_finished.emit(dlg.stats)
 
     def _upload_worker_sync(self, targets: list[dict], payload: list[dict],
                             auditor: str) -> dict:
@@ -191,6 +205,48 @@ class AuditPanel(QGroupBox):
     def _new_cloud_id() -> str:
         import uuid
         return str(uuid.uuid4())
+
+    # ------------------------------------------------------------------
+    def _pull_review(self) -> None:
+        """从待审核队列拉取 1 条(打标正在审核, 防止多人拉同一条)。"""
+        # 一次只能审核一条: 本地已有审核拉取的条目未完成则禁止拉取
+        active = [
+            e for e in self._mw.store.entries
+            if e.source == "review" or getattr(e, "review_id", "")
+        ]
+        if active:
+            QMessageBox.information(
+                self, "已有待审核条目",
+                "本地已有一条审核拉取的条目未完成。\n"
+                "请先审核完毕(上传到服务器)或删除该条目, 才能拉取下一条。",
+            )
+            return
+        auditor = self._auditor_combo.currentText()
+        if not auditor or auditor.startswith("("):
+            QMessageBox.warning(self, "未登录", "请先在服务器设置中登录审核账号")
+            return
+        servers = [s for s in self._mw.app_settings.audit_servers
+                   if s.get("logged_in") and s.get("token")]
+        if not servers:
+            QMessageBox.warning(self, "无可用仓库", "没有已登录的审核服务器")
+            return
+        s = servers[0]
+        url = str(s.get("url") or "")
+        token = str(s.get("token") or "")
+        self._mw._set_io_busy("audit", True)
+
+        def work() -> None:
+            try:
+                from .review_sync import pull_next_review
+                item = pull_next_review(url, token, auditor)
+                if item is not None:
+                    # 记录正在审核的 (仓库, 条目ID), 上传成功后据此删除待审核请求
+                    self._mw._active_review = (url, str(item.get("id") or ""))
+                self.review_pulled.emit(item)
+            except Exception as exc:  # noqa: BLE001
+                self.review_error.emit(str(exc))
+
+        threading.Thread(target=work, daemon=True).start()
 
     # ------------------------------------------------------------------
     def _delete_checked(self) -> None:

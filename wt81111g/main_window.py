@@ -60,6 +60,7 @@ from .nickname_sync_dialog import NicknameSyncDialog
 from .notifications_dialog import NotificationsDialog
 from .proxy_config import get_proxy as _get_proxy, set_proxy as _apply_proxy
 from .proxy_dialog import ProxyDialog
+from .review_request_dialog import ReviewRequestDialog
 from .update_check import check_latest as _check_latest, ping as _github_ping
 from .update_dialog import UpdateDialog
 from .overlay import OverlayWindow
@@ -154,6 +155,7 @@ class MainWindow(QMainWindow):
         self._last_import_mode = "append"
         self._last_import_restore = True
         self._last_delete_ids: set[str] = set()
+        self._active_review: tuple[str, str] | None = None  # (待审核仓库URL, 条目ID) 正在审核的一条
         self._export_finished.connect(self._on_export_done)
         self._import_finished.connect(self._on_import_done)
         self._build_ui()
@@ -326,6 +328,13 @@ class MainWindow(QMainWindow):
         self._delete_action = QPushButton("🗑 删除选中")
         self._delete_action.clicked.connect(self._delete_selected)
         tr.addWidget(self._delete_action)
+        self._review_action = QPushButton("📨 上传审核请求")
+        self._review_action.setToolTip(
+            "把本地勾选的条目通过 issue 提交给审核员审核\n"
+            "(仅文本字段, 不含证据文件)"
+        )
+        self._review_action.clicked.connect(self._upload_review_request)
+        tr.addWidget(self._review_action)
         self._lock_action = QPushButton("🔒 锁定条目")
         self._lock_action.clicked.connect(self._toggle_lock)
         tr.addWidget(self._lock_action)
@@ -410,6 +419,8 @@ class MainWindow(QMainWindow):
         self._audit_panel.delete_started.connect(lambda: self._set_io_busy("audit", True))
         self._audit_panel.delete_finished.connect(self._on_delete_done)
         self._audit_panel.retry_notice.connect(self._on_audit_retry)
+        self._audit_panel.review_pulled.connect(self._on_review_pulled)
+        self._audit_panel.review_error.connect(self._on_review_error)
         splitter.addWidget(right)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 1)
@@ -718,12 +729,158 @@ class MainWindow(QMainWindow):
             self.remark_editor.clear()
             self._remark_locked = False
             self._update_remark_counter()
+        # 删除审核拉取条目 = 放弃审核: 从待审核队列移除该请求
+        self._release_review_entries(deleted)
         if removed_ev:
             self.statusBar().showMessage(
                 f"已删除 {len(deleted)} 行及 {removed_ev} 个证据文件夹", 4000
             )
         else:
             self.statusBar().showMessage("已删除勾选条目", 3000)
+
+    # ------------------------------------------------------------------
+    # 上传审核请求(用户 → 审核员)
+    # ------------------------------------------------------------------
+    def _upload_review_request(self) -> None:
+        """把本地勾选的条目通过 issue 提交给审核员审核(仅文本, 不含证据文件)。"""
+        entries = [
+            e for e in self.store.entries
+            if not e.locked
+            and self._row_widgets.get(id(e), {}).get("check") is not None
+            and self._row_widgets[id(e)]["check"].isChecked()
+        ]
+        if not entries:
+            QMessageBox.information(self, "未选择", "请先在表格中勾选要提交审核的本地条目")
+            return
+        bad = [(e, self._missing_review_fields(e)) for e in entries]
+        bad = [(e, m) for e, m in bad if m]
+        if bad:
+            names = "、".join(
+                f"「{e.nickname or e.player_id or '(未命名)'}」缺 {m}" for e, m in bad
+            )
+            QMessageBox.warning(
+                self, "信息不完整",
+                f"以下条目缺少必填项, 无法提交审核:\n{names}\n\n"
+                "必须包含: 玩家昵称 / 玩家ID / 原因 / 事件发生日期 / 录像链接",
+            )
+            return
+        servers = [s for s in self.app_settings.audit_servers
+                    if s.get("logged_in") and s.get("token")]
+        if not servers:
+            QMessageBox.warning(
+                self, "未登录",
+                "没有已登录的审核服务器账号, 无法提交审核请求。\n"
+                "请先在「服务器设置」中登录 GitHub 账号。",
+            )
+            return
+        payload = [self._entry_to_review_payload(e) for e in entries]
+        dlg = ReviewRequestDialog(self.app_settings, payload, self)
+        dlg.exec()
+
+    @staticmethod
+    def _missing_review_fields(e: BlacklistEntry) -> str:
+        """审核请求必填项检查, 返回缺失项; 全部满足返回空串。"""
+        fields = [
+            ("玩家昵称", e.nickname), ("玩家ID", e.player_id), ("原因", e.reason),
+            ("事件发生日期", e.event_date), ("录像链接", e.replay_link),
+        ]
+        return "、".join(name for name, val in fields if not (val or "").strip())
+
+    @staticmethod
+    def _entry_to_review_payload(e: BlacklistEntry) -> dict:
+        """转成待审核条目(仅文本字段, 不含证据文件)。"""
+        return {
+            "nickname": e.nickname, "player_id": e.player_id, "reason": e.reason,
+            "event_date": e.event_date, "replay_link": e.replay_link,
+            "remarks": e.remarks, "previous_nicknames": list(e.previous_nicknames),
+        }
+
+    # ------------------------------------------------------------------
+    # 审核员拉取审核请求
+    # ------------------------------------------------------------------
+    @pyqtSlot(object)
+    def _on_review_pulled(self, item: object) -> None:
+        """拉取到一条待审核请求 → 追加到本地表格。"""
+        self._set_io_busy("audit", False)
+        if not isinstance(item, dict):
+            QMessageBox.information(self, "拉取审核请求", "当前没有待审核的请求")
+            return
+        self._append_review_entry(item)
+        self._notify(
+            f"已拉取 1 条待审核请求 (玩家ID {item.get('player_id','')}); "
+            "审核完毕上传后会自动从待审核队列移除", "good")
+
+    @pyqtSlot(str)
+    def _on_review_error(self, msg: str) -> None:
+        self._set_io_busy("audit", False)
+        QMessageBox.warning(self, "拉取审核请求失败", msg)
+
+    def _append_review_entry(self, item: dict) -> None:
+        """把拉取的待审核条目追加为本地锁定条目(source=review)。"""
+        e = BlacklistEntry()
+        e.nickname = str(item.get("nickname") or "")
+        e.player_id = str(item.get("player_id") or "")
+        e.reason = str(item.get("reason") or "")
+        e.event_date = str(item.get("event_date") or "")
+        e.replay_link = str(item.get("replay_link") or "")
+        e.remarks = str(item.get("remarks") or "")
+        e.previous_nicknames = [str(x) for x in (item.get("previous_nicknames") or [])]
+        e.review_id = str(item.get("id") or "")
+        e.locked = True
+        e.source = "review"
+        e.audited = False
+        e.auditor = ""
+        e.entry_id = self._make_remote_entry_id(e)
+        self.store.entries.append(e)
+        self._make_row(e)
+        self.table.scrollToBottom()
+        self.store.save()
+
+    def _complete_active_review(self) -> None:
+        """审核条目上传成功后, 从待审核队列删除该请求(后台)。"""
+        ar = getattr(self, "_active_review", None)
+        if not ar:
+            return
+        url, item_id = ar
+        self._active_review = None
+        token = ""
+        for s in self.app_settings.audit_servers:
+            if s.get("url") == url and s.get("logged_in"):
+                token = str(s.get("token") or "")
+                break
+
+        def work() -> None:
+            try:
+                from .review_sync import complete_review
+                complete_review(url, token, item_id)
+            except Exception as exc:  # noqa: BLE001
+                self._notify(f"删除待审核请求失败: {exc}", "warn")
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _release_review_entries(self, deleted: list) -> None:
+        """删除审核拉取条目 = 放弃审核, 从待审核队列移除对应请求(后台)。"""
+        ar = getattr(self, "_active_review", None)
+        if not ar:
+            return
+        url, item_id = ar
+        if item_id not in {getattr(e, "review_id", "") for e in deleted}:
+            return
+        self._active_review = None
+        token = ""
+        for s in self.app_settings.audit_servers:
+            if s.get("url") == url and s.get("logged_in"):
+                token = str(s.get("token") or "")
+                break
+
+        def work() -> None:
+            try:
+                from .review_sync import complete_review
+                complete_review(url, token, item_id)
+            except Exception as exc:  # noqa: BLE001
+                self._notify(f"删除待审核请求失败: {exc}", "warn")
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _detect_unused_evidence(self) -> None:
         """检测证据目录中没有对应条目的文件夹, 询问是否删除并列出目录。"""
@@ -1139,6 +1296,7 @@ class MainWindow(QMainWindow):
         self._import_action.setEnabled(not busy)
         self._add_action.setEnabled(not busy and not self._locked)
         self._delete_action.setEnabled(not busy and not self._locked)
+        self._review_action.setEnabled(not busy and not self._locked)
         self._sort_combo.setEnabled(not busy)
 
     # ------------------------------------------------------------------
@@ -1345,6 +1503,8 @@ class MainWindow(QMainWindow):
         self._audit_panel._refresh_auditors()
         # 上传完成后从服务器重新获取刚上传的条目, 追加为本地锁定条目
         self._refetch_after_upload(result)
+        # 若上传的是审核拉取的条目, 从待审核队列移除该请求
+        self._complete_active_review()
 
     def _refetch_after_upload(self, result: dict) -> None:
         """上传成功后, 从上传目标服务器重新拉取, 把刚上传的条目作为锁定条目追加。"""
