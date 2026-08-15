@@ -66,7 +66,10 @@ def api(method: str, path: str, token: str,
         req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, data=data, timeout=600) as r:
-            return json.loads(r.read())
+            raw = r.read()
+            if not raw:
+                return {}  # 204 等无返回体
+            return json.loads(raw)
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")[:300]
         raise ValueError(f"HTTP {e.code} {method} {path}: {detail}") from e

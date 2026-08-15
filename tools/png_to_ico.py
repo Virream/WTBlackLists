@@ -2,14 +2,27 @@
 
 图标源固定从项目 `icon/2.0/` 目录读取(按实际像素尺寸识别 512/256,
 不受文件名影响); 512 为高分辨率(HiDPI)首选, 256 为兼容性尺寸。
+
+生成标准 ICO: 16/24/32/48/64/128 用 BMP(DIB+AND mask)格式,
+256 用 PNG 格式 —— 保证 Windows 能正确提取任意尺寸(此前仅两个 PNG
+的 ICO 会导致资源管理器/快捷方式提取 32x32 图标异常, 显示旧图标)。
 """
 import os
 import struct
 import sys
 
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, Qt
+from PyQt6.QtGui import QGuiApplication, QImage, QPixmap
+
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC_DIR = os.path.join(BASE, "icon", "2.0")
 OUT = os.path.join(BASE, "app.ico")
+
+# 生成尺寸: 小尺寸用 BMP, 256 用 PNG
+_SIZES = (16, 24, 32, 48, 64, 128, 256)
+
+_app = QGuiApplication([])
 
 
 def png_size(png: bytes) -> tuple[int, int]:
@@ -53,31 +66,66 @@ def find_sources() -> tuple[bytes, bytes]:
     return png512, png256
 
 
-def write_ico(pngs: list[bytes], out: str) -> None:
-    count = len(pngs)
+def _load_img(png: bytes) -> QImage:
+    img = QImage()
+    img.loadFromData(png, "PNG")
+    return img.convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def _resize(img: QImage, size: int) -> QImage:
+    """等比缩放(扩张至填满方形)到目标尺寸。"""
+    pm = QPixmap.fromImage(img).scaled(
+        size, size,
+        Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    return pm.toImage().convertToFormat(QImage.Format.Format_ARGB32)
+
+
+def _encode_dib(img: QImage, size: int) -> bytes:
+    """编码为 32bpp BGRA 的 BITMAPINFOHEADER + XOR(自下而上) + 全0 AND mask。"""
+    header = struct.pack(
+        "<IiiHHIIiiII", 40, size, size * 2, 1, 32, 0, size * size * 4, 0, 0, 0, 0)
+    pixels = bytearray()
+    for y in range(size - 1, -1, -1):
+        for x in range(size):
+            c = img.pixelColor(x, y)
+            pixels += bytes((c.blue(), c.green(), c.red(), c.alpha()))
+    and_stride = ((size + 31) // 32) * 4
+    and_mask = bytes(and_stride * size)
+    return header + bytes(pixels) + and_mask
+
+
+def _encode_png(img: QImage) -> bytes:
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    return bytes(ba)
+
+
+def write_ico(entries: list[tuple[int, bytes, bool]], out: str) -> None:
+    """写标准 ICO。entries: (尺寸, 图像字节, 是否PNG格式)。"""
+    count = len(entries)
     data = bytearray()
     data += (0).to_bytes(2, "little")       # reserved
     data += (1).to_bytes(2, "little")       # type: icon
     data += count.to_bytes(2, "little")     # image count
     offset = 6 + 16 * count
-    for png in pngs:
-        entry = bytearray()
-        # 宽/高字节: 0 表示 256(标准约定), 512 也按 0 写入, Windows 读取 PNG 实际尺寸
-        entry += (0).to_bytes(1, "little")
-        entry += (0).to_bytes(1, "little")
-        entry += (0).to_bytes(1, "little")  # color count
-        entry += (0).to_bytes(1, "little")  # reserved
-        entry += (1).to_bytes(2, "little")  # planes
-        entry += (32).to_bytes(2, "little")  # bit count
-        entry += (len(png)).to_bytes(4, "little")   # bytes in resource
-        entry += offset.to_bytes(4, "little")       # image offset
-        data += entry
-        offset += len(png)
-    for png in pngs:
-        data += png
+    for size, blob, _is_png in entries:
+        dim = 0 if size >= 256 else size  # 宽/高字节: 0 表示 256
+        data += bytes((dim, dim, 0, 0))    # width, height, colorCount, reserved
+        data += (1).to_bytes(2, "little")  # planes
+        data += (32).to_bytes(2, "little")  # bit count
+        data += len(blob).to_bytes(4, "little")   # bytes in resource
+        data += offset.to_bytes(4, "little")       # image offset
+        offset += len(blob)
+    for _size, blob, _is_png in entries:
+        data += blob
     with open(out, "wb") as f:
         f.write(bytes(data))
-    print(f"已写入 {out}: {count} 个尺寸")
+    print(f"已写入 {out}: {count} 个尺寸 {sorted(e[0] for e in entries)}")
 
 
 def main() -> int:
@@ -93,7 +141,16 @@ def main() -> int:
     if s512 != (512, 512) or s256 != (256, 256):
         print("尺寸与预期不符, 中止")
         return 1
-    write_ico([png512, png256], OUT)
+    # 以 512 源为基准缩放生成全部尺寸(质量更好)
+    base = _load_img(png512)
+    entries: list[tuple[int, bytes, bool]] = []
+    for s in _SIZES:
+        qi = _resize(base, s)
+        if s >= 256:
+            entries.append((s, _encode_png(qi), True))
+        else:
+            entries.append((s, _encode_dib(qi, s), False))
+    write_ico(entries, OUT)
     return 0
 
 
