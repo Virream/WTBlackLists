@@ -243,7 +243,7 @@ class MainWindow(QMainWindow):
         g2, g2g = _func_group("数据维护")
         _fill_grid(g2g, [
             ("🔁 刷新昵称", "重新抓取黑名单玩家昵称", self._manual_check),
-            ("🔄 同步服务器名单", "从已配置的服务器下载共享名单并合并到本地", self._sync_servers),
+            ("🔄 下载服务器名单", "从已配置的服务器下载共享名单并合并到本地", self._sync_servers),
             ("🗄 昵称缓存", "查看已抓取的昵称缓存", self._open_cache),
             ("🌐 服务器设置", "配置名单拉取服务器与审核服务器", self._open_server_settings),
             ("☁️ 共享昵称表", "拉取公开仓库的 nickname.json 合并到本地 / 上传抓取到的昵称(需登录)", self._open_nickname_sync),
