@@ -19,7 +19,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QApplication
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-ICON = os.path.join(BASE, "512x512 ico.png")
+ICON = os.path.join(BASE, "icon", "2.0", "icon_2..0_512x512.png")
 OUT = os.path.join(BASE, "WTBlackList_promo.png")
 
 W, H = 1920, 1080
