@@ -1,4 +1,4 @@
-# 一键打包脚本: 应用(onedir 启动更快) + ZIP 版 + 自解压安装版
+# 一键打包脚本: 应用(onedir 启动更快) + ZIP 版 + 自解压安装版 + 源码版
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $root ".venv\Scripts\python.exe"
@@ -48,7 +48,12 @@ Write-Host "== 5/5 打包自解压安装程序 =="
     --version-file version_info_installer.txt `
     "tools\installer\installer_main.py"
 
+Write-Host "== 6/6 生成源码 zip(放入 dist) =="
+& $py "tools\make_source_zip.py"
+Copy-Item "WTBlackList_source.zip" "dist\WTBlackList_source.zip" -Force
+
 Write-Host "== 完成 =="
 Write-Host "  应用目录: dist\WTBlackList\WTBlackList.exe"
 Write-Host "  ZIP 版:   dist\WTBlackList.zip"
 Write-Host "  安装版:   dist\WTBlackList_Setup.exe"
+Write-Host "  源码版:   dist\WTBlackList_source.zip"

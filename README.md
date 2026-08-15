@@ -2,6 +2,8 @@
 
 基于战争雷霆官方 **8111 本地接口** 的陆战黑名单辅助工具: 手动维护黑名单,自动在每一局中收集玩家昵称,一旦发现黑名单玩家进入对局立即提醒。
 
+> ⚠️ **测试阶段**: 当前版本处于测试阶段, 功能与数据格式可能调整, 请以本仓库正式发布说明为准。
+
 ## 功能
 
 1. **黑名单表格**
@@ -26,7 +28,7 @@
    - 一旦当前对局出现黑名单玩家 → 屏幕叠加层提示 `发现肃反人员: 昵称`(同一玩家每局只提示一次)
    - **对局开始/结束检测**: 8111 端口**没有**对局开始/结束的主动通知, 只能轮询推断。程序以 `/mission.json` 的 `valid` 字段为主(退出对局回机库后为 `false`)、辅以 `status`+`objectives` 组合判断, 并对"结束"做连续 3 秒确认, 避免退出对局后叠加层仍残留 `发现肃反人员`
 
-4. **屏幕叠加层(类似 WTRTI)**
+4. **屏幕叠加层**
    - 检测到黑名单玩家时, 在屏幕 4/5(从上往下)位置显示 `发现肃反人员:` 及所有命中昵称; 未命中时显示 `正在确认名单中...`; 仅在进入对局时显示, 离开对局自动隐藏
    - 叠加层为**外部独立透明置顶窗口**(不注入游戏进程), 需游戏使用**全屏窗口(无边框)**模式才能显示在游戏之上
    - 工具栏「⚙ 叠加层设置」可在主界面调整: 水平位置(X%)、垂直位置(Y%)、**锁定位置**、背景颜色、背景不透明度、字体大小、**字体、字体颜色、背景圆角弧度**, 改动实时生效并保存到 `data/config.json`, 适配不同屏幕
@@ -87,6 +89,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `dist\WTBlackList\WTBlackList.exe` | **目录版**(onedir): 启动最快(免解压), 用于日常使用/绿色分发 |
 | `dist\WTBlackList.zip` | **ZIP 版**: 解压即可运行 |
 | `dist\WTBlackList_Setup.exe` | **自解压安装版**: 用户选安装位置(默认 `D:\Program Files\WTBlackList`, 无 D 盘或空间不足退回 `C:\Program Files\WTBlackList`), 装完自动在桌面建快捷方式 |
+| `dist\WTBlackList_source.zip` | **源码版**: 完整源码(不含运行/构建产物), 可自行审查与二次开发 |
 
 运行后会在可写目录自动创建 `data\blacklist.json` 与 `evidences\` 文件夹;
 若安装到受保护的 Program Files 目录, 数据会自动改存到 `%LOCALAPPDATA%\WTBlackList`。
@@ -99,7 +102,8 @@ WTBlackList/
 ├── requirements.txt
 ├── build.ps1                # 一键打包脚本
 ├── version_info.txt         # EXE 版本信息
-├── app.ico                  # 应用图标
+├── app.ico                  # 应用图标(由 icon/2.0 生成)
+├── icon/2.0/                # 2.0 版图标源(512x512 / 256x256 PNG)
 ├── wt81111g/
 │   ├── config.py            # 路径/常量
 │   ├── blacklist.py         # 黑名单模型 + 持久化
@@ -112,7 +116,7 @@ WTBlackList/
 ├── docs/                    # 参考文档归档(见下节)
 │   ├── wtrti/               # WTRTI 官方文档
 │   └── wt8111/              # 8111 接口文档
-├── tools/png_to_ico.py      # 由用户 512/256 PNG 生成 app.ico
+├── tools/png_to_ico.py      # 从 icon/2.0 生成 app.ico
 ├── tests/smoke_test.py      # 冒烟测试
 ├── evidences/               # 运行时自动创建
 └── data/blacklist.json      # 黑名单数据

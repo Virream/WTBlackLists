@@ -1,14 +1,14 @@
-"""将用户提供的 512x512 与 256x256 PNG 图标转换为多尺寸 app.ico。
+"""将 icon/2.0 目录下的 512x512 与 256x256 PNG 图标转换为多尺寸 app.ico。
 
-512 为高分辨率(HiDPI)首选, 256 为兼容性尺寸; 两者内容一致。
+图标源固定从项目 `icon/2.0/` 目录读取(按实际像素尺寸识别 512/256,
+不受文件名影响); 512 为高分辨率(HiDPI)首选, 256 为兼容性尺寸。
 """
 import os
 import struct
 import sys
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC_512 = os.path.join(BASE, "512x512 ico.png")
-SRC_256 = os.path.join(BASE, "256x256 ico.png")
+SRC_DIR = os.path.join(BASE, "icon", "2.0")
 OUT = os.path.join(BASE, "app.ico")
 
 
@@ -23,6 +23,34 @@ def png_size(png: bytes) -> tuple[int, int]:
 def read_png(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()
+
+
+def find_sources() -> tuple[bytes, bytes]:
+    """扫描 icon/2.0 目录, 按实际尺寸找出 512x512 与 256x256 PNG。"""
+    if not os.path.isdir(SRC_DIR):
+        raise FileNotFoundError(f"图标目录不存在: {SRC_DIR}")
+    png512: bytes | None = None
+    png256: bytes | None = None
+    src512 = src256 = ""
+    for n in sorted(os.listdir(SRC_DIR)):
+        if not n.lower().endswith(".png"):
+            continue
+        p = os.path.join(SRC_DIR, n)
+        data = read_png(p)
+        try:
+            w, h = png_size(data)
+        except ValueError:
+            continue
+        if (w, h) == (512, 512) and png512 is None:
+            png512, src512 = data, p
+        elif (w, h) == (256, 256) and png256 is None:
+            png256, src256 = data, p
+    if png512 is None or png256 is None:
+        raise ValueError(
+            f"icon/2.0 缺少 512x512 或 256x256 PNG(找到 512={bool(png512)} 256={bool(png256)})")
+    print(f"512 源: {os.path.basename(src512)}")
+    print(f"256 源: {os.path.basename(src256)}")
+    return png512, png256
 
 
 def write_ico(pngs: list[bytes], out: str) -> None:
@@ -53,12 +81,15 @@ def write_ico(pngs: list[bytes], out: str) -> None:
 
 
 def main() -> int:
-    png512 = read_png(SRC_512)
-    png256 = read_png(SRC_256)
+    try:
+        png512, png256 = find_sources()
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"错误: {exc}")
+        return 1
     s512 = png_size(png512)
     s256 = png_size(png256)
-    print(f"512x512 ico.png -> {s512}")
-    print(f"256x256 ico.png -> {s256}")
+    print(f"512 PNG -> {s512}")
+    print(f"256 PNG -> {s256}")
     if s512 != (512, 512) or s256 != (256, 256):
         print("尺寸与预期不符, 中止")
         return 1
