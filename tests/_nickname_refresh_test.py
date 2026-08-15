@@ -52,12 +52,17 @@ def main() -> int:
     dlg2.close()
     e1.fetched_at = 0.0
 
-    # 2) 勾选框: 读 settings + 勾选写回(可在此取消)
-    assert dlg._auto_check.isChecked() is False
-    dlg._auto_check.setChecked(True)
+    # 2) '自动更新'勾选框已转移到昵称缓存窗口, 默认选中
+    from wt81111g.cache_dialog import CacheDialog
+    assert not hasattr(dlg, "_auto_check"), "刷新窗口不应再有自动更新勾选框"
+    win.app_settings.auto_browser = True  # 显式设置, 避免受真实配置影响
+    cd = CacheDialog(win.nickname_cache, win.app_settings, win)
+    assert cd._auto_check.isChecked() is True, "自动更新应默认选中"
+    cd._auto_check.setChecked(False)
+    assert win.app_settings.auto_browser is False, "取消应写回 settings"
+    cd._auto_check.setChecked(True)
     assert win.app_settings.auto_browser is True, "勾选应写回 settings"
-    dlg._auto_check.setChecked(False)
-    assert win.app_settings.auto_browser is False, "可在此取消"
+    cd.close()
 
     # 3) 互斥单选: 默认内置浏览器
     assert dlg._wv2_radio.isChecked() is True

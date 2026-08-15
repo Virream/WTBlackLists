@@ -1485,6 +1485,7 @@ class MainWindow(QMainWindow):
     def _start_monitor(self) -> None:
         self._thread = QThread(self)
         self._worker = MonitorWorker(self.store, nickname_cache=self.nickname_cache)
+        self._worker.auto_update = self.app_settings.auto_browser
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.connection_changed.connect(self._on_conn)
@@ -1540,15 +1541,8 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str)
     def _on_nickname_manual_needed(self, player_id: str, current_nickname: str) -> None:
-        """WTLive 与官网都查不到该玩家 → 浏览器兜底。"""
-        if self.app_settings.auto_browser:
-            # 已勾选"下次自动打开浏览器": 后台自动抓取, 不弹窗不打断游戏
-            self._start_auto_webview2(player_id)
-            return
-        dlg = BrowserCaptureDialog(player_id, current_nickname, self)
-        dlg.nickname_captured.connect(self._on_browser_nickname_captured)
-        dlg.show()
-        self._browser_capture_dialog = dlg  # 保持引用
+        """自动更新模式: WTLive 与官网都查不到该玩家 → 静默通过内置浏览器兜底抓取。"""
+        self._start_auto_webview2(player_id)
 
     def _start_auto_webview2(self, player_id: str) -> None:
         """后台启动应用内浏览器(隐藏窗口)自动抓取, 不打断游戏。"""
@@ -1595,7 +1589,9 @@ class MainWindow(QMainWindow):
         """浏览器兜底抓到昵称 → 替换玩家昵称 + 维护曾用昵称 + 缓存。"""
         nick_str = str(nick) if nick else ""
         if not nick_str:
-            self._notify(f"玩家ID '{player_id}' 昵称抓取失败: {state}", "bad")
+            self._notify(
+                f"玩家ID '{player_id}' 昵称自动更新失败: {state}。"
+                f"可点击「刷新昵称」手动抓取", "bad")
             self.statusBar().showMessage(f"玩家ID {player_id} 昵称抓取失败: {state}", 5000)
             return
         from .nickname_util import clean_wtlive_nickname
@@ -1751,11 +1747,18 @@ class MainWindow(QMainWindow):
     def _open_cache(self) -> None:
         dlg = getattr(self, "_cache_dialog", None)
         if dlg is None:
-            dlg = CacheDialog(self.nickname_cache, self)
+            dlg = CacheDialog(self.nickname_cache, self.app_settings, self)
+            dlg.auto_changed.connect(self._on_auto_update_changed)
             self._cache_dialog = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    def _on_auto_update_changed(self, checked: bool) -> None:
+        """缓存窗口'自动更新'开关变化 → 同步到监控线程。"""
+        if self._worker is not None:
+            self._worker.auto_update = bool(checked)
+        self._notify("自动更新: " + ("已开启" if checked else "已关闭"), "good")
 
     def _refresh_cache_dialog(self) -> None:
         dlg = getattr(self, "_cache_dialog", None)

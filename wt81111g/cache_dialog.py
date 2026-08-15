@@ -4,16 +4,11 @@ from __future__ import annotations
 import time
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
-    QDialog,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QPushButton,
-    QTableWidget,
-    QTableWidgetItem,
-    QVBoxLayout,
+    QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .monitor import MonitorWorker  # 复用缓存有效期常量
@@ -34,13 +29,17 @@ class CacheDialog(QDialog):
     """非模态窗口, 直接读取独立昵称缓存数据库(ID → 昵称 + 失效倒计时)。
 
     缓存与黑名单条目解耦: 删除条目后缓存仍保留, 重新添加相同ID也能看到已缓存的昵称。
+    含"自动更新"开关: 勾选后 24h 过期昵称在进入新对局时自动更新(先WTLive, 失败静默浏览器)。
     """
 
-    def __init__(self, cache: NicknameCache, parent=None):
+    auto_changed = pyqtSignal(bool)  # 自动更新开关变化
+
+    def __init__(self, cache: NicknameCache, settings=None, parent=None):
         super().__init__(parent)
         self.cache = cache
+        self._settings = settings
         self.setWindowTitle("昵称缓存")
-        self.setMinimumSize(560, 340)
+        self.setMinimumSize(560, 380)
         self.setWindowFlag(Qt.WindowType.Window)
         self._build()
 
@@ -57,6 +56,17 @@ class CacheDialog(QDialog):
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#8a8a9a;")
         lay.addWidget(tip)
+
+        self._auto_check = QCheckBox("自动更新")
+        self._auto_check.setToolTip(
+            "勾选后, 24小时过期的昵称在进入新对局时自动更新:\n"
+            "先通过 WTLive/官网, 失败后静默通过内置浏览器抓取;\n"
+            "抓取失败(网络/人机验证)仅在底部通知, 可点击「刷新昵称」手动抓取。"
+        )
+        if self._settings is not None:
+            self._auto_check.setChecked(bool(self._settings.auto_browser))
+        self._auto_check.toggled.connect(self._on_auto_toggled)
+        lay.addWidget(self._auto_check)
 
         self.table = QTableWidget(0, 3)
         self.table.setHorizontalHeaderLabels(["玩家ID", "昵称", "剩余有效时间"])
@@ -78,6 +88,13 @@ class CacheDialog(QDialog):
         row.addWidget(refresh_btn)
         row.addWidget(close_btn)
         lay.addLayout(row)
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        """自动更新开关: 写回设置并通知主窗口同步 monitor。"""
+        if self._settings is not None:
+            self._settings.auto_browser = bool(checked)
+            self._settings.save()
+        self.auto_changed.emit(bool(checked))
         self.refresh()
 
     def refresh(self) -> None:

@@ -15,7 +15,7 @@ import time
 
 from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QDialog, QHBoxLayout, QHeaderView, QLabel,
+    QAbstractItemView, QDialog, QHBoxLayout, QHeaderView, QLabel,
     QPushButton, QRadioButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
@@ -89,17 +89,7 @@ class NicknameRefreshDialog(QDialog):
             self._table.setItem(i, 3, QTableWidgetItem(_STATUS_PENDING))
         lay.addWidget(self._table, 1)
 
-        # ---- 选项区 ----
-        self._auto_check = QCheckBox("下次自动打开浏览器")
-        self._auto_check.setToolTip(
-            "勾选后, 后续 WTLive 获取失败自动触发时, 后台自动打开应用内浏览器抓取,\n"
-            "不弹窗打断游戏; 可随时在此取消勾选"
-        )
-        if settings is not None:
-            self._auto_check.setChecked(bool(settings.auto_browser))
-        self._auto_check.toggled.connect(self._on_auto_toggled)
-        lay.addWidget(self._auto_check)
-
+        # ---- 选项区(自动更新开关已移至昵称缓存窗口) ----
         radio_row = QHBoxLayout()
         radio_row.addWidget(QLabel("WTLive 获取失败时兜底:"))
         self._wv2_radio = QRadioButton("使用内置浏览器(推荐)")
@@ -139,11 +129,6 @@ class NicknameRefreshDialog(QDialog):
         h = int(remaining // 3600)
         m = int((remaining % 3600) // 60)
         return f"{h}小时{m}分"
-
-    def _on_auto_toggled(self, checked: bool) -> None:
-        if self._settings is not None:
-            self._settings.auto_browser = bool(checked)
-            self._settings.save()
 
     def _start(self) -> None:
         if self._running:

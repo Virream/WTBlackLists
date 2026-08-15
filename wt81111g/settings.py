@@ -56,8 +56,8 @@ class AppSettings:
         self.sync_enabled = False
         # 代理: 设置后所有网络请求都走该代理; 空串=直连
         self.proxy = ""
-        # 自动打开浏览器: 勾选后下次需要浏览器兜底时自动打开应用内浏览器并自动抓取, 不弹窗打断
-        self.auto_browser = False
+        # 自动更新: 勾选后 24h 过期的昵称在进入新对局时自动更新(默认开启)
+        self.auto_browser = True
         existed = os.path.exists(self.path)
         self._load()
         # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换

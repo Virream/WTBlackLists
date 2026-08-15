@@ -74,6 +74,7 @@ class MonitorWorker(QObject):
             if _pid and _nick:
                 self._profile_cache[_pid] = (_nick, _ts)
         self._prefetch_running = False
+        self.auto_update = True  # 是否自动更新24h过期的昵称(缓存窗口'自动更新'控制, 默认开启)
         self._wtlive_count = 0
         self._count_lock = threading.Lock()
 
@@ -232,6 +233,8 @@ class MonitorWorker(QObject):
 
     def _start_prefetch(self, callback=None) -> None:
         """后台抓取黑名单玩家昵称(仅抓缺失/过期的), 完成后可选执行 callback。"""
+        if not self.auto_update:
+            return  # 未勾选"自动更新": 不自动抓取, 需手动点刷新昵称
         if self._prefetch_running:
             if callback is not None:
                 threading.Thread(target=callback, daemon=True).start()
