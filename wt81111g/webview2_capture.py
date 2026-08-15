@@ -23,13 +23,30 @@ from .config import WEBSITE_USERINFO_TEMPLATE
 
 _SELECTOR = "li.user-profile__data-nick"
 _TIMEOUT = 180  # 子进程抓取超时(秒)
+_POLL_INTERVAL = 0.5  # 轮询间隔(秒)
 _WINDOW_TITLE = "WTBlackList 浏览器"
+
+# 抓取昵称的多个候选来源(官网 userinfo 页昵称元素; 命中任一非空即成功)
+_NICK_SELECTORS = [
+    "li.user-profile__data-nick",
+    ".user-profile__data-nick",
+    ".profile__nickname",
+    ".nickname",
+]
 
 
 def _capture_js() -> str:
+    """返回抓取昵称的 JS: 依次尝试多个选择器, 取第一个非空文本。"""
+    sels = ",".join(repr(s) for s in _NICK_SELECTORS)
     return (
-        "(() => { const el = document.querySelector(%r);"
-        " return el ? el.textContent.trim() : ''; })()" % _SELECTOR
+        "(() => {"
+        f" const sels = [{sels}];"
+        " for (const s of sels) {"
+        "   const el = document.querySelector(s);"
+        "   if (el && el.textContent.trim()) return el.textContent.trim();"
+        " }"
+        " return '';"
+        "})()"
     )
 
 
@@ -92,7 +109,7 @@ def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
             if res:
                 nickname = str(res)
                 break
-            time.sleep(1)
+            time.sleep(_POLL_INTERVAL)
         try:
             window.destroy()
         except Exception:  # noqa: BLE001
