@@ -12,7 +12,7 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 处理昵称更新 issue 并合并进 nickname.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
