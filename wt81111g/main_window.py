@@ -262,7 +262,6 @@ class MainWindow(QMainWindow):
         self.conn_label.setStyleSheet("color:#8a8a8a;")
         g4g.addWidget(self.conn_label, 0, 0)
         self.feed_label = QLabel("WT Live 访问: 未检测")
-        self.feed_label.setWordWrap(True)
         feed_check_btn = QPushButton("检测")
         feed_check_btn.setFixedWidth(48)
         feed_check_btn.setToolTip("手动检测 WT Live 连通性")
