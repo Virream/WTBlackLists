@@ -195,18 +195,17 @@ def test_main_window_history_and_reminder() -> None:
     assert prev.isReadOnly()
     assert prev.text() == ""
 
-    # 模拟通过ID抓取到新昵称
+    # 模拟通过ID抓取到新昵称: 自动替换玩家昵称, 旧值记入曾用
     win._on_profiles({"80931116": "NewName"})
     assert entry.previous_nicknames == ["OldName"], entry.previous_nicknames
     assert entry.fetched_nickname == "NewName"
+    assert entry.nickname == "NewName", "抓取后应自动替换玩家昵称"
     assert prev.text() == "OldName", prev.text()
 
-    # 提醒区显示文字(不弹窗)
-    assert win.reminder_label.isVisibleTo(win) or not win.reminder_label.isHidden()
-    text = win.reminder_label.text()
-    assert "NewName" in text and "OldName" in text and "80931116" in text, text
+    # 玩家昵称已自动同步 → 提醒区不提示
+    assert win.reminder_label.isHidden(), "抓取后玩家昵称已自动同步, 不应再提醒"
 
-    # 用户更新昵称后提醒消失
+    # 用户更新昵称后提醒保持隐藏
     entry.nickname = "NewName"
     win._update_nickname_reminder()
     assert win.reminder_label.isHidden(), "昵称一致后不应再提醒"

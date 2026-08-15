@@ -1332,8 +1332,12 @@ class MainWindow(QMainWindow):
     # 系统托盘
     # ------------------------------------------------------------------
     def _setup_tray(self) -> None:
-        self._tray_available = QSystemTrayIcon.isSystemTrayAvailable()
+        # 实测: QSystemTrayIcon.isSystemTrayAvailable() 在本机误报 False,
+        # 但 show() 后托盘实际可正常显示。因此不依赖该返回值, 直接 show。
+        self._tray_available = True
         icon = QIcon(resource_path("app.ico"))
+        if icon.isNull():
+            icon = self.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
         self.setWindowIcon(icon)
         self._tray = QSystemTrayIcon(icon, self)
         self._tray.setToolTip("WTBlackList 战争雷霆黑名单助手")
@@ -1345,7 +1349,9 @@ class MainWindow(QMainWindow):
         menu.addAction("退出应用", self._quit_app)
         self._tray.setContextMenu(menu)
         self._tray.activated.connect(self._on_tray_activated)
-        if self._tray_available:
+        # 真实平台(platformName != offscreen)显示托盘图标;
+        # offscreen(测试/无托盘环境)跳过, 避免 QSystemTrayIcon.show() 挂起
+        if QApplication.platformName() != "offscreen":
             self._tray.show()
 
     def _toggle_overlay(self) -> None:
@@ -1446,9 +1452,37 @@ class MainWindow(QMainWindow):
         dlg.show()
         self._browser_capture_dialog = dlg  # 保持引用
 
+    def _apply_fetched_nickname(self, entry: BlacklistEntry, nick: str) -> None:
+        """用抓取到的官方昵称更新条目:
+        - 官方改名历史: 旧抓取昵称与新抓取不同 → 记入曾用昵称;
+        - 需求: 用官方昵称替换“玩家昵称”字段, 用户手填旧昵称不同 → 记入曾用昵称;
+        - 同步表格(曾用昵称列 + 玩家昵称输入框)。
+        锁定条目(服务器条目)只更新内部字段, 不改写用户可见字段。
+        """
+        old_fetched = (entry.fetched_nickname or "").strip()
+        if old_fetched and old_fetched != nick:
+            entry.push_previous_nickname(old_fetched)
+        entry.fetched_nickname = nick
+        entry.fetched_at = time.time()
+
+        if not entry.locked:
+            manual = (entry.nickname or "").strip()
+            if manual and manual != nick:
+                entry.push_previous_nickname(manual)
+            if manual != nick:
+                entry.nickname = nick
+
+        w = self._row_widgets.get(id(entry))
+        if w is not None:
+            joined = "、".join(entry.previous_nicknames)
+            w["prev"].setText(joined)
+            w["prev"].setToolTip(joined or "暂无曾用昵称")
+            if not entry.locked:
+                w["nick"].setText(nick)
+
     @pyqtSlot(str, object, str)
     def _on_browser_nickname_captured(self, player_id: str, nick: object, state: str) -> None:
-        """浏览器兜底抓到昵称 → 更新对应条目 + 缓存。"""
+        """浏览器兜底抓到昵称 → 替换玩家昵称 + 维护曾用昵称 + 缓存。"""
         nick_str = str(nick) if nick else ""
         if not nick_str:
             self.statusBar().showMessage(f"玩家ID {player_id} 昵称抓取失败: {state}", 5000)
@@ -1458,18 +1492,9 @@ class MainWindow(QMainWindow):
         changed = False
         for entry in self.store.entries:
             if (entry.player_id or "").strip() == player_id:
-                old = (entry.fetched_nickname or "").strip()
-                if old and old != nick_clean:
-                    entry.push_previous_nickname(old)
-                entry.fetched_nickname = nick_clean
-                entry.fetched_at = time.time()
+                self._apply_fetched_nickname(entry, nick_clean)
                 changed = True
                 self.nickname_cache.set(player_id, nick_clean, entry.fetched_at, save=True)
-                w = self._row_widgets.get(id(entry))
-                if w is not None:
-                    joined = "、".join(entry.previous_nicknames)
-                    w["prev"].setText(joined)
-                    w["prev"].setToolTip(joined or "暂无曾用昵称")
         if changed:
             self.store.save()
             self._refresh_cache_dialog()
@@ -1480,7 +1505,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(dict)
     def _on_profiles(self, result: dict) -> None:
-        """收到通过ID访问 WT Live 获取到的昵称: 维护曾用昵称 + 持久化 + 提醒。"""
+        """收到通过ID访问 WT Live 获取到的昵称: 替换玩家昵称 + 维护曾用昵称 + 持久化。"""
         if not result:
             return
         changed = False
@@ -1489,17 +1514,8 @@ class MainWindow(QMainWindow):
             nick = result.get(pid)
             if not nick:
                 continue
-            old = (entry.fetched_nickname or "").strip()
-            if old and old != nick:
-                entry.push_previous_nickname(old)  # 玩家改过昵称 → 记录曾用昵称
-            entry.fetched_nickname = nick
-            entry.fetched_at = time.time()
+            self._apply_fetched_nickname(entry, nick)
             changed = True
-            widgets = self._row_widgets.get(id(entry))
-            if widgets is not None:
-                joined = "、".join(entry.previous_nicknames)
-                widgets["prev"].setText(joined)
-                widgets["prev"].setToolTip(joined or "暂无曾用昵称")
         if changed:
             self.store.save()
             self._refresh_cache_dialog()
@@ -1565,22 +1581,45 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"正在抓取黑名单昵称 {done}/{total}…", 2000)
 
     # ------------------------------------------------------------------
+    def _ask_close_mode(self) -> str:
+        """点X时询问关闭方式, 返回 'quit'(关闭程序) 或 'tray'(收起到系统托盘)。"""
+        # offscreen(自动化测试/无桌面)不弹窗, 直接视为关闭, 避免模态框阻塞测试
+        if QApplication.platformName() == "offscreen":
+            return "quit"
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("退出确认")
+        box.setText(
+            "关闭主界面后程序仍会在后台监控对局, 可从系统托盘重新打开。\n"
+            "请选择关闭方式:"
+        )
+        btn_quit = box.addButton("关闭程序", QMessageBox.ButtonRole.AcceptRole)
+        btn_tray = box.addButton("收起到系统托盘", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return "quit" if box.clickedButton() is btn_quit else "tray"
+
     def closeEvent(self, event) -> None:  # noqa: N802
-        # 点击“X” → 最小化到系统托盘(而非真正退出)
-        if not self._really_quit and getattr(self, "_tray_available", False):
-            event.ignore()
-            self.hide()
-            try:
-                self._tray.showMessage(
-                    "WTBlackList",
-                    "应用已最小化到系统托盘",
-                    QSystemTrayIcon.MessageIcon.Information,
-                    2000,
-                )
-            except Exception:  # noqa: BLE001
-                pass
-            return
-        # 真正退出
+        # 点击“X” → 弹窗询问: 关闭程序 or 收起到系统托盘
+        if not self._really_quit:
+            if self._ask_close_mode() == "tray":
+                event.ignore()
+                self.hide()
+                try:
+                    self._tray.showMessage(
+                        "WTBlackList",
+                        "应用已最小化到系统托盘",
+                        QSystemTrayIcon.MessageIcon.Information,
+                        2000,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+            self._really_quit = True
+        self._do_quit()
+        super().closeEvent(event)
+
+    def _do_quit(self) -> None:
+        """真正退出: 冲刷保存 → 停监控线程 → 关叠加层 → 隐藏托盘。"""
         self._flush_save()  # 冲刷防抖保存, 避免丢失最后修改
         if self._worker is not None:
             self._worker.stop()
@@ -1595,4 +1634,3 @@ class MainWindow(QMainWindow):
             self._tray.hide()
         except Exception:  # noqa: BLE001
             pass
-        super().closeEvent(event)
