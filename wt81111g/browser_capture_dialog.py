@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import threading
 
-from PyQt6.QtCore import pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
@@ -35,9 +35,8 @@ class BrowserCaptureDialog(QDialog):
             f"玩家ID: {player_id}\n"
             f"当前昵称: {current_nickname or '(未填写)'}\n\n"
             "该玩家无法通过 WTLive/官网接口直接查询。\n"
-            "点击下方按钮打开浏览器, 若页面要求人机验证请手动完成,\n"
-            "软件会自动检测页面加载完成并抓取昵称。\n"
-            "卡在人机验证界面通常是网络问题导致, 还请您自行解决。"
+            "推荐使用应用内浏览器(可自动通过人机验证并抓取昵称);\n"
+            "若自动抓取失败, 可展开下方选项使用系统浏览器手动验证。"
         )
         self._info.setWordWrap(True)
         lay.addWidget(self._info)
@@ -47,22 +46,50 @@ class BrowserCaptureDialog(QDialog):
         self._status.setStyleSheet("color:#5ab0ff;")
         lay.addWidget(self._status)
 
+        # 首选: 应用内浏览器(WebView2, 自动过验证), 视觉上突出引导
         row = QHBoxLayout()
-        self._open_btn = QPushButton("🌐 打开浏览器并开始检测")
-        self._open_btn.setToolTip("启动本机系统浏览器(Edge/Chrome)手动验证")
-        self._open_btn.clicked.connect(self._start)
-        self._wv2_btn = QPushButton("🔷 应用内浏览器")
+        self._wv2_btn = QPushButton("🔷 应用内浏览器(推荐)")
         self._wv2_btn.setToolTip("使用应用内 WebView2 浏览器, 通常可自动通过人机验证")
         self._wv2_btn.clicked.connect(self._start_webview2)
+        self._wv2_btn.setStyleSheet(
+            "QPushButton { background:#1a6fb0; color:#ffffff; border:none; "
+            "border-radius:6px; padding:7px 20px; font-weight:bold; }"
+            "QPushButton:hover { background:#2a80c0; }"
+            "QPushButton:disabled { background:#4a5a6a; color:#b0b0c0; }"
+        )
         self._close_btn = QPushButton("取消")
         self._close_btn.clicked.connect(self.reject)
         row.addStretch(1)
-        row.addWidget(self._open_btn)
         row.addWidget(self._wv2_btn)
         row.addWidget(self._close_btn)
         lay.addLayout(row)
 
+        # 次要: 系统浏览器(默认折叠, 点击链接展开)
+        link_row = QHBoxLayout()
+        link_row.addStretch(1)
+        self._open_btn = QPushButton("🌐 打开浏览器并开始检测")
+        self._open_btn.setToolTip("启动本机系统浏览器(Edge/Chrome)手动验证")
+        self._open_btn.clicked.connect(self._start)
+        self._open_btn.hide()
+        link_row.addWidget(self._open_btn)
+        self._toggle_btn = QPushButton("使用系统浏览器手动验证")
+        self._toggle_btn.setFlat(True)
+        self._toggle_btn.setStyleSheet("color:#7ec8e3;")
+        self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle_btn.clicked.connect(self._toggle_system_browser)
+        link_row.addWidget(self._toggle_btn)
+        lay.addLayout(link_row)
+
         self.nickname_captured.connect(self._on_captured)
+
+    def _toggle_system_browser(self) -> None:
+        """展开/收起'打开系统浏览器'的次要选项。"""
+        if self._open_btn.isHidden():
+            self._open_btn.show()
+            self._toggle_btn.setText("收起系统浏览器选项")
+        else:
+            self._open_btn.hide()
+            self._toggle_btn.setText("使用系统浏览器手动验证")
 
     def _start(self) -> None:
         if self._running:

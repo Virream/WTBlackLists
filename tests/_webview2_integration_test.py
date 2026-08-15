@@ -30,11 +30,17 @@ def _app() -> QApplication:
 def main() -> int:
     _app()
 
-    # 1) 对话框包含'应用内浏览器'按钮
+    # 1) 对话框: 应用内浏览器为推荐首选, 系统浏览器默认折叠
     dlg = BrowserCaptureDialog("123", "旧昵称", None)
-    texts = {b.text() for b in dlg.findChildren(QPushButton)}
-    assert "🔷 应用内浏览器" in texts, texts
+    texts = [b.text() for b in dlg.findChildren(QPushButton)]
+    assert any("🔷 应用内浏览器" in t for t in texts), texts
     assert dlg._wv2_btn is not None
+    assert dlg._open_btn.isHidden(), "系统浏览器按钮默认应折叠隐藏"
+    # 展开/收起
+    dlg._toggle_system_browser()
+    assert not dlg._open_btn.isHidden(), "展开后应显示系统浏览器按钮"
+    dlg._toggle_system_browser()
+    assert dlg._open_btn.isHidden(), "再次点击应收起"
     dlg.close()
 
     # 2) run_capture: 用 mock Popen 验证子进程命令与结果解析
