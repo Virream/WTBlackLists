@@ -55,6 +55,7 @@ from .import_export import export_zip, format_size, import_zip
 from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
+from .nickname_refresh_dialog import NicknameRefreshDialog
 from .nickname_sync_dialog import NicknameSyncDialog
 from .notifications_dialog import NotificationsDialog
 from .proxy_config import get_proxy as _get_proxy, set_proxy as _apply_proxy
@@ -949,8 +950,28 @@ class MainWindow(QMainWindow):
             log.exception("自动保存失败")
 
     def _manual_check(self) -> None:
-        if self._worker is not None:
-            self._worker.manual_requested.emit()
+        """打开刷新昵称窗口: 统计需更新的昵称, 逐一通过 WTLive/浏览器兜底更新。"""
+        dlg = NicknameRefreshDialog(
+            self.store, self.nickname_cache, self.app_settings, self
+        )
+        dlg.nickname_fetched.connect(self._on_refresh_fetched)
+        dlg.exec()
+
+    @pyqtSlot(str, str)
+    def _on_refresh_fetched(self, player_id: str, nick: str) -> None:
+        """刷新窗口抓到一个昵称 → 清洗并更新所有匹配条目 + 缓存。"""
+        from .nickname_util import clean_wtlive_nickname
+        nick_clean = clean_wtlive_nickname(nick)
+        changed = False
+        for entry in self.store.entries:
+            if (entry.player_id or "").strip() == player_id:
+                self._apply_fetched_nickname(entry, nick_clean)
+                changed = True
+        if changed:
+            self.store.save()
+            self._refresh_cache_dialog()
+            self.nickname_cache.set(player_id, nick_clean, time.time(), save=True)
+            self._notify(f"已更新玩家ID '{player_id}' 昵称: {nick_clean}", "good")
 
     def _check_feed(self) -> None:
         if self._worker is not None:
@@ -1524,7 +1545,7 @@ class MainWindow(QMainWindow):
             # 已勾选"下次自动打开浏览器": 后台自动抓取, 不弹窗不打断游戏
             self._start_auto_webview2(player_id)
             return
-        dlg = BrowserCaptureDialog(player_id, current_nickname, self.app_settings, self)
+        dlg = BrowserCaptureDialog(player_id, current_nickname, self)
         dlg.nickname_captured.connect(self._on_browser_nickname_captured)
         dlg.show()
         self._browser_capture_dialog = dlg  # 保持引用
