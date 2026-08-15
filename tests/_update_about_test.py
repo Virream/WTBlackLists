@@ -55,6 +55,19 @@ def main() -> int:
     assert win._update_btn is not None and win._update_btn.text() == "🔄 检查更新"
     assert "代理: 未开启" in win.proxy_state_label.text(), win.proxy_state_label.text()
 
+    # 4) 连接检测标签: 可点击 + 初始'点击检测' + 检测后冒号后显示延迟
+    from wt81111g.main_window import _ClickableLabel
+    assert "点击检测" in win.feed_label.text(), win.feed_label.text()
+    assert "点击检测" in win.github_label.text()
+    assert isinstance(win.feed_label, _ClickableLabel)
+    assert isinstance(win.github_label, _ClickableLabel)
+    win._on_github_checked(True, 0.35)
+    assert "GitHub 访问: 350ms" in win.github_label.text(), win.github_label.text()
+    win._on_github_checked(False, 0.0)
+    assert "不可达" in win.github_label.text()
+    win._on_feed_status("good", "350ms")
+    assert "WT Live 访问: 350ms" in win.feed_label.text(), win.feed_label.text()
+
     from wt81111g.proxy_config import set_proxy
     set_proxy("127.0.0.1:7890")
     win._refresh_proxy_state()
@@ -63,7 +76,7 @@ def main() -> int:
     win._refresh_proxy_state()
     assert "未开启" in win.proxy_state_label.text()
 
-    # 4) UpdateDialog 可构造
+    # 5) UpdateDialog 可构造
     ud = UpdateDialog({
         "version": "2.0.1", "current": "2.0.0", "body": "更新日志",
         "html_url": "https://github.com", "download_url": "",

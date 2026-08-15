@@ -366,13 +366,13 @@ class MonitorWorker(QObject):
             ok, sec = check_feed_latency()
             self._bump_wtlive_count()  # 访问了一次 WT Live 首页
             if not ok:
-                level, text = "bad", f"不可达({sec:.1f}s), 建议开启加速器"
+                level, text = "bad", "不可达"
             elif sec < 3.0:
-                level, text = "good", f"流畅({sec:.2f}s)"
+                level, text = "good", f"{sec * 1000:.0f}ms"
             elif sec < 8.0:
-                level, text = "warn", f"较慢({sec:.2f}s), 建议开启加速器"
+                level, text = "warn", f"{sec * 1000:.0f}ms"
             else:
-                level, text = "warn", f"缓慢({sec:.1f}s), 建议开启加速器"
+                level, text = "warn", f"{sec * 1000:.0f}ms"
             log.info("feed latency: %s %s", level, text)
             self.feed_status.emit(level, text)
 

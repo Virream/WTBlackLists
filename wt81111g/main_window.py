@@ -74,6 +74,16 @@ HEADERS = ["勾选", "玩家昵称", "玩家ID", "原因", "事件发生日期",
 _REMARK_MAX = 1000  # 备注最大字数
 
 
+class _ClickableLabel(QLabel):
+    """可点击的 QLabel: 左键按下时发射 clicked(用于连接检测区的'点击检测'标签)。"""
+    clicked = pyqtSignal()
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class _RemarkEditor(QPlainTextEdit):
     """限制最大字数的备注编辑器。
 
@@ -261,32 +271,18 @@ class MainWindow(QMainWindow):
         self.conn_label = QLabel("8111 连接状态: 未连接")
         self.conn_label.setStyleSheet("color:#8a8a8a;")
         g4g.addWidget(self.conn_label, 0, 0)
-        self.feed_label = QLabel("WT Live 访问: 未检测")
-        feed_check_btn = QPushButton("检测")
-        feed_check_btn.setFixedWidth(48)
-        feed_check_btn.setToolTip("手动检测 WT Live 连通性")
-        feed_check_btn.clicked.connect(self._check_feed)
-        feed_row = QWidget()
-        feed_lay = QHBoxLayout(feed_row)
-        feed_lay.setContentsMargins(0, 0, 0, 0)
-        feed_lay.setSpacing(4)
-        feed_lay.addWidget(self.feed_label, 1)
-        feed_lay.addWidget(feed_check_btn)
-        g4g.addWidget(feed_row, 1, 0)
+        self.feed_label = _ClickableLabel("WT Live 访问: 点击检测")
+        self.feed_label.setToolTip("点击检测 WT Live 连通性")
+        self.feed_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.feed_label.clicked.connect(self._check_feed)
+        g4g.addWidget(self.feed_label, 1, 0)
         self.wtlive_label = QLabel("WT Live 访问(本次): 0 次")
         g4g.addWidget(self.wtlive_label, 0, 1)
-        self.github_label = QLabel("GitHub 访问: 未检测")
-        github_check_btn = QPushButton("检测")
-        github_check_btn.setFixedWidth(48)
-        github_check_btn.setToolTip("检测 GitHub API 连通性(共享表/更新)")
-        github_check_btn.clicked.connect(self._check_github)
-        github_row = QWidget()
-        github_lay = QHBoxLayout(github_row)
-        github_lay.setContentsMargins(0, 0, 0, 0)
-        github_lay.setSpacing(4)
-        github_lay.addWidget(self.github_label, 1)
-        github_lay.addWidget(github_check_btn)
-        g4g.addWidget(github_row, 1, 1)
+        self.github_label = _ClickableLabel("GitHub 访问: 点击检测")
+        self.github_label.setToolTip("点击检测 GitHub API 连通性")
+        self.github_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.github_label.clicked.connect(self._check_github)
+        g4g.addWidget(self.github_label, 1, 1)
         self.proxy_state_label = QLabel("代理: 未开启")
         self.proxy_state_label.setStyleSheet("color:#8a8a8a;")
         g4g.addWidget(self.proxy_state_label, 0, 2)
@@ -1622,7 +1618,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(bool, float)
     def _on_github_checked(self, ok: bool, ms: float) -> None:
         if ok:
-            self.github_label.setText(f"GitHub 访问: 正常 ({ms * 1000:.0f}ms)")
+            self.github_label.setText(f"GitHub 访问: {ms * 1000:.0f}ms")
             self.github_label.setStyleSheet("color:#5ab0ff;")
         else:
             self.github_label.setText("GitHub 访问: 不可达")
