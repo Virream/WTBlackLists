@@ -56,6 +56,8 @@ class AppSettings:
         self.sync_enabled = False
         # 代理: 设置后所有网络请求都走该代理; 空串=直连
         self.proxy = ""
+        # 自动打开浏览器: 勾选后下次需要浏览器兜底时自动打开应用内浏览器并自动抓取, 不弹窗打断
+        self.auto_browser = False
         existed = os.path.exists(self.path)
         self._load()
         # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换
@@ -94,6 +96,7 @@ class AppSettings:
                     self.audit_servers = [d for d in au if isinstance(d, dict)]
                 self.sync_enabled = bool(data.get("sync_enabled", False))
                 self.proxy = str(data.get("proxy", "") or "")
+                self.auto_browser = bool(data.get("auto_browser", False))
         except Exception:  # noqa: BLE001
             pass
 
@@ -106,6 +109,7 @@ class AppSettings:
                 "audit_servers": self.audit_servers,
                 "sync_enabled": self.sync_enabled,
                 "proxy": self.proxy,
+                "auto_browser": self.auto_browser,
             }
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

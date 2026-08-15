@@ -117,6 +117,8 @@ class MainWindow(QMainWindow):
     # 后台检测信号: GitHub 连通性(bool, 耗时秒) / 版本更新检查结果(dict 或 None)
     _github_checked = pyqtSignal(bool, float)
     _update_checked = pyqtSignal(object)
+    # 自动浏览器抓取完成: (player_id, nickname 或 None, 状态)
+    _auto_capture_done = pyqtSignal(str, object, str)
 
     def __init__(self, store_path: str | None = None, start_monitor: bool = True,
                  nickname_cache: NicknameCache | None = None):
@@ -414,6 +416,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("就绪")
         self._update_checked.connect(self._on_update_checked)
         self._github_checked.connect(self._on_github_checked)
+        self._auto_capture_done.connect(self._on_browser_nickname_captured)
         self._refresh_proxy_state()
         self._start_update_check()  # 每次启动自动检测 GitHub 是否有新版本
 
@@ -1492,11 +1495,26 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, str)
     def _on_nickname_manual_needed(self, player_id: str, current_nickname: str) -> None:
-        """WTLive 与官网都查不到该玩家 → 弹交互式浏览器兜底对话框。"""
-        dlg = BrowserCaptureDialog(player_id, current_nickname, self)
+        """WTLive 与官网都查不到该玩家 → 浏览器兜底。"""
+        if self.app_settings.auto_browser:
+            # 已勾选"下次自动打开浏览器": 后台自动抓取, 不弹窗不打断游戏
+            self._start_auto_webview2(player_id)
+            return
+        dlg = BrowserCaptureDialog(player_id, current_nickname, self.app_settings, self)
         dlg.nickname_captured.connect(self._on_browser_nickname_captured)
         dlg.show()
         self._browser_capture_dialog = dlg  # 保持引用
+
+    def _start_auto_webview2(self, player_id: str) -> None:
+        """后台启动应用内浏览器(隐藏窗口)自动抓取, 不打断游戏。"""
+        self.statusBar().showMessage(f"正在后台自动获取玩家 {player_id} 昵称…", 4000)
+
+        def work() -> None:
+            from .webview2_capture import run_capture
+            nick, state = run_capture(player_id, hidden=True)
+            self._auto_capture_done.emit(player_id, nick, state)
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _apply_fetched_nickname(self, entry: BlacklistEntry, nick: str) -> None:
         """用抓取到的官方昵称更新条目:

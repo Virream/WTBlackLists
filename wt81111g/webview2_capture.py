@@ -33,18 +33,30 @@ def _capture_js() -> str:
     )
 
 
-def child_main(uid: str, outfile: str) -> int:
-    """子进程入口: 运行 pywebview 窗口抓取昵称, 结果写入 outfile。"""
+def child_main(uid: str, outfile: str, hidden: bool = False) -> int:
+    """子进程入口: 运行 pywebview 窗口抓取昵称, 结果写入 outfile。
+
+    hidden=True 时窗口先隐藏(不打断游戏/不抢焦点), 若超过一定时间未自动
+    通过验证(可能需要人工点击), 再显示窗口让用户处理。
+    """
     import webview
 
     url = WEBSITE_USERINFO_TEMPLATE.format(player_id=uid)
     js = _capture_js()
     nickname = ""
+    _shown = [hidden]  # 隐藏模式下是否已转显示
 
     def poll(window) -> None:
         nonlocal nickname
         start = time.time()
         while time.time() - start < _TIMEOUT:
+            # 隐藏模式: 15 秒仍未自动通过验证 → 显示窗口让用户处理
+            if hidden and not _shown[0] and time.time() - start > 15:
+                _shown[0] = True
+                try:
+                    window.show()
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 res = window.evaluate_js(js)
             except Exception:  # noqa: BLE001
@@ -56,7 +68,9 @@ def child_main(uid: str, outfile: str) -> int:
             time.sleep(1)
         window.destroy()
 
-    window = webview.create_window(_WINDOW_TITLE, url, width=1100, height=850)
+    window = webview.create_window(
+        _WINDOW_TITLE, url, width=1100, height=850, hidden=hidden,
+    )
     webview.start(poll, window)
 
     try:
@@ -67,13 +81,17 @@ def child_main(uid: str, outfile: str) -> int:
     return 0
 
 
-def run_capture(player_id: str, timeout: float = 200) -> tuple[str | None, str]:
+def run_capture(player_id: str, hidden: bool = False,
+                timeout: float = 200) -> tuple[str | None, str]:
     """主进程调用: 启动子进程跑 WebView2 抓取, 返回 (昵称或 None, 状态说明)。"""
     fd, outfile = tempfile.mkstemp(prefix="wtbl_wv2_", suffix=".json")
     os.close(fd)
     try:
+        cmd = [sys.executable, "--webview2-capture", player_id, outfile]
+        if hidden:
+            cmd.append("--hidden")
         proc = subprocess.Popen(
-            [sys.executable, "--webview2-capture", player_id, outfile],
+            cmd,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
         try:

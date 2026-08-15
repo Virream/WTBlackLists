@@ -12,7 +12,7 @@ import threading
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    QCheckBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
 from .browser_capture import capture_nickname_via_browser
@@ -22,10 +22,11 @@ class BrowserCaptureDialog(QDialog):
     # 抓取完成: (player_id, nickname 或 None, 状态说明)
     nickname_captured = pyqtSignal(str, object, str)
 
-    def __init__(self, player_id: str, current_nickname: str, parent=None):
+    def __init__(self, player_id: str, current_nickname: str, settings=None, parent=None):
         super().__init__(parent)
         self._player_id = player_id
         self._current_nickname = current_nickname
+        self._settings = settings
         self._running = False
         self.setWindowTitle("浏览器抓取昵称")
         self.setMinimumWidth(520)
@@ -48,6 +49,14 @@ class BrowserCaptureDialog(QDialog):
 
         # 首选: 应用内浏览器(WebView2, 自动过验证), 视觉上突出引导
         row = QHBoxLayout()
+        self._auto_check = QCheckBox("下次自动打开浏览器")
+        self._auto_check.setToolTip(
+            "勾选后, 下次需要浏览器获取昵称时自动打开应用内浏览器并自动抓取,"
+            "不弹窗打断游戏"
+        )
+        if settings is not None:
+            self._auto_check.setChecked(bool(settings.auto_browser))
+        self._auto_check.toggled.connect(self._on_auto_toggled)
         self._wv2_btn = QPushButton("🔷 应用内浏览器(推荐)")
         self._wv2_btn.setToolTip("使用应用内 WebView2 浏览器, 通常可自动通过人机验证")
         self._wv2_btn.clicked.connect(self._start_webview2)
@@ -60,6 +69,7 @@ class BrowserCaptureDialog(QDialog):
         self._close_btn = QPushButton("取消")
         self._close_btn.clicked.connect(self.reject)
         row.addStretch(1)
+        row.addWidget(self._auto_check)
         row.addWidget(self._wv2_btn)
         row.addWidget(self._close_btn)
         lay.addLayout(row)
@@ -81,6 +91,12 @@ class BrowserCaptureDialog(QDialog):
         lay.addLayout(link_row)
 
         self.nickname_captured.connect(self._on_captured)
+
+    def _on_auto_toggled(self, checked: bool) -> None:
+        """勾选框状态持久化到设置。"""
+        if self._settings is not None:
+            self._settings.auto_browser = bool(checked)
+            self._settings.save()
 
     def _toggle_system_browser(self) -> None:
         """展开/收起'打开系统浏览器'的次要选项。"""
