@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""共享昵称表对话框验证(offscreen)。"""
+"""共享昵称表对话框验证(offscreen): 上传服务器选择 + 未登录提示。"""
 import os
 import sys
 import tempfile
@@ -18,21 +18,41 @@ d = tempfile.mkdtemp()
 settings = AppSettings(os.path.join(d, "config.json"))
 cache = NicknameCache(os.path.join(d, "nc.json"))
 
+# 首次预置: audit_servers 含官方但未登录
 dlg = NicknameSyncDialog(settings, cache, None)
-assert dlg.sync_check is not None and dlg.pull_btn is not None
+assert dlg.server_combo is not None and dlg.pull_btn is not None
 assert dlg.upload_btn is not None and dlg.status is not None
-
-# 开关状态与 settings 同步
-assert dlg.sync_check.isChecked() == settings.sync_enabled
-dlg.sync_check.setChecked(True)
-assert settings.sync_enabled is True, "开关应写回 settings"
-# 重新加载确认持久化
-s2 = AppSettings(os.path.join(d, "config.json"))
-assert s2.sync_enabled is True, "sync_enabled 应持久化"
-
-# 默认仓库(首次预置)应存在
+assert not hasattr(dlg, "sync_check"), "启用网络同步开关应已删除"
+assert dlg.upload_btn.isEnabled() is False, "未登录应禁用上传"
+assert "未登录" in dlg.login_hint.text(), dlg.login_hint.text()
+# 未登录点击上传 → 更新下方提示
+dlg._upload()
+assert "未登录" in dlg.status.text(), dlg.status.text()
+# 默认仓库(拉取用)应存在
 assert settings.fetch_servers and "Virream/WTBlackLists" in settings.fetch_servers[0]["url"]
 print("仓库:", settings.fetch_servers[0]["url"])
-
 dlg.close()
+
+# 已登录审核服务器 → 可上传, 用对应账号
+settings.audit_servers = [{
+    "url": "https://github.com/Virream/WTBlackLists.git",
+    "platform": "github", "name": "官方共享仓库 (Virream/WTBlackLists)",
+    "token": "tok", "logged_in": True, "username": "Alice",
+}]
+dlg2 = NicknameSyncDialog(settings, cache, None)
+assert dlg2.upload_btn.isEnabled() is True, "已登录应可上传"
+assert "Alice" in dlg2.login_hint.text(), dlg2.login_hint.text()
+dlg2.close()
+
+# 未登录服务器 → 禁用 + 提示
+settings.audit_servers = [{
+    "url": "https://github.com/Virream/WTBlackLists.git",
+    "platform": "github", "name": "官方", "token": "", "logged_in": False,
+}]
+dlg3 = NicknameSyncDialog(settings, cache, None)
+assert dlg3.upload_btn.isEnabled() is False
+assert "未登录" in dlg3.login_hint.text()
+dlg3.close()
+
 print("NICKNAME SYNC DIALOG TEST PASSED")
+

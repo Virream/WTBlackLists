@@ -5,13 +5,12 @@ import threading
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QCheckBox, QDialog, QLabel, QPushButton, QVBoxLayout,
+    QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
 from .nickname_cache import NicknameCache
 from .nickname_sync import (
-    collect_pending, fetch_shared_table, find_github_token,
-    merge_shared_into_cache, submit_issue,
+    collect_pending, fetch_shared_table, merge_shared_into_cache, submit_issue,
 )
 from .settings import AppSettings
 
@@ -41,11 +40,21 @@ class NicknameSyncDialog(QDialog):
         desc.setStyleSheet("color:#b8c4d4;")
         lay.addWidget(desc)
 
-        # 网络同步开关
-        self.sync_check = QCheckBox("启用网络同步(上传抓取到的昵称到共享表, 需登录 GitHub)")
-        self.sync_check.setChecked(bool(settings.sync_enabled))
-        self.sync_check.toggled.connect(self._on_toggle)
-        lay.addWidget(self.sync_check)
+        # 上传服务器选择(从服务器设置已添加的审核服务器中选, 用对应登录账号发 issue)
+        srv_row = QHBoxLayout()
+        srv_row.addWidget(QLabel("上传服务器:"))
+        self.server_combo = QComboBox()
+        self.server_combo.setToolTip("选择用哪个已登录账号提交 issue")
+        for s in settings.audit_servers:
+            name = s.get("name") or s.get("url") or "(未命名)"
+            if s.get("logged_in") and s.get("token"):
+                label = f"{name} ({s.get('username') or '已登录'})"
+            else:
+                label = f"{name} (未登录)"
+            self.server_combo.addItem(label, s)
+        self.server_combo.currentIndexChanged.connect(self._refresh_login_hint)
+        srv_row.addWidget(self.server_combo, 1)
+        lay.addLayout(srv_row)
 
         self.login_hint = QLabel("")
         self.login_hint.setStyleSheet("color:#e67e22;")
@@ -73,21 +82,25 @@ class NicknameSyncDialog(QDialog):
         self._refresh_login_hint()
 
     # ------------------------------------------------------------------
+    def _selected_server(self) -> dict | None:
+        idx = self.server_combo.currentIndex()
+        if idx < 0:
+            return None
+        return self.server_combo.itemData(idx)
+
     def _refresh_login_hint(self) -> None:
-        if not self._settings.sync_enabled:
-            self.login_hint.setText("网络同步已关闭")
+        s = self._selected_server()
+        if s is None:
+            self.login_hint.setText("⚠ 未添加审核服务器, 请先在「服务器设置」中添加")
+            self.upload_btn.setEnabled(False)
             return
-        if not find_github_token(self._settings):
-            self.login_hint.setText("⚠ 未登录 GitHub, 无法上传; 请先在「服务器设置」中登录")
+        if not (s.get("logged_in") and s.get("token")):
+            self.login_hint.setText("⚠ 当前服务器未登录, 无法上传; 请先在「服务器设置」中登录")
             self.upload_btn.setEnabled(False)
         else:
-            self.login_hint.setText("已登录 GitHub, 可上传")
+            self.login_hint.setText(
+                f"将以 {s.get('username') or '该账号'} 的账号提交 issue")
             self.upload_btn.setEnabled(True)
-
-    def _on_toggle(self, checked: bool) -> None:
-        self._settings.sync_enabled = checked
-        self._settings.save()
-        self._refresh_login_hint()
 
     def _repo(self) -> str | None:
         """上传/拉取用仓库: 优先第一个拉取服务器, 否则第一个已登录审核服务器。"""
@@ -132,16 +145,16 @@ class NicknameSyncDialog(QDialog):
         return f"拉取完成: 新增 {added} 条, 更新 {updated} 条"
 
     def _upload(self) -> None:
-        if not self._settings.sync_enabled:
-            self.status.setText("请先勾选「启用网络同步」")
+        s = self._selected_server()
+        if s is None:
+            self.status.setText("未添加审核服务器, 请先在「服务器设置」中添加")
+            self._refresh_login_hint()
             return
-        token = find_github_token(self._settings)
-        if not token:
-            self.status.setText("未登录 GitHub, 无法上传; 请在服务器设置中登录")
-            return
-        url = self._repo()
-        if not url:
-            self.status.setText("未配置仓库")
+        url = str(s.get("url") or "").strip()
+        token = str(s.get("token") or "").strip()
+        if not (s.get("logged_in") and url and token):
+            self.status.setText("当前服务器未登录, 无法上传; 请先在「服务器设置」中登录")
+            self._refresh_login_hint()
             return
         self.upload_btn.setEnabled(False)
         self.status.setText("对比共享表并提交中…")
