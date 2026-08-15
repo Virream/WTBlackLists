@@ -1750,6 +1750,8 @@ class MainWindow(QMainWindow):
             dlg = CacheDialog(self.nickname_cache, self.app_settings, self)
             dlg.auto_changed.connect(self._on_auto_update_changed)
             self._cache_dialog = dlg
+        # 模态显示: 窗口存在期间禁用主界面操作(不阻塞代码, 信号照常处理)
+        dlg.setModal(True)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
