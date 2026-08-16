@@ -89,21 +89,51 @@ def _headers_github(token: str | None = None) -> dict:
 # 拉取
 # ----------------------------------------------------------------------
 def fetch_entries(url: str) -> list[dict]:
-    """从公开仓库拉取名单条目列表。文件不存在视为空列表。"""
-    raw = raw_url(url)
-    if not raw:
+    """从公开仓库拉取名单条目列表。文件不存在视为空列表。
+
+    GitHub 走 api.github.com contents API(与上传/审核同一条通道, 避免
+    raw.githubusercontent.com 在部分网络下不可达导致长时间卡住);
+    Gitee 走 raw 地址。
+    """
+    p = parse_repo_url(url)
+    if not p:
         raise ValueError("不支持的仓库地址(仅支持 GitHub / Gitee)")
-    try:
-        r = requests.get(raw, timeout=TIMEOUT, headers={"User-Agent": UA})
-    except requests.RequestException as exc:
-        raise ValueError(f"无法连接服务器: {exc}") from exc
-    if r.status_code == 404:
-        return []
-    r.raise_for_status()
-    try:
-        data = r.json()
-    except ValueError as exc:
-        raise ValueError("服务器文件不是有效的 JSON") from exc
+    plat, owner, repo = p
+    if plat == "github":
+        api = (f"https://api.github.com/repos/{owner}/{repo}/contents/"
+               f"{DEFAULT_FILE}?ref={DEFAULT_BRANCH}")
+        try:
+            r = requests.get(api, timeout=TIMEOUT, headers=_headers_github())
+        except requests.RequestException as exc:
+            raise ValueError(f"无法连接服务器: {exc}") from exc
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        try:
+            j = r.json()
+        except ValueError as exc:
+            raise ValueError("服务器文件不是有效的 JSON") from exc
+        if not isinstance(j, dict) or not j.get("content"):
+            raise ValueError("服务器文件内容读取失败")
+        try:
+            import base64 as _b64
+            text = _b64.b64decode(j["content"]).decode("utf-8", "replace")
+            data = json.loads(text)
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("服务器文件不是有效的 JSON") from exc
+    else:
+        raw = f"https://gitee.com/{owner}/{repo}/raw/{DEFAULT_BRANCH}/{DEFAULT_FILE}"
+        try:
+            r = requests.get(raw, timeout=TIMEOUT, headers={"User-Agent": UA})
+        except requests.RequestException as exc:
+            raise ValueError(f"无法连接服务器: {exc}") from exc
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        try:
+            data = r.json()
+        except ValueError as exc:
+            raise ValueError("服务器文件不是有效的 JSON") from exc
     if not isinstance(data, list):
         raise ValueError("服务器名单格式错误: 应为条目列表")
     return [d for d in data if isinstance(d, dict)]

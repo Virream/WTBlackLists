@@ -31,14 +31,15 @@ ISSUE_TITLE = "[nickname-sync] 客户端提交昵称更新"
 
 
 def shared_json_url(repo_url: str) -> str | None:
-    """公开仓库 nickname.json 的 raw 地址(GitHub/Gitee)。"""
+    """公开仓库 nickname.json 的读取地址(GitHub 走 contents API, Gitee 走 raw)。"""
     from .server_sync import parse_repo_url
     p = parse_repo_url(repo_url)
     if not p:
         return None
     plat, owner, repo = p
     if plat == "github":
-        return f"https://raw.githubusercontent.com/{owner}/{repo}/{DEFAULT_BRANCH}/nickname.json"
+        return (f"https://api.github.com/repos/{owner}/{repo}/contents/"
+                f"nickname.json?ref={DEFAULT_BRANCH}")
     return f"https://gitee.com/{owner}/{repo}/raw/{DEFAULT_BRANCH}/nickname.json"
 
 
@@ -46,6 +47,7 @@ def fetch_shared_table(repo_url: str) -> dict[str, dict]:
     """拉取共享表, 返回 {uid: {"nickname": str, "ts": float}}。
 
     文件不存在/格式错误/网络失败均返回 {} (不抛异常)。
+    GitHub 走 contents API(base64 内容), Gitee 走 raw。
     """
     url = shared_json_url(repo_url)
     if not url:
@@ -57,8 +59,16 @@ def fetch_shared_table(repo_url: str) -> dict[str, dict]:
     if r.status_code != 200:
         return {}
     try:
-        data = r.json()
-    except ValueError:
+        if "/contents/" in url:  # GitHub contents API → base64
+            import base64 as _b64
+            j = r.json()
+            if not isinstance(j, dict) or not j.get("content"):
+                return {}
+            text = _b64.b64decode(j["content"]).decode("utf-8", "replace")
+            data = json.loads(text)
+        else:  # Gitee raw
+            data = r.json()
+    except Exception:  # noqa: BLE001
         return {}
     nicks = data.get("nicknames") if isinstance(data, dict) else None
     if not isinstance(nicks, dict):

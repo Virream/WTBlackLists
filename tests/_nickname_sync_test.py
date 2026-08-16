@@ -23,10 +23,11 @@ def check(name: str, cond: bool, *extra) -> None:
         raise AssertionError(name)
 
 
-# 1. raw URL 解析
+# 1. 共享表 URL 解析
+
 u = shared_json_url("https://github.com/Virream/WTBlackLists")
-check("github raw 地址",
-      u == "https://raw.githubusercontent.com/Virream/WTBlackLists/main/nickname.json")
+check("github api 地址",
+      u == "https://api.github.com/repos/Virream/WTBlackLists/contents/nickname.json?ref=main")
 check("不支持地址返回 None", shared_json_url("https://example.com/x") is None)
 
 # 2. 合并进本地缓存
