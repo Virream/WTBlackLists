@@ -32,6 +32,10 @@ APP_EXE = "WTBlackList.exe"
 PAYLOAD_ZIP = "app_payload.zip"
 FREE_MARGIN = 300 * 1024 * 1024  # 300 MB 剩余空间余量
 
+# 用户运行时数据目录(位于安装目录下), 解压时一律跳过:
+# 防止升级安装时用载荷里的空 data/evidences 覆盖用户已有的设置/黑名单/昵称缓存/证据。
+PAYLOAD_SKIP_PREFIXES = ("data/", "evidences/")
+
 # 深色高对比度界面: 显式指定全部颜色, 避免浅色背景 + 白色文字的可读性问题
 _DARK_QSS = """
 QDialog {
@@ -232,7 +236,11 @@ def create_shortcut(target_exe: str, workdir: str) -> str:
 def install(target: str) -> str:
     os.makedirs(target, exist_ok=True)
     with zipfile.ZipFile(payload_path(), "r") as z:
-        z.extractall(target)
+        for info in z.infolist():
+            name = info.filename.replace("\\", "/")
+            if name.startswith(PAYLOAD_SKIP_PREFIXES):
+                continue  # 用户数据目录, 绝不覆盖
+            z.extract(info, target)
     exe = os.path.join(target, APP_EXE)
     return create_shortcut(exe, target)
 
