@@ -64,6 +64,7 @@ def api(method: str, path: str, token: str,
     elif body is not None:
         data = json.dumps(body).encode()
         req.add_header("Content-Type", "application/json")
+    # 走系统代理(Clash 等); 上传大文件对节点稳定性要求高, 失败时外层重试
     try:
         with urllib.request.urlopen(req, data=data, timeout=600) as r:
             raw = r.read()
@@ -77,7 +78,7 @@ def api(method: str, path: str, token: str,
 
 def main() -> int:
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    tag = sys.argv[1] if len(sys.argv) > 1 else "v2.0.0"
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v2.0.1"
     title = sys.argv[2] if len(sys.argv) > 2 else f"WTBlackList {tag.lstrip('v')}"
     notes_file = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_NOTES
     token = get_token()

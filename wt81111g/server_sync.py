@@ -27,7 +27,7 @@ except Exception:  # noqa: BLE001
 DEFAULT_FILE = "blacklist.json"
 DEFAULT_BRANCH = "main"
 TIMEOUT = 15
-UA = "WTBlackList/2.0.0"
+UA = "WTBlackList/2.0.1"
 MAX_RETRIES = 3          # 乐观锁冲突自动重试上限
 RETRY_DELAY = 0.6        # 重试间隔(秒)
 
