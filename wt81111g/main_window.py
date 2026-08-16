@@ -512,7 +512,28 @@ class MainWindow(QMainWindow):
         link.setPlaceholderText("https://...")
         link.setMaxLength(128)  # 录像链接不超过 128 字符
         link.setToolTip("录像链接: 不超过128字符")
-        self.table.setCellWidget(row, 6, link)
+        # 录像链接前加"复制"按钮: 一键复制该条目链接, 方便审核快速打开
+        copy_btn = QToolButton()
+        copy_btn.setText("📋")
+        copy_btn.setToolTip("复制该条目的录像链接")
+        copy_btn.setFixedSize(26, 26)
+        link_cell = QWidget()
+        link_lay = QHBoxLayout(link_cell)
+        link_lay.setContentsMargins(0, 0, 0, 0)
+        link_lay.setSpacing(2)
+        link_lay.addWidget(copy_btn)
+        link_lay.addWidget(link, 1)
+        self.table.setCellWidget(row, 6, link_cell)
+
+        def on_copy_link() -> None:
+            url = (link.text() or entry.replay_link or "").strip()
+            if not url:
+                self.statusBar().showMessage("该条目未填写录像链接", 3000)
+                return
+            QApplication.clipboard().setText(url)
+            self.statusBar().showMessage(f"已复制录像链接: {url}", 3000)
+
+        copy_btn.clicked.connect(on_copy_link)
 
         btn = QToolButton()
         btn.setIcon(self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon))
