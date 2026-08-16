@@ -1,7 +1,7 @@
 name: nickname-sync
 on:
   schedule:
-    - cron: "0 0,6,12,18 * * *"  # 每 6 小时一次(UTC 0/6/12/18 点, 即北京 8/14/20/2 点)
+    - cron: "0 * * * *"  # 每 1 小时一次(UTC 整点; 仓库为 public, Actions 免费不限分钟)
   workflow_dispatch: {}  # 支持手动触发
 
 permissions:
