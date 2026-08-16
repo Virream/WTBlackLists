@@ -37,7 +37,8 @@ class OverlaySettings:
 
 
 # 官方默认共享仓库(黑名单共享 + 审核 + nickname.json 共享表)
-DEFAULT_REPO = "https://github.com/Virream/WTBlackLists.git"
+# 数据与代码分离: 数据存于独立公开仓库 WTBlackListsData, 代码/版本更新仍在本仓库
+DEFAULT_REPO = "https://github.com/Virream/WTBlackListsData.git"
 
 
 class AppSettings:
@@ -72,7 +73,7 @@ class AppSettings:
         return {
             "url": DEFAULT_REPO,
             "platform": "github",
-            "name": "官方共享仓库 (Virream/WTBlackLists)",
+            "name": "官方共享仓库 (Virream/WTBlackListsData)",
         }
 
     def _load(self) -> None:

@@ -29,14 +29,14 @@ assert "未登录" in dlg.login_hint.text(), dlg.login_hint.text()
 dlg._upload()
 assert "未登录" in dlg.status.text(), dlg.status.text()
 # 默认仓库(拉取用)应存在
-assert settings.fetch_servers and "Virream/WTBlackLists" in settings.fetch_servers[0]["url"]
+assert settings.fetch_servers and "Virream/WTBlackListsData" in settings.fetch_servers[0]["url"]
 print("仓库:", settings.fetch_servers[0]["url"])
 dlg.close()
 
 # 已登录审核服务器 → 可上传, 用对应账号
 settings.audit_servers = [{
-    "url": "https://github.com/Virream/WTBlackLists.git",
-    "platform": "github", "name": "官方共享仓库 (Virream/WTBlackLists)",
+    "url": "https://github.com/Virream/WTBlackListsData.git",
+    "platform": "github", "name": "官方共享仓库 (Virream/WTBlackListsData)",
     "token": "tok", "logged_in": True, "username": "Alice",
 }]
 dlg2 = NicknameSyncDialog(settings, cache, None)
@@ -46,7 +46,7 @@ dlg2.close()
 
 # 未登录服务器 → 禁用 + 提示
 settings.audit_servers = [{
-    "url": "https://github.com/Virream/WTBlackLists.git",
+    "url": "https://github.com/Virream/WTBlackListsData.git",
     "platform": "github", "name": "官方", "token": "", "logged_in": False,
 }]
 dlg3 = NicknameSyncDialog(settings, cache, None)

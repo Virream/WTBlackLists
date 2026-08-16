@@ -9,8 +9,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from wt81111g import review_sync as rs
 
 # ---- review_json_url ----
-assert rs.review_json_url("https://github.com/Virream/WTBlackLists") == (
-    "https://raw.githubusercontent.com/Virream/WTBlackLists/main/review_pending.json")
+assert rs.review_json_url("https://github.com/Virream/WTBlackListsData") == (
+    "https://raw.githubusercontent.com/Virream/WTBlackListsData/main/review_pending.json")
 assert rs.review_json_url("https://example.com/x") is None
 
 # ---- validate_entry ----

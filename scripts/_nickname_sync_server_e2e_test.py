@@ -53,7 +53,7 @@ def fake_api(method: str, path: str, payload=None):
 
 def main() -> int:
     srv.api = fake_api
-    srv.REPO = "Virream/WTBlackLists"
+    srv.REPO = "Virream/WTBlackListsData"
     srv.TOKEN = "tok"
     srv.BRANCH = "main"
 

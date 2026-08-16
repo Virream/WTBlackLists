@@ -15,7 +15,7 @@ from wt81111g.settings import AppSettings
 app = QApplication([])
 d = tempfile.mkdtemp()
 
-REPO = "https://github.com/Virream/WTBlackLists.git"
+REPO = "https://github.com/Virream/WTBlackListsData.git"
 ENTRIES = [{
     "player_id": "123", "nickname": "abc", "reason": "x",
     "event_date": "2024-01-01", "replay_link": "https://r", "remarks": "备注",

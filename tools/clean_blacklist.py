@@ -74,7 +74,7 @@ def fetch_ban_ids(source: str) -> set[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="清理仓库 blacklist.json 中已封号玩家")
-    parser.add_argument("repo_url", help="GitHub 仓库地址, 如 https://github.com/Virream/WTBlackLists")
+    parser.add_argument("repo_url", help="GitHub 仓库地址, 如 https://github.com/Virream/WTBlackListsData")
     parser.add_argument("--apply", action="store_true", help="真正删除命中条目并写回(默认仅预览)")
     parser.add_argument("--ban-file", default=None, help="本地封号名单 CSV 路径(默认拉取社区 Fair Play 名单)")
     args = parser.parse_args()
