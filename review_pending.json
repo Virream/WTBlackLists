@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": 1786856844,
+  "updated_at": 1786856889,
   "items": [
     {
       "id": "3ac5b86e-40ba-4a99-affc-96f616a206b5",
@@ -13,9 +13,9 @@
       "replay_link": "https://test.com",
       "remarks": "测试",
       "previous_nicknames": [],
-      "status": "pending",
-      "checkout_by": "",
-      "checkout_at": 0
+      "status": "checking",
+      "checkout_by": "Virream",
+      "checkout_at": 1786856889
     }
   ]
 }
