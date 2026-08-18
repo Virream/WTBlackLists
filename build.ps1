@@ -4,6 +4,11 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $root ".venv\Scripts\python.exe"
 Set-Location $root
 
+# 当前版本号(来自 config.py APP_VERSION), 产物文件名带上版本号
+$version = & $py -c "import re,io,sys; t=io.open('wt81111g/config.py',encoding='utf-8').read(); m=re.search('APP_VERSION\\s*=\\s*[\\x22\\x27]([^\\x22\\x27]+)[\\x22\\x27]', t); sys.stdout.write(m.group(1) if m else '0.0.0')"
+if (-not $version) { $version = "0.0.0" }
+Write-Host "当前版本: $version"
+
 Write-Host "== 1/5 生成图标(app.ico) =="
 & $py "tools\png_to_ico.py"
 
@@ -33,7 +38,7 @@ Write-Host "== 3/5 生成应用载荷 zip =="
 & $py "tools\make_payload.py"
 
 Write-Host "== 4/5 生成 ZIP 版 =="
-Copy-Item "build_assets\app_payload.zip" "dist\WTBlackList.zip" -Force
+Copy-Item "build_assets\app_payload.zip" "dist\WTBlackList_${version}.zip" -Force
 
 Write-Host "== 5/5 打包自解压安装程序 =="
 & $py -m PyInstaller `
@@ -47,13 +52,17 @@ Write-Host "== 5/5 打包自解压安装程序 =="
     --add-data "build_assets\app_payload.zip;." `
     --version-file version_info_installer.txt `
     "tools\installer\installer_main.py"
+# 安装程序文件名带上版本号
+Remove-Item "dist\WTBlackList_Setup_${version}.exe" -Force -ErrorAction SilentlyContinue
+Rename-Item "dist\WTBlackList_Setup.exe" "WTBlackList_Setup_${version}.exe"
 
 Write-Host "== 6/6 生成源码 zip(放入 dist) =="
 & $py "tools\make_source_zip.py"
-Copy-Item "WTBlackList_source.zip" "dist\WTBlackList_source.zip" -Force
+Copy-Item "WTBlackList_source.zip" "dist\WTBlackList_source_${version}.zip" -Force
+Remove-Item "WTBlackList_source.zip" -Force -ErrorAction SilentlyContinue
 
 Write-Host "== 完成 =="
 Write-Host "  应用目录: dist\WTBlackList\WTBlackList.exe"
-Write-Host "  ZIP 版:   dist\WTBlackList.zip"
-Write-Host "  安装版:   dist\WTBlackList_Setup.exe"
-Write-Host "  源码版:   dist\WTBlackList_source.zip"
+Write-Host "  ZIP 版:   dist\WTBlackList_${version}.zip"
+Write-Host "  安装版:   dist\WTBlackList_Setup_${version}.exe"
+Write-Host "  源码版:   dist\WTBlackList_source_${version}.zip"

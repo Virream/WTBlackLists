@@ -25,11 +25,41 @@ DEFAULT_NOTES = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "build_assets", "release_notes.md",
 )
-ASSETS = [
-    ("dist/WTBlackList.zip", "application/zip"),
-    ("dist/WTBlackList_Setup.exe", "application/octet-stream"),
-    ("dist/WTBlackList_source.zip", "application/zip"),
-]
+ASSETS: list = []  # 由 main 动态构建(产物文件名带版本号)
+
+
+def _read_version(base: str) -> str:
+    """从 config.py 读取当前版本号。"""
+    try:
+        import re
+        with open(os.path.join(base, "wt81111g", "config.py"), encoding="utf-8") as f:
+            m = re.search(r"APP_VERSION\s*=\s*['\"]([^'\"]+)['\"]", f.read())
+        return m.group(1) if m else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _asset_files(base: str, ver: str) -> list[tuple[str, str, str]]:
+    """(相对路径, content_type, 上传文件名): 带版本文件名优先, 缺则回退旧名。"""
+    cands = [
+        (f"dist/WTBlackList_{ver}.zip", "application/zip", f"WTBlackList_{ver}.zip"),
+        (f"dist/WTBlackList_Setup_{ver}.exe", "application/octet-stream",
+         f"WTBlackList_Setup_{ver}.exe"),
+        (f"dist/WTBlackList_source_{ver}.zip", "application/zip",
+         f"WTBlackList_source_{ver}.zip"),
+    ]
+    legacy = [
+        ("dist/WTBlackList.zip", "application/zip", "WTBlackList.zip"),
+        ("dist/WTBlackList_Setup.exe", "application/octet-stream", "WTBlackList_Setup.exe"),
+        ("dist/WTBlackList_source.zip", "application/zip", "WTBlackList_source.zip"),
+    ]
+    out = []
+    for cand, leg in zip(cands, legacy):
+        if os.path.isfile(os.path.join(base, cand[0])):
+            out.append(cand)
+        else:
+            out.append(leg)
+    return out
 
 
 def get_token() -> str:
@@ -82,6 +112,7 @@ def main() -> int:
     title = sys.argv[2] if len(sys.argv) > 2 else f"WTBlackList {tag.lstrip('v')}"
     notes_file = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_NOTES
     token = get_token()
+    ver = _read_version(base)
     notes = ""
     if os.path.isfile(notes_file):
         with open(notes_file, encoding="utf-8") as f:
@@ -114,12 +145,11 @@ def main() -> int:
     rel_id = rel["id"]
     print(f"已创建 release {tag}: {rel['html_url']}")
 
-    for rel_path, ctype in ASSETS:
+    for rel_path, ctype, fname in _asset_files(base, ver):
         full = os.path.join(base, rel_path)
         if not os.path.isfile(full):
             print(f"跳过(文件不存在): {rel_path}")
             continue
-        fname = os.path.basename(rel_path)
         with open(full, "rb") as f:
             data = f.read()
         api("POST",
