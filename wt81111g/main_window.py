@@ -55,6 +55,7 @@ from .monitor import MonitorWorker
 from .progress_dialog import ProgressDialog
 from .nickname_cache import NicknameCache
 from .nickname_refresh_dialog import NicknameRefreshDialog
+from .nickname_sync import collect_pending, fetch_shared_table, submit_issue
 from .nickname_sync_dialog import NicknameSyncDialog
 from .notifications_dialog import NotificationsDialog
 from .proxy_config import get_proxy as _get_proxy, set_proxy as _apply_proxy
@@ -122,6 +123,8 @@ class MainWindow(QMainWindow):
     _auto_capture_done = pyqtSignal(str, object, str)
     # 上传后重新拉取服务器条目完成: (all_entries, errors) 回主线程合并(避免 UI 冻结)
     _refetch_done = pyqtSignal(list, list)
+    # 自动上传昵称完成状态(后台线程 emit, 主线程显示)
+    _auto_upload_status = pyqtSignal(str)
 
     def __init__(self, store_path: str | None = None, start_monitor: bool = True,
                  nickname_cache: NicknameCache | None = None):
@@ -157,6 +160,7 @@ class MainWindow(QMainWindow):
         self._last_delete_ids: set[str] = set()
         self._active_review: tuple[str, str] | None = None  # (待审核仓库URL, 条目ID) 正在审核的一条
         self._export_finished.connect(self._on_export_done)
+        self._auto_upload_status.connect(self._on_auto_upload_status)
         self._import_finished.connect(self._on_import_done)
         self._refetch_done.connect(self._on_refetch_done)
         self._build_ui()
@@ -1151,6 +1155,7 @@ class MainWindow(QMainWindow):
             self._refresh_cache_dialog()
             self.nickname_cache.set(player_id, nick_clean, time.time(), save=True)
             self._notify(f"已更新玩家ID '{player_id}' 昵称: {nick_clean}", "good")
+            self._auto_upload_nicknames()
 
     def _check_feed(self) -> None:
         if self._worker is not None:
@@ -1814,6 +1819,7 @@ class MainWindow(QMainWindow):
             self._update_nickname_reminder()
             self._notify(f"玩家ID '{player_id}' 昵称已更新: {nick_clean}", "good")
             self.statusBar().showMessage(f"已通过浏览器更新昵称: {nick_clean}", 5000)
+            self._auto_upload_nicknames()
         else:
             self.statusBar().showMessage(f"未找到玩家ID {player_id} 的条目", 5000)
 
@@ -1836,6 +1842,7 @@ class MainWindow(QMainWindow):
             self._update_nickname_reminder()
         self._notify(f"已从 WTLive/官网 获取 {len(result)} 个黑名单玩家昵称", "good")
         self.statusBar().showMessage(f"已获取 {len(result)} 个黑名单玩家昵称", 4000)
+        self._auto_upload_nicknames()
 
     def _update_nickname_reminder(self) -> None:
         """当通过ID获取到的昵称与用户填写的玩家昵称不一致时, 在右侧统计区下方文字提醒。"""
@@ -1855,6 +1862,45 @@ class MainWindow(QMainWindow):
         else:
             self.reminder_label.clear()
             self.reminder_label.hide()
+
+    def _auto_upload_nicknames(self) -> None:
+        """自动上传: 刷新昵称后把本地最新 ID↔昵称上传共享表(需已登录审核服务器)。
+
+        「共享昵称表」窗口的"自动上传本地昵称表"开关控制, 默认开启。
+        未登录/无待传条目/失败 → 静默跳过, 不影响主流程。
+        """
+        if not getattr(self.app_settings, "auto_upload", False):
+            return
+        srv = None
+        for s in self.app_settings.audit_servers:
+            if s.get("logged_in") and s.get("url") and s.get("token"):
+                srv = s
+                break
+        if srv is None:
+            return
+        url = str(srv.get("url") or "").strip()
+        token = str(srv.get("token") or "").strip()
+        if not (url and token):
+            return
+
+        def work() -> None:
+            try:
+                remote = fetch_shared_table(url)
+                pending = collect_pending(remote, self.nickname_cache)
+                if not pending:
+                    return
+                number, _html = submit_issue(url, token, pending)
+                self._auto_upload_status.emit(
+                    f"已自动上传 {len(pending)} 条昵称至共享表 (issue #{number})")
+            except Exception:  # noqa: BLE001
+                pass  # 自动上传失败静默, 不打扰用户
+
+        threading.Thread(target=work, daemon=True).start()
+
+    @pyqtSlot(str)
+    def _on_auto_upload_status(self, msg: str) -> None:
+        """主线程显示自动上传结果。"""
+        self.statusBar().showMessage(msg, 6000)
 
     def _open_nickname_sync(self) -> None:
         """打开共享昵称表同步对话框(拉取合并 / 开关 / issue 上传)。"""

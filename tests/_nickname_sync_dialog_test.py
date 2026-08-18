@@ -25,6 +25,16 @@ assert dlg.upload_btn is not None and dlg.status is not None
 assert not hasattr(dlg, "sync_check"), "启用网络同步开关应已删除"
 assert dlg.upload_btn.isEnabled() is False, "未登录应禁用上传"
 assert "未登录" in dlg.login_hint.text(), dlg.login_hint.text()
+# 自动上传开关: 存在且默认勾选, 切换写回设置
+assert hasattr(dlg, "auto_upload_check"), "应有自动上传开关"
+assert dlg.auto_upload_check.isChecked() is True, "默认应勾选"
+assert settings.auto_upload is True
+settings.auto_upload = True
+settings.save()
+dlg.auto_upload_check.setChecked(False)
+assert settings.auto_upload is False, "取消勾选应写回设置"
+dlg.auto_upload_check.setChecked(True)
+assert settings.auto_upload is True
 # 未登录点击上传 → 更新下方提示
 dlg._upload()
 assert "未登录" in dlg.status.text(), dlg.status.text()

@@ -59,6 +59,8 @@ class AppSettings:
         self.proxy = ""
         # 自动更新: 勾选后 24h 过期的昵称在进入新对局时自动更新(默认开启)
         self.auto_browser = True
+        # 自动上传: 刷新昵称后自动把本地最新昵称上传共享表(需已登录审核服务器, 默认开启)
+        self.auto_upload = True
         existed = os.path.exists(self.path)
         self._load()
         # 首次(无配置文件)预置官方默认仓库; 用户删除后不再自动加回, 可自行更换
@@ -98,6 +100,7 @@ class AppSettings:
                 self.sync_enabled = bool(data.get("sync_enabled", False))
                 self.proxy = str(data.get("proxy", "") or "")
                 self.auto_browser = bool(data.get("auto_browser", False))
+                self.auto_upload = bool(data.get("auto_upload", True))
         except Exception:  # noqa: BLE001
             pass
 
@@ -111,6 +114,7 @@ class AppSettings:
                 "sync_enabled": self.sync_enabled,
                 "proxy": self.proxy,
                 "auto_browser": self.auto_browser,
+                "auto_upload": self.auto_upload,
             }
             with open(self.path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False, indent=2)

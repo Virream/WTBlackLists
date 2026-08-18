@@ -2,10 +2,15 @@
 import os
 import sys
 import tempfile
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# 禁用主窗口启动时的版本检测网络线程: 测试环境无网络, 避免后台线程残留/超时导致原生崩溃
+import wt81111g.main_window as _mw
+_mw._check_latest = lambda: None
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
@@ -18,6 +23,7 @@ from wt81111g.blacklist import (
 from wt81111g.main_window import MainWindow
 from wt81111g.monitor import MonitorWorker
 from wt81111g.nickname_cache import NicknameCache
+from wt81111g.settings import AppSettings
 
 results = []
 
@@ -374,6 +380,62 @@ def test_shared_table_fallback_on_fail() -> None:
     worker.stop()
 
 
+def test_auto_upload_nicknames() -> None:
+    """自动上传: 刷新后自动把本地最新昵称上传共享表(需已登录审核服务器)。"""
+    app = QApplication.instance() or QApplication([])  # 复用已有实例
+    tmpdir = tempfile.mkdtemp()
+    win = MainWindow(os.path.join(tmpdir, "blacklist.json"), start_monitor=False)
+    win.app_settings = AppSettings(os.path.join(tmpdir, "config.json"))
+    win.app_settings.auto_upload = True
+    win.app_settings.audit_servers = [{
+        "url": "https://github.com/Virream/WTBlackListsData.git",
+        "platform": "github", "name": "官方", "token": "tok",
+        "logged_in": True, "username": "Alice",
+    }]
+    win.nickname_cache.set("111", "Nick111", time.time())
+
+    # main_window 用 `from .nickname_sync import ...` 绑定到自身命名空间,
+    # 必须 mock main_window 模块上的引用才有效
+    import wt81111g.main_window as mw
+    mw.fetch_shared_table = lambda url: {}
+    submitted = []
+    done_evt = threading.Event()
+    mw.submit_issue = lambda url, token, entries: (
+        submitted.append((url, token, list(entries))) or done_evt.set()
+        or (1, "http://x"))
+
+    # 已登录 + 开启 → 提交 issue
+    win._auto_upload_nicknames()
+    assert done_evt.wait(5), "已登录应提交 issue"
+    assert submitted
+    _url, token, entries = submitted[0]
+    assert token == "tok"
+    assert any(e["uid"] == "111" for e in entries)
+
+    # 关闭自动上传 → 不再提交
+    win.app_settings.auto_upload = False
+    done_evt.clear()
+    submitted.clear()
+    win._auto_upload_nicknames()
+    assert not done_evt.wait(0.5), "关闭后不应提交"
+    assert not submitted
+
+    # 未登录服务器 → 不提交
+    win.app_settings.auto_upload = True
+    win.app_settings.audit_servers = [{
+        "url": "https://github.com/Virream/WTBlackListsData.git",
+        "platform": "github", "name": "官方", "token": "", "logged_in": False,
+    }]
+    done_evt.clear()
+    submitted.clear()
+    win._auto_upload_nicknames()
+    assert not done_evt.wait(0.5), "未登录不应提交"
+    assert not submitted
+
+    results.append("auto upload nicknames OK")
+    win.close()
+
+
 def main() -> int:
     test_blacklist_history()
     test_monitor_fresh_only()
@@ -383,10 +445,11 @@ def main() -> int:
     test_testflight_detection()
     test_shared_table_avoids_wtlive()
     test_shared_table_fallback_on_fail()
+    test_auto_upload_nicknames()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 10 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 11 else "FAILED")
     return 0
 
 

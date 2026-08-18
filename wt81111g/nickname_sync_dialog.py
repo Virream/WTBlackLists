@@ -5,7 +5,7 @@ import threading
 
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
-    QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
+    QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout,
 )
 
 from .nickname_cache import NicknameCache
@@ -60,6 +60,15 @@ class NicknameSyncDialog(QDialog):
         self.login_hint.setStyleSheet("color:#e67e22;")
         lay.addWidget(self.login_hint)
 
+        # 自动上传开关
+        self.auto_upload_check = QCheckBox("自动上传本地昵称表")
+        self.auto_upload_check.setChecked(bool(settings.auto_upload))
+        self.auto_upload_check.setToolTip(
+            "刷新昵称后, 自动把本地最新的 ID↔昵称上传共享表(需已登录审核服务器)。\n"
+            "服务端处理后其他玩家即可查到该昵称。")
+        self.auto_upload_check.toggled.connect(self._on_auto_upload_toggled)
+        lay.addWidget(self.auto_upload_check)
+
         # 按钮行
         row = QVBoxLayout()
         self.pull_btn = QPushButton("🔽 拉取共享表并合并到本地")
@@ -101,6 +110,14 @@ class NicknameSyncDialog(QDialog):
             self.login_hint.setText(
                 f"将以 {s.get('username') or '该账号'} 的账号提交 issue")
             self.upload_btn.setEnabled(True)
+
+    def _on_auto_upload_toggled(self, checked: bool) -> None:
+        """自动上传开关: 写回设置并保存。"""
+        self._settings.auto_upload = bool(checked)
+        try:
+            self._settings.save()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _repo(self) -> str | None:
         """上传/拉取用仓库: 优先第一个拉取服务器, 否则第一个已登录审核服务器。"""

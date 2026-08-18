@@ -299,12 +299,16 @@ class MonitorWorker(QObject):
                     snick = str((shared.get(pid) or {}).get("nickname") or "").strip()
                     if snick:
                         nick = clean_wtlive_nickname(snick) or snick
-                        fetched_at = time.time()
+                        # 写缓存保留共享表原始 ts: 避免 collect_pending 判为
+                        # "本地更新者"而把共享表已有的昵称重复上传
+                        rec = shared.get(pid) or {}
+                        cache_ts = float(rec.get("ts") or 0) or time.time()
+                        fetched_at = time.time()  # 内存判断用 now(24h 内不重抓)
                         if self._stop.is_set():
                             return  # 退出中, 不再 emit
                         with lock:
                             self._profile_cache[pid] = (nick, fetched_at)
-                            updates.append((pid, nick, fetched_at, False))
+                            updates.append((pid, nick, cache_ts, False))
                             result[pid] = nick
                         done += 1
                         self.prefetch_progress.emit(done, total)
