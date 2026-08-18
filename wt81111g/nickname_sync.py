@@ -20,7 +20,7 @@ import requests
 
 DEFAULT_BRANCH = "main"
 TIMEOUT = 15
-UA = "WTBlackList/2.0.1"
+UA = "WTBlackList/2.0.2"
 
 _NICKNAME_MAX = 32
 _UID_RE = re.compile(r"^\d{1,16}$")

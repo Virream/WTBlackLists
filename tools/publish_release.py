@@ -78,7 +78,7 @@ def api(method: str, path: str, token: str,
 
 def main() -> int:
     base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    tag = sys.argv[1] if len(sys.argv) > 1 else "v2.0.1"
+    tag = sys.argv[1] if len(sys.argv) > 1 else "v2.0.2"
     title = sys.argv[2] if len(sys.argv) > 2 else f"WTBlackList {tag.lstrip('v')}"
     notes_file = sys.argv[3] if len(sys.argv) > 3 else DEFAULT_NOTES
     token = get_token()

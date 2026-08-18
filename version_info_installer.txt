@@ -17,12 +17,12 @@ VSVersionInfo(
           [
             StringStruct(u'CompanyName', u'WTBlackList'),
             StringStruct(u'FileDescription', u'战争雷霆黑名单助手 安装程序'),
-            StringStruct(u'FileVersion', u'2.0.1'),
+            StringStruct(u'FileVersion', u'2.0.2'),
             StringStruct(u'InternalName', u'WTBlackList_Setup'),
             StringStruct(u'LegalCopyright', u'仅供个人使用'),
             StringStruct(u'OriginalFilename', u'WTBlackList_Setup.exe'),
             StringStruct(u'ProductName', u'战争雷霆黑名单助手'),
-            StringStruct(u'ProductVersion', u'2.0.1')
+            StringStruct(u'ProductVersion', u'2.0.2')
           ]
         )
       ]
