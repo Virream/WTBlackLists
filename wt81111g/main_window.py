@@ -1683,7 +1683,14 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     def _start_monitor(self) -> None:
         self._thread = QThread(self)
-        self._worker = MonitorWorker(self.store, nickname_cache=self.nickname_cache)
+        # 昵称自动刷新优先查公开仓库共享表(命中免访问 WTLive/官网)
+        fetch_url = ""
+        if self.app_settings.fetch_servers:
+            fetch_url = str(self.app_settings.fetch_servers[0].get("url", "") or "")
+        self._worker = MonitorWorker(
+            self.store, nickname_cache=self.nickname_cache,
+            shared_repo_url=fetch_url or None,
+        )
         self._worker.auto_update = self.app_settings.auto_browser
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)

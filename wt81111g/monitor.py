@@ -16,6 +16,7 @@ from .api8111 import WT8111
 from .blacklist import BlacklistStore
 from .nickname_cache import NicknameCache
 from .nickname_collector import parse_hudmsg_names
+from .nickname_sync import fetch_shared_table
 from .nickname_util import (
     battle_nickname_variants, clean_wtlive_nickname, matches,
 )
@@ -50,11 +51,14 @@ class MonitorWorker(QObject):
     def __init__(self, store: BlacklistStore,
                  nickname_cache: NicknameCache | None = None,
                  base_url: str = "http://localhost:8111",
-                 poll_interval: float = 1.0):
+                 poll_interval: float = 1.0,
+                 shared_repo_url: str | None = None):
         super().__init__()
         self.store = store
         self.nickname_cache = nickname_cache or NicknameCache()
         self.poll_interval = poll_interval
+        # 公开仓库共享表(nickname.json)地址: 自动刷新优先查此表, 命中则免访问 WTLive/官网
+        self.shared_repo_url = shared_repo_url
         self.client = WT8111(base_url)
         self.manual_requested.connect(self._on_manual_check)
         self.feed_requested.connect(self._on_feed_check)
@@ -256,6 +260,17 @@ class MonitorWorker(QObject):
         def work() -> None:
             try:
                 now = time.time()
+                # 先从公开仓库共享表(nickname.json)拉一次: 命中的 ID 免访问
+                # WTLive/官网, 显著减少对 war thunder 站点的访问频率。
+                # 拉取失败/无服务器配置 → 空表, 静默降级为纯 WTLive 抓取。
+                shared: dict[str, dict] = {}
+                if self.shared_repo_url:
+                    try:
+                        shared = fetch_shared_table(self.shared_repo_url) or {}
+                    except Exception:  # noqa: BLE001
+                        shared = {}
+                    if shared:
+                        log.info("prefetch: 共享表命中 %d 条, 减少 WTLive 访问", len(shared))
                 # 只处理真正需要抓取的 ID(缓存未命中/过期)
                 pending: list[str] = []
                 for e in self.store.snapshot():
@@ -277,6 +292,23 @@ class MonitorWorker(QObject):
 
                 def fetch_one(pid: str) -> None:
                     nonlocal consec_fail, done, aborted, rate_limited
+                    with lock:
+                        if aborted:
+                            return  # 已被中止(限流/连续失败/超时), 不处理新任务
+                    # 优先查共享表: 命中则直接采用, 免访问 WTLive/官网(不计数不 sleep)
+                    snick = str((shared.get(pid) or {}).get("nickname") or "").strip()
+                    if snick:
+                        nick = clean_wtlive_nickname(snick) or snick
+                        fetched_at = time.time()
+                        if self._stop.is_set():
+                            return  # 退出中, 不再 emit
+                        with lock:
+                            self._profile_cache[pid] = (nick, fetched_at)
+                            updates.append((pid, nick, fetched_at, False))
+                            result[pid] = nick
+                        done += 1
+                        self.prefetch_progress.emit(done, total)
+                        return
                     time.sleep(random.uniform(*self.PREFETCH_INTER_TASK))
                     with lock:
                         if aborted:

@@ -322,6 +322,58 @@ def test_testflight_detection() -> None:
     results.append("test-flight enter/exit via map_info OK")
 
 
+def test_shared_table_avoids_wtlive() -> None:
+    """自动刷新优先查 GitHub 共享表: 命中则免访问 WTLive/官网。"""
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="111"))
+    store.add(BlacklistEntry(player_id="222"))
+    import wt81111g.monitor as mon
+    mon.fetch_shared_table = lambda repo_url: {
+        "111": {"nickname": "SharedOne"},
+        "222": {"nickname": "  SharedTwo@live  "},
+    }
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (
+        f"Fresh{pid}", 200)
+    worker = MonitorWorker(store, nickname_cache=cache,
+                           shared_repo_url="https://github.com/x/y")
+    worker._start_prefetch()
+    deadline = time.time() + 8
+    while worker._prefetch_running and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    assert worker._wtlive_count == 0, "共享表命中不应访问 WTLive"
+    assert cache.get("111")["nickname"] == "SharedOne"
+    assert cache.get("222")["nickname"] == "SharedTwo", cache.get("222")
+    results.append("shared table avoids wtlive OK")
+    worker.stop()
+
+
+def test_shared_table_fallback_on_fail() -> None:
+    """共享表为空/拉取失败 → 静默降级走 WTLive, 不影响原有功能。"""
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="111"))
+    import wt81111g.monitor as mon
+    mon.fetch_shared_table = lambda repo_url: {}
+    calls = []
+    mon.fetch_profile_best_effort = lambda pid, timeout=8, retry_website=2: (
+        calls.append(pid) or (f"Fresh{pid}", 200))
+    worker = MonitorWorker(store, nickname_cache=cache,
+                           shared_repo_url="https://github.com/x/y")
+    worker._start_prefetch()
+    deadline = time.time() + 8
+    while worker._prefetch_running and time.time() < deadline:
+        time.sleep(0.05)
+    time.sleep(0.2)
+    assert calls == ["111"], "共享表为空应回退 WTLive"
+    assert cache.get("111")["nickname"] == "Fresh111"
+    results.append("shared table fallback to wtlive OK")
+    worker.stop()
+
+
 def main() -> int:
     test_blacklist_history()
     test_monitor_fresh_only()
@@ -329,10 +381,12 @@ def main() -> int:
     test_wtlive_optimization()
     test_battle_end_detection()
     test_testflight_detection()
+    test_shared_table_avoids_wtlive()
+    test_shared_table_fallback_on_fail()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 8 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 10 else "FAILED")
     return 0
 
 
