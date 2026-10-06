@@ -32,9 +32,13 @@ COLOR_UNPLAYED = QColor(140, 160, 200, 120)
 COLOR_PLAYER = QColor("#38bdf8")
 COLOR_BG = QColor("#0f172a")
 COLOR_GRID = QColor(255, 255, 255, 18)
-# 战区: 白菱形 + 字母(深色描边保证在任何底图上都能看清)
+# 战区: 菱形 + 字母, 颜色按归属(8111 约定: 蓝=我方, 红=敌方, 白=中立)
 COLOR_ZONE = QColor("#f8fafc")
-COLOR_ZONE_FILL = QColor(15, 23, 42, 150)
+ZONE_SIDE_COLORS = {
+    "ours": QColor("#174DFF"),      # 蓝 = 我方(与 8111 原色一致)
+    "enemy": QColor("#fa0C00"),     # 红 = 敌方
+    "neutral": QColor("#f8fafc"),   # 白 = 中立/未占领(看缓存底图时也用它)
+}
 ZONE_RADIUS = 8.0
 
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
@@ -468,6 +472,7 @@ class RouteMapView(QWidget):
         """画战区: 小菱形 + 中心字母(A/B/C, 由 8111 的 zone_label 提供)。
 
         形状用菱形而不是圆圈: 图上圆圈已经表示起点/标记/终点, 菱形不会混淆。
+        颜色按归属: 蓝 = 我方, 红 = 敌方, 白 = 中立(见 zones.SIDE_*)。
         """
         if not self._show_zones or not self._zones:
             return
@@ -478,22 +483,25 @@ class RouteMapView(QWidget):
                 x, y = float(z["x"]), float(z["y"])
             except (KeyError, TypeError, ValueError):
                 continue
+            side = str(z.get("side") or "neutral")
+            fill = QColor(ZONE_SIDE_COLORS.get(side, ZONE_SIDE_COLORS["neutral"]))
+            label_color = QColor("#0f172a") if side == "neutral" else QColor("#ffffff")
             c = self._to_px(x, y)
             r = ZONE_RADIUS
             diamond = QPolygonF([
                 QPointF(c.x(), c.y() - r), QPointF(c.x() + r, c.y()),
                 QPointF(c.x(), c.y() + r), QPointF(c.x() - r, c.y()),
             ])
-            p.setBrush(QBrush(COLOR_ZONE_FILL))
-            p.setPen(QPen(QColor(15, 23, 42, 200), 3.4))   # 深色描边(浅底图上也能看清)
+            p.setBrush(QBrush(fill))
+            p.setPen(QPen(QColor(15, 23, 42, 210), 3.4))   # 深色描边(浅底图上也能看清)
             p.drawPolygon(diamond)
-            p.setPen(QPen(COLOR_ZONE, 1.8))
+            p.setPen(QPen(COLOR_ZONE, 1.6))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawPolygon(diamond)
             label = str(z.get("label") or "").strip()
             if label:
                 p.setFont(font)
-                p.setPen(QPen(COLOR_ZONE))
+                p.setPen(QPen(label_color))
                 p.drawText(QRectF(c.x() - r, c.y() - r, r * 2, r * 2),
                            int(Qt.AlignmentFlag.AlignCenter), label[:2])
 

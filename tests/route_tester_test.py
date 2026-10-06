@@ -28,7 +28,9 @@ from wt81111g.route_store import (
     point_at, pretty_vehicle, split_points,
 )
 from wt81111g.route_window import RouteTesterWindow
-from wt81111g.zones import mode_name, signature, zones_from_objects
+from wt81111g.zones import (
+    Zone, mode_name, ownership_text, signature, zones_from_objects,
+)
 
 # 测试时不播放系统提示音
 rw.play_sound = lambda action: None
@@ -1373,6 +1375,26 @@ def test_zones_and_modes(tmpdir: str):
     sig3 = signature(zones)
     assert sig3 == "A@0.4329,0.5561;B@0.4990,0.4985;C@0.5899,0.4277", sig3
     assert zones_from_objects([]) == []
+    # 没带颜色的样本 → 全部当“中立”
+    assert {z.side for z in zones} == {"neutral"}
+    assert ownership_text(zones) == ""
+    # 归属色(8111 站在玩家视角): 实测两战区局 = 红(敌方)+蓝(我方)
+    duo = [
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.4727, "y": 0.5456,
+         "zone_id": 0, "zone_label": "A", "color": "#fa0C00"},
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.5137, "y": 0.4705,
+         "zone_id": 1, "zone_label": "B", "color[]": [23, 77, 255]},
+    ]
+    duoz = zones_from_objects(duo)
+    assert [z.side for z in duoz] == ["enemy", "ours"], [z.side for z in duoz]
+    assert duoz[1].color == "#174DFF", duoz[1].color   # color[] 数组也能还原
+    assert duoz[0].side_label == "敌方" and duoz[1].side_label == "我方"
+    assert mode_name(len(duoz)) == "战区攻陷"
+    assert ownership_text(duoz) == "我方 B, 敌方 A", ownership_text(duoz)
+    # 颜色**不进指纹**: 攻陷模式会换手, 但模式还是同一个
+    flipped = [Zone("A", 0.4727, 0.5456, "#174DFF", "ours"),
+               Zone("B", 0.5137, 0.4705, "#fa0C00", "enemy")]
+    assert signature(flipped) == signature(duoz)
     # 旧记录没存过模式 → 未知模式
     bare = RouteRecord("r", "k", "m", "v", "2026-10-06T21:00:00", 1.0, 0.0, 0.0)
     assert bare.mode_label == "未知模式"

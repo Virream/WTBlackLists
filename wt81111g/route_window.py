@@ -41,7 +41,7 @@ from .route_store import (
 )
 from .sound import play as play_sound
 from .sound import play_error as play_error_sound
-from .zones import zones_to_json
+from .zones import ownership_text, zones_to_json
 
 log = logging.getLogger("route_window")
 
@@ -187,10 +187,13 @@ class RouteTesterWindow(QMainWindow):
             "    3 个 → 战区控制(A/B/C 互相争夺)\n"
             "    2 个 → 战区攻陷(开局双方各一个)\n"
             "    1 个 → 战区争夺(单点争夺)\n\n"
+            "战区颜色就是**归属**(站在玩家视角):\n"
+            "    蓝 #174DFF = 我方, 红 #fa0C00 = 敌方, 白 #ffFFFA = 中立/未被占领\n"
+            "(实测: 双方重生点/机场的蓝、红对象成对出现, 旁证了这个约定)\n\n"
             "各战区坐标串作为“模式指纹”记进每条轨迹, 因此同一张图的不同模式\n"
             "会被分开归组(侧栏: 地图 → 模式 → 轨迹)。\n"
-            "战区只在战局内才有数据; 见过的布局会存进 routes.json, 战局结束后\n"
-            "依旧能在地图上画出来。"))
+            "战区只在战局内才有数据; 见过的布局(含颜色)会存进 routes.json,\n"
+            "战局结束后依旧能在地图上画出战区(归属以中立色显示)。"))
         help_menu.addAction(act_mode)
 
     def _make_about_action(self) -> QAction:
@@ -580,8 +583,12 @@ class RouteTesterWindow(QMainWindow):
         if live and recorder is not None and recorder.map_key == key:
             self.map_view.set_zones(zones_to_json(live))
             return
+        # 旧布局: 只画字母 + 中立色 —— 当时谁占着哪个战区早已过期, 不拿来误导
         layout = self.store.layout_for(key, self._zone_signature_for_view())
-        self.map_view.set_zones((layout or {}).get("zones") or [])
+        self.map_view.set_zones([
+            {"label": z.get("label"), "x": z.get("x"), "y": z.get("y")}
+            for z in (layout or {}).get("zones") or []
+        ])
 
     def _selection_tracks(self) -> list[RouteRecord]:
         """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""
@@ -956,8 +963,10 @@ class RouteTesterWindow(QMainWindow):
                     self.lbl_status.setText("已连接 8111 | 等待进入对局/试车场(未获取到玩家位置)")
                 else:
                     mode = str(info.get("mode") or "")
+                    own = ownership_text(info.get("zones") or [])
+                    tail = " | ".join(x for x in (mode, own) if x)
                     self.lbl_status.setText(
-                        f"已连接 8111 | {mode} | 可开始录制" if mode
+                        f"已连接 8111 | {tail} | 可开始录制" if tail
                         else "已连接 8111 | 可开始录制")
 
             # 没有底图时(游戏没开/战局外)用本地缓存补上, 这样关掉游戏也能看回放
