@@ -15,10 +15,11 @@ import subprocess
 import sys
 
 from PyQt6.QtCore import QSize, Qt
-from PyQt6.QtGui import QIcon, QPixmap
+from PyQt6.QtGui import QBrush, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView, QLabel,
-    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QHBoxLayout,
+    QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
 from .map_cache import MapCache, MapEntry
@@ -27,6 +28,7 @@ from .route_store import RouteStore
 log = logging.getLogger("map_manager")
 
 _THUMB = 84          # 预览缩略图边长(px)
+_NAME_COL_W = 300    # “名称”列宽度(必须给足, 否则编辑框会压在预览图上)
 
 
 class MapManagerDialog(QDialog):
@@ -38,16 +40,17 @@ class MapManagerDialog(QDialog):
         self.cache = cache
         self.renamed = 0
         self.setWindowTitle("地图管理")
-        self.resize(820, 520)
+        self.resize(940, 560)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 10, 12, 10)
         root.setSpacing(8)
 
         tip = QLabel(
-            "8111 不提供地图名, 所以这里用**图片内容哈希**区分地图。\n"
-            "双击“名称”列即可改名(名称会显示在左侧列表, 也会写进已录制的轨迹记录)。\n"
-            "缓存图片保存在 data/maps 下, 同一张图只存一份; 删除图片不会删除轨迹记录。")
+            "8111 不提供地图名, 所以这里用「图片内容哈希」区分地图。\n"
+            "给地图起个名字: 双击“名称”单元格直接输入, 或选中后点下面的「重命名选中项…」。\n"
+            "名称会显示在左侧列表, 也会写进已录制的轨迹记录; 缓存图片在 data/maps 下,"
+            "同一张图只存一份; 删除图片不会删除轨迹记录。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#94a3b8;")
         root.addWidget(tip)
@@ -60,12 +63,18 @@ class MapManagerDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
                                    | QAbstractItemView.EditTrigger.EditKeyPressed)
+        # 列宽: 预览固定; 名称列伸缩(靠窗口最小宽度保证它不会小到放不下编辑框);
+        # 其余按内容。以前名称列也是 Stretch 但窗口允许变很窄, 结果被挤成 0 宽,
+        # 编辑框直接压在预览图上。
         head = self.table.horizontalHeader()
+        head.setStretchLastSection(False)
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         head.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         for col in (2, 3, 4):
             head.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setColumnWidth(0, _THUMB + 16)
+        # 预览 + 名称 + 其余按内容的列 + 边距: 小于这个宽度名称列就会被压坏
+        self.setMinimumWidth(_THUMB + 16 + _NAME_COL_W + 300)
         root.addWidget(self.table, 1)
 
         self.lbl_summary = QLabel("")
@@ -74,6 +83,10 @@ class MapManagerDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
+        self.btn_rename = QPushButton("重命名选中项…")
+        self.btn_rename.setToolTip("选中一行后点这里改名(双击“名称”单元格也可以)")
+        self.btn_rename.clicked.connect(self._rename_current)
+        row.addWidget(self.btn_rename)
         self.btn_reload = QPushButton("刷新")
         self.btn_reload.clicked.connect(self.reload)
         row.addWidget(self.btn_reload)
@@ -153,12 +166,47 @@ class MapManagerDialog(QDialog):
         self.table.setItem(row, 4, when)
 
     # ------------------------------------------------------------------ 操作
+    def _commit_editor(self) -> None:
+        """结束正在进行的单元格编辑。
+
+        关键: 否则“还在编辑时就点保存”, 单元格文本还没提交, 刚输入的名字会**静默丢失**
+        (表现为“怎么改都存不上”)。做法是把焦点从编辑器移回表格 —— 失焦即提交。
+        """
+        editor = self.table.findChild(QLineEdit)
+        if editor is not None and editor.isVisible():
+            editor.clearFocus()
+        self.table.setFocus()
+        QApplication.processEvents()
+
     def _current_key(self) -> str | None:
         row = self.table.currentRow()
         if row < 0:
             return None
         item = self.table.item(row, 0)
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
+
+    def _rename_current(self) -> None:
+        """选中一行 → 弹输入框改名(**立即写盘、不关窗口**, 方便一次改多张)。"""
+        row = self.table.currentRow()
+        key = self._current_key()
+        if key is None:
+            QMessageBox.information(self, "重命名地图", "请先在列表里选中一行")
+            return
+        current = self.table.item(row, 1).text().strip() or self.store.display_name(key)
+        name, ok = QInputDialog.getText(self, "重命名地图",
+                                        f"给这张地图起个名字(地图键 {key}):",
+                                        text=current)
+        if not ok:
+            return
+        name = name.strip()
+        item = self.table.item(row, 1)
+        item.setText(name)
+        item.setForeground(QBrush())        # 恢复常规颜色(空名字才会是灰的)
+        item.setToolTip(f"地图键: {key}" + ("" if name else
+                        f"\n留空则按顺序自动编号为「{self.store.display_name(key)}」"))
+        self.store.rename_map(key, name)
+        self.renamed += 1
+        log.info("地图管理: 重命名 %s -> %r", key, name)
 
     def _open_dir(self) -> None:
         path = self.cache.dir
@@ -171,6 +219,7 @@ class MapManagerDialog(QDialog):
             log.warning("打开目录失败 %s: %s", path, exc)
 
     def _remove_current(self) -> None:
+        self._commit_editor()
         key = self._current_key()
         if key is None:
             QMessageBox.information(self, "删除缓存图片", "请先选中一行")
@@ -186,7 +235,8 @@ class MapManagerDialog(QDialog):
             self.reload()
 
     def _save(self) -> None:
-        """把“名称”列写回 store.map_names。"""
+        """把“名称”列写回 store.map_names(含还在编辑、刚输入的内容)。"""
+        self._commit_editor()
         changed = 0
         for row in range(self.table.rowCount()):
             item = self.table.item(row, 1)
@@ -197,7 +247,7 @@ class MapManagerDialog(QDialog):
             if new != self.store.name_of(key):
                 self.store.rename_map(key, new)
                 changed += 1
-        self.renamed = changed
+        self.renamed += changed
         log.info("地图管理: 保存了 %d 个地图名称", changed)
         self.accept()
 
