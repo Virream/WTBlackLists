@@ -1,9 +1,10 @@
-"""树形列表用的图标(眼睛 = 轨迹在地图上显示 / 隐藏)。
+"""树形列表用的图标(眼睛 = 轨迹在地图上显示 / 隐藏; 图钉 = 当前基准版本)。
 
 素材: `assets/icons/eye.png`(显示中)与 `eye_off.png`(已隐藏),
 来自开源图标库 **Lucide**(https://github.com/lucide-icons/lucide, ISC 许可,
 见 `assets/icons/LICENSE-lucide.txt`), 由 `tools/make_icons.py` 从官方 SVG
 光栅化为 **黑色描边 + 透明底** 的 PNG。
+图钉图标不依赖外部资源, 直接 `QPainter` 现画(见 `pin_icon`)。
 
 为什么这样做:
 - 颜色在运行时用 `CompositionMode_SourceIn` 合成 —— 一套黑图就能适配不同状态/主题;
@@ -16,8 +17,10 @@ from __future__ import annotations
 import logging
 import os
 
-from PyQt6.QtCore import QRectF, Qt
-from PyQt6.QtGui import QColor, QIcon, QPainter, QPalette, QPen, QPixmap
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import (
+    QBrush, QColor, QIcon, QPainter, QPalette, QPen, QPixmap, QPolygonF,
+)
 from PyQt6.QtWidgets import QApplication
 
 from .config import resource_path
@@ -30,7 +33,58 @@ _HIDDEN_ALPHA = 110    # 隐藏状态只是“变淡”(太淡会连“有图标
 _FALLBACK_TEXT = QColor("#334155")   # 拿不到调色板(无 QApplication)时的兜底颜色
 
 _cache: dict[tuple[bool, int], QIcon] = {}
+_pin_cache: dict[int, QIcon] = {}
 _logged: set[str] = set()      # 已记录“加载成功”的资源路径(只记一次)
+# 图钉的颜色取调色板的“高亮色”(通常蓝), 拿不到时用这个兜底
+_FALLBACK_PIN = QColor("#2563eb")
+
+
+def _pin_color() -> QColor:
+    app = QApplication.instance()
+    if app is None:
+        return QColor(_FALLBACK_PIN)
+    color = QColor(app.palette().color(QPalette.ColorRole.Highlight))
+    if not color.isValid() or color.lightnessF() > 0.85:
+        return QColor(_FALLBACK_PIN)
+    return color
+
+
+def pin_icon(size: int = ICON_SIZE) -> QIcon:
+    """图钉图标: 标在“当前基准版本”那一行前面。
+
+    直接画而不是加载 PNG: 少一个资源文件、少一道打包环节, 而且**永远不会**
+    因为打包漏带 assets 而消失。
+    """
+    key = int(size)
+    cached = _pin_cache.get(key)
+    if cached is not None:
+        return cached
+    ratio = _device_ratio()
+    px = max(8, int(round(size * ratio)))
+    pm = QPixmap(px, px)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        color = _pin_color()
+        u = px / 18.0                      # 以 18px 为设计基准
+        painter.setPen(QPen(color, max(1.0, 1.5 * u)))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        # 钉头(空心圆) + 中间的孔 + 下面的针
+        painter.drawEllipse(QRectF(4.6 * u, 2.0 * u, 8.8 * u, 8.8 * u))
+        painter.setBrush(color)
+        painter.drawEllipse(QRectF(7.7 * u, 5.1 * u, 2.6 * u, 2.6 * u))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawPolygon(QPolygonF([
+            QPointF(8.1 * u, 10.4 * u), QPointF(9.9 * u, 10.4 * u),
+            QPointF(9.0 * u, 16.0 * u),
+        ]))
+    finally:
+        painter.end()
+    pm.setDevicePixelRatio(ratio)
+    icon = QIcon(pm)
+    _pin_cache[key] = icon
+    return icon
 
 
 def _device_ratio() -> float:

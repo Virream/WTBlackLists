@@ -1268,14 +1268,21 @@ def test_cached_map_switch(tmpdir: str):
     assert win._visible_ids == {rec_b.route_id}, "同一张地图才能一起显示"
     assert child_a.icon(0).cacheKey() != child_b.icon(0).cacheKey()
 
-    # 3) 选中也不允许跨地图: 先选 A 再选 B → 只保留 B(本次新选的那张图)
+    # 3) 选中也不允许跨地图/跨版本: 先选 A 再 Ctrl 选 B → 保留基准(A) 并提示
     child_a.setSelected(True)
+    app.processEvents()
+    child_b.setSelected(True)          # 相当于 Ctrl 点(在已选中基础上追加)
+    app.processEvents()
+    picked = [r.route_id for r in win._selection_tracks()]
+    assert picked == [rec_a.route_id], picked
+    assert "同一版本" in win.lbl_status.text(), win.lbl_status.text()
+    # 想真正换到 B: 直接点它(清空后选中) —— 基准会跟着换过去
+    win.tree.clearSelection()
     app.processEvents()
     child_b.setSelected(True)
     app.processEvents()
-    picked = [r.route_id for r in win._selection_tracks()]
-    assert picked == [rec_b.route_id], picked
-    assert "同一版本" in win.lbl_status.text(), win.lbl_status.text()
+    assert [r.route_id for r in win._selection_tracks()] == [rec_b.route_id]
+    assert win._anchor == win._group_of(rec_b)
     assert [r.route_id for r in win._playable_tracks()] == [rec_b.route_id]
 
     # 4) 回放前会把底图切到选中轨迹的那张图
@@ -1540,6 +1547,42 @@ def test_zones_and_modes(tmpdir: str):
     win._on_tree_double_clicked(rows[2], 1)
     assert win._sel_ids == {rows[2].data(0, rw._ROLE_ID)}
     assert win._anchor == win._group_of(win.store.get(rows[2].data(0, rw._ROLE_ID)))
+    # 双击还会把它显示到地图上(并切到它那张图的缓存底图)
+    assert rows[2].data(0, rw._ROLE_ID) in win._visible_ids
+    assert any(r.route_id == rows[2].data(0, rw._ROLE_ID)
+               for r in win.map_view.visible_tracks)
+
+    # 图钉: 只标在“基准版本”那一行, 换基准时跟着走
+    top_now = win.tree.topLevelItem(0)
+    mode_rows = {top_now.child(i).text(1): top_now.child(i)
+                 for i in range(top_now.childCount())}
+    variant_rows = [mode_rows[m].child(i) for m in mode_rows
+                    for i in range(mode_rows[m].childCount())]
+    pinned = [it for it in variant_rows if not it.icon(0).isNull()]
+    assert len(pinned) == 1, [it.text(1) for it in pinned]
+    base_sig = win.store.get(rows[2].data(0, rw._ROLE_ID)).zone_signature
+    assert pinned[0].data(0, rw._ROLE_SIG) == base_sig, pinned[0].text(1)
+
+    # 没选中任何条目时: 第一个点到的路线就把它的版本定为基准
+    win.tree.clearSelection()
+    app.processEvents()
+    win._anchor = None                  # 模拟“刚打开软件, 还没定过基准”
+    win._refresh_anchor_icon()
+    ctrl_click(rows[0])
+    assert win._anchor == win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID)))
+    ctrl_click(rows[2])                 # 另一个版本 → 被拦下(基准仍是 rows[0] 的版本)
+    assert win._anchor == win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID)))
+    assert not rows[2].isSelected()
+
+    # 录制期间: 侧栏与“会改显示/底图”的菜单入口都要锁住, 并清掉之前的预览
+    live_rec = win.store.get(rows[0].data(0, rw._ROLE_ID))
+    win._visible_ids = {rows[2].data(0, rw._ROLE_ID)}
+    win._enter_recording_ui(live_rec, armed=False)
+    assert not win.tree.isEnabled(), "录制中侧栏应禁用(防止触发预览)"
+    assert not win.act_manage.isEnabled() and not win.act_refresh.isEnabled()
+    assert win._visible_ids == set(), "录制开始时应清掉之前预览的轨迹"
+    win._update_buttons(False)
+    assert win.tree.isEnabled() and win.act_manage.isEnabled()
 
     # 右键重命名版本 → 树里立刻换成新名字
     win.store.rename_layout("m2", "A@0.10,0.10;B@0.20,0.20", "大地图")

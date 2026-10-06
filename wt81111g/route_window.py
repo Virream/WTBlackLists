@@ -22,7 +22,7 @@ import os
 import time
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont
+from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFrame, QGridLayout, QHeaderView,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -30,7 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from .global_hotkey import ACTION_LABELS, DEFAULT_BINDINGS, GlobalHotkeyWatcher, describe_binding
-from .icons import ICON_SIZE, eye_icon
+from .icons import ICON_SIZE, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
 from .route_map_view import RouteMapView
@@ -159,16 +159,16 @@ class RouteTesterWindow(QMainWindow):
     def _build_menu(self) -> None:
         """顶部菜单栏: 「地图」(管理/缓存) / 「设置」(显示开关) / 「帮助」。"""
         menu = self.menuBar().addMenu("地图(&M)")
-        act_manage = QAction("地图管理(命名/预览/删除缓存)…", self)
-        act_manage.triggered.connect(self._open_map_manager)
-        menu.addAction(act_manage)
+        self.act_manage = QAction("地图管理(命名/预览/删除缓存)…", self)
+        self.act_manage.triggered.connect(self._open_map_manager)
+        menu.addAction(self.act_manage)
         menu.addSeparator()
         act_dir = QAction("打开地图缓存文件夹", self)
         act_dir.triggered.connect(self._open_map_dir)
         menu.addAction(act_dir)
-        act_refresh = QAction("用缓存底图重新显示当前轨迹", self)
-        act_refresh.triggered.connect(self._restore_map_for_current_view)
-        menu.addAction(act_refresh)
+        self.act_refresh = QAction("用缓存底图重新显示当前轨迹", self)
+        self.act_refresh.triggered.connect(self._restore_map_for_current_view)
+        menu.addAction(self.act_refresh)
 
         setting = self.menuBar().addMenu("设置(&S)")
         self.act_zones = QAction("显示战区位置(A/B/C)", self)
@@ -555,6 +555,7 @@ class RouteTesterWindow(QMainWindow):
                 (rec := self.store.get(rid)) is not None and self._group_of(rec) == self._anchor
                 for rid in alive):
             self._anchor = None          # 基准那些轨迹被删光了 → 解除锁定
+        self._refresh_anchor_icon()      # 图钉要跟着基准标回对应版本行
         self._refresh_map_tracks()
         self._on_tree_selection_changed()
 
@@ -647,14 +648,21 @@ class RouteTesterWindow(QMainWindow):
         """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
 
         跨地图(底图只能是一张)/跨版本(战区位置不同, 线路本来就不可比)一起回放没有意义,
-        所以选中了多个分组时只保留一个:
+        所以选中了多个版本时只保留一个:
 
-        * 双击定过“基准”时, **基准优先** —— 点到别的版本也不会把基准换掉(锁住);
-        * 没定基准时, 保留“本次新加进来的那个分组”。
+        * 双击定过“基准”时, **基准优先** —— Ctrl 点到别的版本不会把基准换掉(锁住);
+        * 没定基准时保留“本次新加进来的那个版本”。
+
+        基准(图钉)还会**跟随当前选中所在的版本** —— 刚开始没选中任何条目时,
+        第一个点到的路线就把它的“地图·模式·版本”定为基准。
         """
         if self._reselecting or self._in_playback():
             return
         recs = self._selection_tracks()
+        if not recs:
+            self._sel_ids = set()
+            self._update_play_label()
+            return                       # 清空选中时保留基准(图钉不消失)
         groups = {self._group_of(r) for r in recs}
         if len(groups) > 1:
             keep: tuple[str, str] | None = None
@@ -677,10 +685,14 @@ class RouteTesterWindow(QMainWindow):
                 "同一张地图的同一版本才能一起回放/显示, 已只保留一个版本内的选中条目",
                 sticky=3.0)
         self._sel_ids = {r.route_id for r in recs}
+        grp = self._group_of(recs[0])
+        if grp != self._anchor:
+            self._anchor = grp          # 基准跟着当前选中走
+            self._refresh_anchor_icon()
         self._update_play_label()
 
     def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
-        """双击轨迹行 → 把它所在的版本定为**基准**(多选/回放锁定在该版本内)。
+        """双击轨迹行 → 定基准 + **把它显示到地图上并切到对应地图图片**。
 
         双击地图/模式/版本行不做处理(保留 Qt 默认的展开/折叠)。
         """
@@ -701,10 +713,13 @@ class RouteTesterWindow(QMainWindow):
         finally:
             self._reselecting = False
         self._sel_ids = {rec.route_id}
+        self._refresh_anchor_icon()
         self._update_play_label()
+        # 双击同时就把它显示出来(自动隐掉其它版本), 并把底图切到它的地图
+        self._set_visible(item, True)
         self._set_status(
-            f"基准已锁定: {self._group_name(*self._anchor)} —— "
-            f"之后只能在“{rec.label}”所在这个版本里多选/回放", sticky=4.0)
+            f"基准已锁定: {self._group_name(*self._anchor)} · {rec.label}; "
+            f"已切到该地图并显示这条轨迹", sticky=4.0)
 
     # --------------------------------------------------- 分组(地图 + 版本)
     @staticmethod
@@ -720,6 +735,20 @@ class RouteTesterWindow(QMainWindow):
         version = self.store.layout_display_name(map_key, signature)
         parts = [self.store.display_name(map_key), mode, version]
         return " · ".join(p for p in parts if p)
+
+    def _refresh_anchor_icon(self) -> None:
+        """把图钉图标标到“当前基准版本”那一行(其它版本行清掉图标)。"""
+        for i in range(self.tree.topLevelItemCount()):
+            self._refresh_anchor_icon_in(self.tree.topLevelItem(i))
+
+    def _refresh_anchor_icon_in(self, item: QTreeWidgetItem) -> None:
+        for i in range(item.childCount()):
+            ch = item.child(i)
+            if ch.data(0, _ROLE_KIND) == "variant":
+                grp = (ch.data(0, _ROLE_ID), ch.data(0, _ROLE_SIG) or "")
+                ch.setIcon(_COL_EYE, pin_icon() if grp == self._anchor else QIcon())
+            else:
+                self._refresh_anchor_icon_in(ch)
 
     def _update_play_label(self) -> None:
         """信息区“回放”那一栏: 显示基准版本 + 待回放条数。"""
@@ -1040,7 +1069,10 @@ class RouteTesterWindow(QMainWindow):
         self.btn_mark.setEnabled(recording and not armed)
         self.chk_start_on_move.setEnabled(not recording and not in_play)
         self.cmb_rate.setEnabled(not recording and not in_play)
-        self.tree.setEnabled(not in_play)          # 含眼睛点击与右键菜单
+        self.tree.setEnabled(not in_play and not recording)   # 含眼睛点击与右键菜单
+        # 录制期间屏蔽会改变“显示/底图”的入口, 避免与录制抢主界面
+        self.act_manage.setEnabled(not recording)
+        self.act_refresh.setEnabled(not recording)
         # 回放控制
         has_track = (bool(self.player.records) or self._last_record is not None
                      or bool(self.store.routes))
@@ -1316,16 +1348,30 @@ class RouteTesterWindow(QMainWindow):
         self.player.load(None)
         self.map_view.set_playback(None)
         self.map_view.set_live(rec)
+        # 录制时先**把主界面切回游戏当前地图**: 用户可能正在预览另一张地图/另一个
+        # 版本的轨迹, 不切回去就会“录着这张图、看着那张图”, 两边打架。
+        # 同时清掉之前预览的点亮状态(录制期间只显示正在录的这条)。
+        previewed = len(self._visible_ids)
+        self._visible_ids.clear()
+        self._refresh_eye_icons()
+        key = self.recorder.map_key
+        switched = False
+        if key and key != PLACEHOLDER_MAP_KEY and self.map_view.map_key != key:
+            switched = self._show_cached_map(key)
+        self._refresh_map_tracks()
         self._update_buttons(True)
+        note = ""
+        if previewed or switched:
+            note = "\n已切回游戏当前地图并暂停预览(录制期间其余功能已锁定)"
         if armed:
             self.lbl_status.setText(
                 f"准备录制… 地图: {rec.map_name} | 载具: {rec.vehicle} "
-                f"| 等待载具移动(速度从 0 变为非 0 时开始计时)"
+                f"| 等待载具移动(速度从 0 变为非 0 时开始计时){note}"
             )
         else:
             self.lbl_status.setText(
                 f"录制中… 地图: {rec.map_name} | 载具: {rec.vehicle} "
-                f"| 起点已标注 (按 {describe_binding(DEFAULT_BINDINGS['stop'])} 结束)"
+                f"| 起点已标注 (按 {describe_binding(DEFAULT_BINDINGS['stop'])} 结束){note}"
             )
 
     def _on_recording_cancelled(self) -> None:
