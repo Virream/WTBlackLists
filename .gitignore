@@ -12,3 +12,6 @@ logs/
 backups/
 *.zip
 *.html
+
+# 第三方工具/本地解包(WTRTI 实时信息工具, 28MB, 不入库)
+WTRTI/

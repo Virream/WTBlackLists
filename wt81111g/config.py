@@ -8,7 +8,9 @@ APP_NAME = "WTBlackList"
 APP_VERSION = "2.0.2"
 
 # 战争雷霆 8111 本地接口
-WT_BASE_URL = "http://localhost:8111"
+# 用 127.0.0.1 而非 localhost: Windows 上 localhost 可能先解析到 IPv6(::1)再回退 IPv4,
+# 8111 只监听 IPv4 时会产生额外的解析/重试开销 —— 高频轮询(40Hz)下影响明显。
+WT_BASE_URL = "http://127.0.0.1:8111"
 
 # 黑名单玩家在 War Thunder Live 上的主页模板,数字部分为玩家ID
 PROFILE_URL_TEMPLATE = "https://live.warthunder.com/user/{player_id}/"

@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
 from .blacklist import BlacklistStore
+from .config import WT_BASE_URL
 from .nickname_cache import NicknameCache
 from .nickname_collector import parse_hudmsg_names
 from .nickname_sync import fetch_shared_table
@@ -50,7 +51,7 @@ class MonitorWorker(QObject):
 
     def __init__(self, store: BlacklistStore,
                  nickname_cache: NicknameCache | None = None,
-                 base_url: str = "http://localhost:8111",
+                 base_url: str = WT_BASE_URL,
                  poll_interval: float = 1.0,
                  shared_repo_url: str | None = None):
         super().__init__()
