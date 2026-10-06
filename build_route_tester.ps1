@@ -12,11 +12,23 @@
 # 说明: 仅依赖 PyQt6 + requests, 无需 pywebview/pythonnet(那是黑名单主程序的依赖)。
 #       精简 Qt 时**保留 jpeg/webp 图片插件** —— 地图图片来自 8111 的 /map.img。
 #       侧栏的“眼睛”图标来自 assets\icons(PNG), 必须一起打进去。
+#
+# ⚠ 数据保护: 程序把数据写在 **exe 同级目录的 data\** 下(录制的 routes.json 与
+#   缓存的地图 maps\)。PyInstaller 重建会清掉整个 dist\WTRouteTester,
+#   所以打包前会把 data 暂存到 dist\_data_backup、 完成后原样搬回。
 param([switch]$OneFile)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $root ".venv\Scripts\python.exe"
 Set-Location $root
+
+$dataDir = Join-Path $root "dist\WTRouteTester\data"
+$dataBak = Join-Path $root "dist\_data_backup"
+if (Test-Path $dataDir) {
+    Write-Host "== 0/3 暂存用户数据(routes.json / maps\ 缓存) =="
+    Remove-Item $dataBak -Recurse -Force -ErrorAction SilentlyContinue
+    Move-Item $dataDir $dataBak -Force
+}
 
 Write-Host "== 1/3 打包 onedir(启动更快) =="
 & $py -m PyInstaller `
@@ -44,6 +56,12 @@ if ($OneFile) {
         --version-file version_info_route.txt `
         --add-data "assets\icons;assets\icons" `
         route_tester.py
+}
+
+if (Test-Path $dataBak) {
+    Write-Host "== 恢复用户数据(routes.json / maps\ 缓存) =="
+    New-Item -ItemType Directory -Force -Path (Split-Path $dataDir -Parent) | Out-Null
+    Move-Item $dataBak $dataDir -Force
 }
 
 Write-Host "== 完成 =="
