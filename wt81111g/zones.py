@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 # 战区数量 → 模式名(按用户口径):
@@ -186,6 +187,47 @@ def signature(zones) -> str:
     """战区坐标串(模式指纹, **不含归属色**)。空列表返回空串。"""
     return ";".join(f"{z.label}@{z.x:.{_SIG_DIGITS}f},{z.y:.{_SIG_DIGITS}f}"
                     for z in zones)
+
+
+def layout_spread(zones) -> float:
+    """布局跨度: 各战区中心之间的**最大距离**(0~1 地图单位)。
+
+    用途: 同一个模式(同样的战区数量)会有多个“版本”, 典型就是**大地图/小地图**
+    —— 交战区越大, 战区之间分得越开。跨度大的一般就是大地图版本。
+    接受 Zone 或普通字典(持久化后的布局格式)。
+    """
+    pts: list[tuple[float, float]] = []
+    for z in zones or []:
+        try:
+            x = float(z["x"] if isinstance(z, dict) else z.x)
+            y = float(z["y"] if isinstance(z, dict) else z.y)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            continue
+        pts.append((x, y))
+    best = 0.0
+    for i in range(len(pts)):
+        for j in range(i + 1, len(pts)):
+            best = max(best, math.hypot(pts[i][0] - pts[j][0], pts[i][1] - pts[j][1]))
+    return best
+
+
+def zones_from_signature(sig: str) -> list[Zone]:
+    """指纹(`A@0.4329,0.5561;B@x,y`) → Zone 列表。
+
+    指纹里就带着字母与坐标, 所以旧数据(轨迹有指纹、但 `map_zones` 没存过布局)
+    也能把战区位置还原出来。
+    """
+    out: list[Zone] = []
+    for part in (sig or "").split(";"):
+        label, at, coords = part.partition("@")
+        xs, comma, ys = coords.partition(",")
+        if not at or not comma:
+            continue
+        x, y = _to_float(xs), _to_float(ys)
+        if x is None or y is None:
+            continue
+        out.append(Zone(label=label.strip() or "?", x=x, y=y))
+    return out
 
 
 def zones_to_json(zones) -> list[dict]:

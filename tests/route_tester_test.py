@@ -1074,14 +1074,14 @@ def make_window(tmpdir: str, name: str) -> RouteTesterWindow:
 
 
 def routes_of(top) -> list:
-    """取某张地图节点下的全部**轨迹条目**(侧栏三层: 地图 → 模式 → 轨迹)。"""
+    """取某个节点下的全部**轨迹条目**(侧栏: 地图 → 模式 → 版本 → 轨迹)。"""
     out = []
     for i in range(top.childCount()):
         ch = top.child(i)
         if ch.data(0, rw._ROLE_KIND) == "route":
             out.append(ch)
         else:
-            out.extend(ch.child(j) for j in range(ch.childCount()))
+            out.extend(routes_of(ch))
     return out
 
 
@@ -1463,28 +1463,51 @@ def test_zones_and_modes(tmpdir: str):
     recorder._tick()
     assert recorder.zones == [] and recorder.zones_signature == ""
 
-    # 侧栏三层树: 地图 → 模式 → 轨迹
+    # 侧栏四层树: 地图 → 模式 → 版本(战区布局) → 轨迹
     win = make_window(tmpdir, "zonetree.json")
     win.recorder.stop()
     win.hotkeys.stop()
     win.show()
     app = QApplication.instance()
     app.processEvents()
-    for mode in ("战区攻陷", "战区争夺"):
+    # 记录里带战区指纹(但 map_zones 没存过布局) → 从指纹还原出布局, 版本也能自动编号
+    for mode, sig in (("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
+                      ("战区争夺", "A@0.50,0.50"),
+                      ("战区争夺", "A@0.70,0.70")):
         rec = win.store.new_route("m2", "地图 2", "T-90M", 0.3, 0.3)
         rec.duration = 10.0
-        rec.zone_count, rec.zone_signature, rec.mode_name = 2, "A@0.1,0.1;B@0.2,0.2", mode
+        rec.zone_count, rec.zone_signature, rec.mode_name = 2, sig, mode
         win.store.add(rec)
+    assert len(win.store.zone_layouts("m2")) == 3, "应从轨迹指纹补回 3 个版本布局"
     win._reload_tree()
     app.processEvents()
     assert win.tree.topLevelItemCount() == 1
     top = win.tree.topLevelItem(0)
-    assert top.text(2) == "2 条" and top.childCount() == 2
+    assert top.text(2) == "3 条" and top.childCount() == 2      # 2 个模式
     assert {top.child(i).text(1) for i in range(top.childCount())} == {"战区攻陷", "战区争夺"}
-    assert top.child(0).childCount() == 1
-    assert len(list(win._iter_route_items())) == 2        # 三层下仍能遍历到轨迹
-    win._show_all_tracks(True)                           # 一键显示要作用到第三层
-    assert len(win._visible_ids) == 2
+    by_mode = {top.child(i).text(1): top.child(i) for i in range(top.childCount())}
+    # 2 战区模式 → 单版本“区域 1”; 1 战区模式 → 两个随机点位“点位 1/2”
+    assert [by_mode["战区攻陷"].child(i).text(1) for i in range(by_mode["战区攻陷"].childCount())] \
+        == ["区域 1"]
+    spots = [by_mode["战区争夺"].child(i).text(1)
+             for i in range(by_mode["战区争夺"].childCount())]
+    assert sorted(spots) == ["点位 1", "点位 2"], spots
+    assert all(by_mode["战区争夺"].child(i).childCount() == 1
+               for i in range(by_mode["战区争夺"].childCount()))
+    assert len(list(win._iter_route_items())) == 3        # 四层下仍能遍历到轨迹
+    win._show_all_tracks(True)                            # 一键显示要作用到最里层
+    assert len(win._visible_ids) == 3
+    # 右键重命名版本 → 树里立刻换成新名字
+    win.store.rename_layout("m2", "A@0.10,0.10;B@0.20,0.20", "大地图")
+    win._reload_tree()
+    app.processEvents()
+    names = [win.tree.topLevelItem(0).child(0).child(i).text(1)
+             for i in range(win.tree.topLevelItem(0).child(0).childCount())]
+    assert names == ["大地图"], names
+    assert win.store.layout_display_name("m2", "A@0.10,0.10;B@0.20,0.20") == "大地图"
+    # 名字落盘(重建 store 仍在)
+    again_store = RouteStore(os.path.join(tmpdir, "zonetree.json"))
+    assert again_store.layout_display_name("m2", "A@0.10,0.10;B@0.20,0.20") == "大地图"
 
     # 地图上的战区: 归属色变化要刷新, blink>0 时跑闪烁定时器
     view = win.map_view
