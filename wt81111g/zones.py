@@ -52,9 +52,9 @@ SIDE_NEUTRAL = "neutral"
 
 SIDE_LABELS = {SIDE_OURS: "我方", SIDE_ENEMY: "敌方", SIDE_NEUTRAL: "中立"}
 
-# 闪烁(被占领中): 8111 的 blink 值与官方页面的周期; 脉冲目标色是**纯黄**
+# 闪烁(被占领中): 8111 的 blink 值 → 官方页面的脉冲周期
+# (官方是拿它把图标在 color[] ↔ 纯黄之间插值; 本项目改成在**本阵营色**里做明暗脉冲)
 BLINK_PERIODS = {1: 2.0, 2: 1.2}
-BLINK_COLOR = (255, 255, 0)
 
 _COLOR_TO_SIDE = {
     COLOR_OURS.lower(): SIDE_OURS,

@@ -19,7 +19,7 @@ from .route_store import (
     PLACEHOLDER_MAP_SHA1, RoutePoint, RouteRecord, fmt_speed, fmt_time, fmt_time_ms,
     point_at, split_points,
 )
-from .zones import BLINK_COLOR, BLINK_PERIODS
+from .zones import BLINK_PERIODS
 
 log = logging.getLogger("route_map_view")
 
@@ -42,8 +42,19 @@ ZONE_SIDE_COLORS = {
     "neutral": QColor("#f8fafc"),   # 白 = 中立/未占领(看缓存底图时也用它)
 }
 ZONE_RADIUS = 8.0
-# 被占领中的战区闪烁: 与官方 8111 页面一致(在归属色 ↔ 纯黄之间脉冲)
+# 被占领中的战区闪烁: 脉冲曲线与周期照官方 8111 页面(blink=1 → 2.0s, blink=2 → 1.2s),
+# 但**不掺黄** —— 在本阵营色里做“变暗 ↔ 纯色”的呼吸(蓝闪蓝, 红闪红)
 BLINK_TICK_MS = 40
+BLINK_DIM = 0.4           # 脉冲谷底时保留的亮度比例(0.4 = 变暗到 40%)
+ZONE_DARK = QColor(15, 23, 42)    # 变暗时拉向的底色(与界面同色系)
+
+
+def _blend(color: QColor, rgb: tuple[int, int, int], k: float) -> QColor:
+    """从 color 按 k 比例拉向 rgb(k=0 不变, k=1 完全变成 rgb)。"""
+    k = max(0.0, min(1.0, float(k)))
+    return QColor(int(color.red() + (rgb[0] - color.red()) * k),
+                  int(color.green() + (rgb[1] - color.green()) * k),
+                  int(color.blue() + (rgb[2] - color.blue()) * k))
 
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 
@@ -502,6 +513,7 @@ class RouteMapView(QWidget):
 
         形状用菱形而不是圆圈: 图上圆圈已经表示起点/标记/终点, 菱形不会混淆。
         颜色按归属: 蓝 = 我方, 红 = 敌方, 白 = 中立(见 zones.SIDE_*)。
+        被占领中(blink)时在本阵营色里脉冲: 变暗 ↔ 纯色(蓝闪蓝、红闪红, 不掺黄)。
         """
         if not self._show_zones or not self._zones:
             return
@@ -517,16 +529,13 @@ class RouteMapView(QWidget):
             label_color = QColor("#0f172a") if side == "neutral" else QColor("#ffffff")
             blink = int(z.get("blink") or 0)
             if blink > 0:
-                # 正在被占领: 与官方页面一致 —— 在归属色↔纯黄之间脉冲
-                # (官方: bv = exp(-(5*t - 2)^4), t 在一个周期内 0→period)
+                # 官方: bv = exp(-(5*t - 2)^4), t 在一个周期内 0→period
                 period = BLINK_PERIODS.get(blink, BLINK_PERIODS[1])
                 t = self._blink_t % period
                 bv = math.exp(-((5.0 * t - 2.0) ** 4))
-                r, g, b = BLINK_COLOR
-                fill = QColor(int(fill.red() + (r - fill.red()) * bv),
-                              int(fill.green() + (g - fill.green()) * bv),
-                              int(fill.blue() + (b - fill.blue()) * bv))
-                label_color = QColor("#0f172a")
+                # 谷底 = 变暗的阵营色, 峰值 = 纯阵营色(色相始终不变)
+                k = BLINK_DIM + (1.0 - BLINK_DIM) * bv
+                fill = _blend(ZONE_DARK, (fill.red(), fill.green(), fill.blue()), k)
             c = self._to_px(x, y)
             r = ZONE_RADIUS
             diamond = QPolygonF([
