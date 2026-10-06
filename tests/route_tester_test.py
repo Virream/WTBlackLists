@@ -1513,6 +1513,23 @@ def test_zones_and_modes(tmpdir: str):
     assert win._group_of(win.store.get(rows[2].data(0, rw._ROLE_ID))) != \
         win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID)))
 
+    # 层级行(地图/模式/版本)是分组标题: **不能被选中**(多选时不能把它们也选进去)
+    top_node = win.tree.topLevelItem(0)
+    mode_node = top_node.child(0)
+    var_node = mode_node.child(0)
+    for node in (top_node, mode_node, var_node):
+        assert not (node.flags() & Qt.ItemFlag.ItemIsSelectable), node.text(1)
+        assert node.flags() & Qt.ItemFlag.ItemIsEnabled, "仍要能展开/折叠、能右键"
+    assert rows[0].flags() & Qt.ItemFlag.ItemIsSelectable
+    win.tree.clearSelection()
+    app.processEvents()
+    top_node.setSelected(True)
+    mode_node.setSelected(True)
+    var_node.setSelected(True)
+    app.processEvents()
+    assert win.tree.selectedItems() == [], "层级行不能被选中"
+    assert win._sel_ids == set()
+
     # 显示只限**同一版本**: 点亮其它版本的轨迹时, 原来的自动隐掉
     win._set_visible(rows[0], True)
     assert len(win._visible_ids) == 1

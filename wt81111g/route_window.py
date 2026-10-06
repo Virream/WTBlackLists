@@ -53,6 +53,10 @@ _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
 _ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 版本(战区布局)的坐标指纹
 
+# 层级行(地图/模式/版本)只当“分组标题”: 可点击展开、可右键, 但**不可被选中** ——
+# 否则多选时会把标题行也选进去(回放/基准只应以轨迹条目为单位)。
+GROUP_ITEM_FLAGS = Qt.ItemFlag.ItemIsEnabled
+
 # 侧栏列: 0=眼睛(显示/隐藏轨迹) 1=地图/线路 2=用时
 _COL_EYE = 0
 _COL_NAME = 1
@@ -477,6 +481,7 @@ class RouteTesterWindow(QMainWindow):
             top = QTreeWidgetItem(["", self.store.display_name(map_key), f"{total} 条"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
+            top.setFlags(GROUP_ITEM_FLAGS)
             f = QFont()
             f.setBold(True)
             top.setFont(_COL_NAME, f)
@@ -486,6 +491,7 @@ class RouteTesterWindow(QMainWindow):
                 mid = QTreeWidgetItem(["", mode_label, f"{n_mode} 条"])
                 mid.setData(0, _ROLE_KIND, "mode")
                 mid.setData(0, _ROLE_ID, map_key)
+                mid.setFlags(GROUP_ITEM_FLAGS)
                 mid.setToolTip(_COL_NAME,
                                f"{self.store.display_name(map_key)} · {mode_label}\n"
                                f"模式由 8111 的战区(capture_zone)数量推出: "
@@ -496,6 +502,7 @@ class RouteTesterWindow(QMainWindow):
                     var.setData(0, _ROLE_KIND, "variant")
                     var.setData(0, _ROLE_ID, map_key)
                     var.setData(0, _ROLE_SIG, sig)
+                    var.setFlags(GROUP_ITEM_FLAGS)
                     var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
                     mid.addChild(var)
                     for rec in routes:
@@ -523,6 +530,7 @@ class RouteTesterWindow(QMainWindow):
             top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
+            top.setFlags(GROUP_ITEM_FLAGS)
             f = QFont()
             f.setBold(True)
             top.setFont(_COL_NAME, f)
@@ -545,6 +553,7 @@ class RouteTesterWindow(QMainWindow):
                 var.setData(0, _ROLE_KIND, "variant")
                 var.setData(0, _ROLE_ID, map_key)
                 var.setData(0, _ROLE_SIG, sig)
+                var.setFlags(GROUP_ITEM_FLAGS)
                 var.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
                 var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
                 top.addChild(var)
