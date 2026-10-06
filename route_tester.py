@@ -15,9 +15,10 @@ import os
 import sys
 import traceback
 
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from wt81111g.config import data_dir
+from wt81111g.config import data_dir, resource_path
 from wt81111g.route_store import RouteStore
 from wt81111g.route_window import RouteTesterWindow
 
@@ -66,6 +67,16 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("WTRouteTester")
     app.setApplicationDisplayName("跑图线路测试器")
+    # 窗口/任务栏图标: 用 icon\ 里的 PNG(Qt 内建解码, 不依赖 ico 读插件);
+    # exe 自身的图标在打包时用 icon\WTRouteTester.ico(见 tools\make_app_icon.py)
+    icon_path = resource_path(os.path.join("icon", "icon_512X512_WTRouteTester.png"))
+    if os.path.exists(icon_path):
+        icon = QIcon(icon_path)
+        if not icon.isNull():
+            app.setWindowIcon(icon)
+            log.info("窗口图标已加载: %s", icon_path)
+    else:
+        log.warning("窗口图标资源缺失: %s", icon_path)
 
     try:
         win = RouteTesterWindow(RouteStore())

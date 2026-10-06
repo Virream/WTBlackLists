@@ -11,7 +11,9 @@
 #
 # 说明: 仅依赖 PyQt6 + requests, 无需 pywebview/pythonnet(那是黑名单主程序的依赖)。
 #       精简 Qt 时**保留 jpeg/webp 图片插件** —— 地图图片来自 8111 的 /map.img。
-#       侧栏的“眼睛”图标来自 assets\icons(PNG), 必须一起打进去。
+#       侧栏的“眼睛”图标来自 assets\icons(PNG), 必须一起打进去;
+#       窗口/任务栏图标来自 icon\(PNG), exe 图标用 icon\WTRouteTester.ico
+#       (由 tools\make_app_icon.py 从那张 AI 画的 PNG 转出多尺寸 ico, 重跑即可)。
 #
 # ⚠ 数据保护: 程序把数据写在 **exe 同级目录的 data\** 下(录制的 routes.json 与
 #   缓存的地图 maps\)。PyInstaller 重建会清掉整个 dist\WTRouteTester,
@@ -37,9 +39,10 @@ Write-Host "== 1/3 打包 onedir(启动更快) =="
     --onedir `
     --windowed `
     --name WTRouteTester `
-    --icon app.ico `
+    --icon "icon\WTRouteTester.ico" `
     --version-file version_info_route.txt `
     --add-data "assets\icons;assets\icons" `
+    --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
     route_tester.py
 
 Write-Host "== 2/3 精简 Qt 体积(保留 jpeg/webp 图片插件, 保证地图图片可解码) =="
@@ -52,9 +55,10 @@ if ($OneFile) {
         --onefile `
         --windowed `
         --name WTRouteTester_Portable `
-        --icon app.ico `
+        --icon "icon\WTRouteTester.ico" `
         --version-file version_info_route.txt `
         --add-data "assets\icons;assets\icons" `
+        --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
         route_tester.py
 }
 
