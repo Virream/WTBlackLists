@@ -22,7 +22,7 @@ import os
 import time
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtGui import QAction, QCloseEvent, QFont
+from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QFrame, QGridLayout, QHeaderView,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
@@ -71,6 +71,10 @@ class RouteTesterWindow(QMainWindow):
         self.resize(1400, 880)
 
         self.store = store or RouteStore()
+        # 地图图片本地缓存: 关掉游戏后仍能用缓存的底图看回放
+        # (map_cache / start_recorder 可注入: 测试里指向临时目录且不启动真实 8111 轮询)
+        # 必须在 _reload_tree() 之前赋值 —— 侧栏会用它判断“哪些地图只有缓存图片”
+        self.map_cache = map_cache if map_cache is not None else MapCache()
         self._last_duration = 0.0
         self._last_text_at = 0.0
         self._last_map_try = 0.0      # 上次尝试用缓存底图的时间(节流)
@@ -98,9 +102,6 @@ class RouteTesterWindow(QMainWindow):
         self._build_ui()
         self._build_menu()
         self._reload_tree()
-        # 地图图片本地缓存: 关掉游戏后仍能用缓存的底图看回放
-        # (map_cache / start_recorder 可注入: 测试里指向临时目录且不启动真实 8111 轮询)
-        self.map_cache = map_cache if map_cache is not None else MapCache()
         # 后台轮询 8111
         self.recorder = RouteRecorder(self.store, parent=self, map_cache=self.map_cache)
         self.recorder.tick.connect(self._on_tick)
@@ -176,12 +177,15 @@ class RouteTesterWindow(QMainWindow):
             self._set_status(f"打开缓存目录失败: {exc}", sticky=3.0)
 
     def _open_map_manager(self) -> None:
-        """打开「地图管理」; 保存过名称就刷新侧栏。"""
+        """打开「地图管理」; 关掉后总是刷新侧栏(名字可能改了, 也可能删了缓存图片)。"""
         dlg = MapManagerDialog(self.store, self.map_cache, self)
         dlg.exec()
+        self._reload_tree()
         if dlg.renamed:
-            self._reload_tree()
-            self._set_status(f"已更新 {dlg.renamed} 个地图名称", sticky=3.0)
+            self._set_status(f"已保存 {dlg.renamed} 处地图名称改动(左侧列表已同步)",
+                             sticky=3.0)
+        else:
+            self._set_status("地图管理已关闭(名称改动会立即保存)", sticky=2.0)
 
     def _build_ui(self) -> None:
         central = QWidget(self)
@@ -421,6 +425,21 @@ class RouteTesterWindow(QMainWindow):
                 top.addChild(child)
                 alive.add(rec.route_id)
             top.setExpanded(True)
+        # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
+        # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
+        for map_key in self.store.ordered_map_keys():
+            if map_key in grouped or not self.map_cache.has(map_key):
+                continue
+            top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
+            top.setData(0, _ROLE_KIND, "map")
+            top.setData(0, _ROLE_ID, map_key)
+            f = QFont()
+            f.setBold(True)
+            top.setFont(_COL_NAME, f)
+            top.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
+            top.setToolTip(_COL_NAME, "这张地图只缓存了图片, 还没录过轨迹\n"
+                                      "右键可重命名, 或菜单「地图 → 地图管理…」")
+            self.tree.addTopLevelItem(top)
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
         self._refresh_map_tracks()

@@ -5,7 +5,11 @@
 地图身份只能靠图片哈希。所以这里让用户把哈希对应成看得懂的名字,
 名字存进 `RouteStore.map_names`, 左侧侧栏会立刻显示这个名字。
 
-列表列: 预览 / 名称(可直接双击改) / 图片大小 / 轨迹数 / 首次缓存时间
+列表列: 预览 / 名称 / 图片大小 / 轨迹数 / 首次缓存时间
+
+名称改在窗口顶部固定的「地图名称」输入框里 —— 表格内部**完全禁止编辑**。
+之前用“双击单元格就地编辑”, 编辑器会落在图片所在的那一格里被缩略图盖住
+(只看得到左右各一条竖线), 所以改成结构上不可能出错的方案。
 """
 from __future__ import annotations
 
@@ -17,9 +21,9 @@ import sys
 from PyQt6.QtCore import QSize, Qt
 from PyQt6.QtGui import QBrush, QIcon, QPixmap
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QHBoxLayout,
-    QHeaderView, QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QAbstractItemView, QDialog, QDialogButtonBox, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
+    QTableWidgetItem, QVBoxLayout,
 )
 
 from .map_cache import MapCache, MapEntry
@@ -48,12 +52,32 @@ class MapManagerDialog(QDialog):
 
         tip = QLabel(
             "8111 不提供地图名, 所以这里用「图片内容哈希」区分地图。\n"
-            "给地图起个名字: 双击“名称”单元格直接输入, 或选中后点下面的「重命名选中项…」。\n"
+            "改名字的步骤: 先在下面的列表里**选中一张地图**, 再在顶部「地图名称」框里输入,\n"
+            "按回车(或点「保存名称」)立即生效 —— 表格里的名字只是显示, 不用双击去改。\n"
             "名称会显示在左侧列表, 也会写进已录制的轨迹记录; 缓存图片在 data/maps 下,"
             "同一张图只存一份; 删除图片不会删除轨迹记录。")
         tip.setWordWrap(True)
         tip.setStyleSheet("color:#94a3b8;")
         root.addWidget(tip)
+
+        # ---- 名称输入区(固定位置, 永远和表格里的图片隔着两行, 不可能重叠) ----
+        name_row = QHBoxLayout()
+        name_row.setSpacing(8)
+        lbl_name = QLabel("地图名称:")
+        lbl_name.setStyleSheet("font-weight:bold;")
+        name_row.addWidget(lbl_name)
+        self.edit_name = QLineEdit()
+        self.edit_name.setPlaceholderText("先选中下面的一张地图, 然后在这里输入名称, 回车保存")
+        self.edit_name.setClearButtonEnabled(True)
+        self.edit_name.setEnabled(False)
+        self.edit_name.returnPressed.connect(self._apply_name)
+        self.edit_name.editingFinished.connect(self._apply_name)   # 失焦也保存
+        name_row.addWidget(self.edit_name, 1)
+        self.btn_apply = QPushButton("保存名称")
+        self.btn_apply.setEnabled(False)
+        self.btn_apply.clicked.connect(self._apply_name)
+        name_row.addWidget(self.btn_apply)
+        root.addLayout(name_row)
 
         self.table = QTableWidget(0, 5, self)
         self.table.setHorizontalHeaderLabels(["预览", "名称", "图片", "轨迹", "首次缓存"])
@@ -61,11 +85,13 @@ class MapManagerDialog(QDialog):
         self.table.setIconSize(QSize(_THUMB, _THUMB))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked
-                                   | QAbstractItemView.EditTrigger.EditKeyPressed)
-        # 列宽: 预览固定; 名称列伸缩(靠窗口最小宽度保证它不会小到放不下编辑框);
-        # 其余按内容。以前名称列也是 Stretch 但窗口允许变很窄, 结果被挤成 0 宽,
-        # 编辑框直接压在预览图上。
+        # 关键: 表格里一律不许就地编辑 —— 以前开启 DoubleClicked 时, 双击到图片那一格
+        # 会在图片格上叠一个输入框(被缩略图盖住, 只剩左右两条竖线)。
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self._loading = False
+        self._cur_key: str | None = None     # 名称输入框当前对应的地图
+        # 列宽: 预览固定; 名称列伸缩; 其余按内容。
         head = self.table.horizontalHeader()
         head.setStretchLastSection(False)
         head.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -73,7 +99,6 @@ class MapManagerDialog(QDialog):
         for col in (2, 3, 4):
             head.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setColumnWidth(0, _THUMB + 16)
-        # 预览 + 名称 + 其余按内容的列 + 边距: 小于这个宽度名称列就会被压坏
         self.setMinimumWidth(_THUMB + 16 + _NAME_COL_W + 300)
         root.addWidget(self.table, 1)
 
@@ -83,10 +108,6 @@ class MapManagerDialog(QDialog):
 
         row = QHBoxLayout()
         row.setSpacing(8)
-        self.btn_rename = QPushButton("重命名选中项…")
-        self.btn_rename.setToolTip("选中一行后点这里改名(双击“名称”单元格也可以)")
-        self.btn_rename.clicked.connect(self._rename_current)
-        row.addWidget(self.btn_rename)
         self.btn_reload = QPushButton("刷新")
         self.btn_reload.clicked.connect(self.reload)
         row.addWidget(self.btn_reload)
@@ -98,12 +119,9 @@ class MapManagerDialog(QDialog):
         row.addWidget(self.btn_remove)
         row.addStretch(1)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save
-                                   | QDialogButtonBox.StandardButton.Cancel, self)
-        buttons.button(QDialogButtonBox.StandardButton.Save).setText("保存名称")
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
-        buttons.accepted.connect(self._save)
-        buttons.rejected.connect(self.reject)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, self)
+        buttons.button(QDialogButtonBox.StandardButton.Close).setText("关闭")
+        buttons.rejected.connect(self.accept)
         row.addWidget(buttons)
         root.addLayout(row)
 
@@ -112,10 +130,14 @@ class MapManagerDialog(QDialog):
     # ------------------------------------------------------------------ 列表
     def reload(self) -> None:
         """重建列表(按首次缓存时间倒序)。"""
-        entries = self.cache.entries()
-        self.table.setRowCount(0)
-        for entry in entries:
-            self._add_row(entry)
+        self._loading = True
+        try:
+            entries = self.cache.entries()
+            self.table.setRowCount(0)
+            for entry in entries:
+                self._add_row(entry)
+        finally:
+            self._loading = False
         missing = [k for k in self.store.ordered_map_keys() if not self.cache.has(k)]
         extra = ""
         if missing:
@@ -124,13 +146,16 @@ class MapManagerDialog(QDialog):
         self.lbl_summary.setText(
             f"共 {len(entries)} 张缓存地图, 合计 "
             f"{self.cache.total_bytes() / 1024.0 / 1024.0:.1f} MB{extra}")
+        if entries and self.table.currentRow() < 0:
+            self.table.setCurrentCell(0, 0)      # 默认选中第一张, 输入框直接可用
+        self._on_selection_changed()
 
     def _add_row(self, entry: MapEntry) -> None:
         row = self.table.rowCount()
         self.table.insertRow(row)
         self.table.setRowHeight(row, _THUMB + 10)
 
-        # 预览
+        # 预览(不可编辑: 否则双击图片会把输入框开在图片格里)
         thumb = QTableWidgetItem()
         pm = QPixmap(entry.path)
         if pm.isNull():
@@ -142,14 +167,11 @@ class MapManagerDialog(QDialog):
         thumb.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         self.table.setItem(row, 0, thumb)
 
-        # 名称(可编辑): 默认值用“用户起的名字”, 没有就留空并用水印提示
-        name = QTableWidgetItem(self.store.name_of(entry.key))
+        name = QTableWidgetItem()          # 只显示, 编辑在顶部输入框里做
         name.setData(Qt.ItemDataRole.UserRole, entry.key)
-        default = self.store.display_name(entry.key)
-        name.setToolTip(f"留空则按顺序自动编号为「{default}」\n地图键: {entry.key}")
-        if not self.store.name_of(entry.key):
-            name.setForeground(Qt.GlobalColor.gray)
+        name.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
         self.table.setItem(row, 1, name)
+        self._update_name_cell(entry.key)
 
         size = QTableWidgetItem(f"{entry.size_text}  {_image_size_text(entry.path)}")
         size.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -165,18 +187,57 @@ class MapManagerDialog(QDialog):
         when.setToolTip(f"地图键: {entry.key}")
         self.table.setItem(row, 4, when)
 
-    # ------------------------------------------------------------------ 操作
-    def _commit_editor(self) -> None:
-        """结束正在进行的单元格编辑。
+    def _update_name_cell(self, key: str) -> None:
+        """把「名称」列刷新成当前真实值(没名字显示灰色“未命名”)。"""
+        for r in range(self.table.rowCount()):
+            it = self.table.item(r, 1)
+            if it is None or it.data(Qt.ItemDataRole.UserRole) != key:
+                continue
+            name = self.store.name_of(key)
+            it.setText(name or "未命名")
+            it.setForeground(QBrush() if name else QBrush(Qt.GlobalColor.gray))
+            default = self.store.display_name(key)
+            it.setToolTip(f"地图键: {key}\n留空则按顺序自动编号为「{default}」")
+            return
 
-        关键: 否则“还在编辑时就点保存”, 单元格文本还没提交, 刚输入的名字会**静默丢失**
-        (表现为“怎么改都存不上”)。做法是把焦点从编辑器移回表格 —— 失焦即提交。
+    # ------------------------------------------------------------------ 操作
+    def _on_selection_changed(self) -> None:
+        """选中另一张地图 → 把上一张刚输入的内容落盘, 再把新选中项的现有名称填进输入框。"""
+        if self._loading:
+            return
+        self._apply_name()                  # 先保存上一张(还没回车就换行的情况)
+        key = self._current_key()
+        self._cur_key = key
+        if key is None:
+            self.edit_name.clear()
+            self.edit_name.setEnabled(False)
+            self.btn_apply.setEnabled(False)
+            return
+        self.edit_name.setEnabled(True)
+        self.btn_apply.setEnabled(True)
+        self.edit_name.setText(self.store.name_of(key))
+        self.edit_name.setToolTip(f"地图键: {key}")
+        self.edit_name.selectAll()
+
+    def _apply_name(self) -> None:
+        """把顶部输入框的内容写盘(立即生效, 不关窗口, 可接着改下一张)。
+
+        以前是“双击单元格就地编辑 + 点保存才写入”: 编辑器没提交时名字会静默丢掉,
+        现在输入框独立在表格外, 回车 / 失焦 / 切行 都会保存。
         """
-        editor = self.table.findChild(QLineEdit)
-        if editor is not None and editor.isVisible():
-            editor.clearFocus()
-        self.table.setFocus()
-        QApplication.processEvents()
+        key = self._cur_key
+        if not key:
+            return
+        new = self.edit_name.text().strip()
+        if new == self.store.name_of(key):
+            return
+        self.store.rename_map(key, new)
+        self.renamed += 1
+        self._update_name_cell(key)
+        shown = new or self.store.display_name(key)
+        self.lbl_summary.setText(
+            f"已保存: {shown}(第 {self.renamed} 次修改, 左侧列表已同步)")
+        log.info("地图管理: 重命名 %s -> %r", key, new)
 
     def _current_key(self) -> str | None:
         row = self.table.currentRow()
@@ -184,29 +245,6 @@ class MapManagerDialog(QDialog):
             return None
         item = self.table.item(row, 0)
         return item.data(Qt.ItemDataRole.UserRole) if item is not None else None
-
-    def _rename_current(self) -> None:
-        """选中一行 → 弹输入框改名(**立即写盘、不关窗口**, 方便一次改多张)。"""
-        row = self.table.currentRow()
-        key = self._current_key()
-        if key is None:
-            QMessageBox.information(self, "重命名地图", "请先在列表里选中一行")
-            return
-        current = self.table.item(row, 1).text().strip() or self.store.display_name(key)
-        name, ok = QInputDialog.getText(self, "重命名地图",
-                                        f"给这张地图起个名字(地图键 {key}):",
-                                        text=current)
-        if not ok:
-            return
-        name = name.strip()
-        item = self.table.item(row, 1)
-        item.setText(name)
-        item.setForeground(QBrush())        # 恢复常规颜色(空名字才会是灰的)
-        item.setToolTip(f"地图键: {key}" + ("" if name else
-                        f"\n留空则按顺序自动编号为「{self.store.display_name(key)}」"))
-        self.store.rename_map(key, name)
-        self.renamed += 1
-        log.info("地图管理: 重命名 %s -> %r", key, name)
 
     def _open_dir(self) -> None:
         path = self.cache.dir
@@ -219,7 +257,7 @@ class MapManagerDialog(QDialog):
             log.warning("打开目录失败 %s: %s", path, exc)
 
     def _remove_current(self) -> None:
-        self._commit_editor()
+        self._apply_name()
         key = self._current_key()
         if key is None:
             QMessageBox.information(self, "删除缓存图片", "请先选中一行")
@@ -234,22 +272,10 @@ class MapManagerDialog(QDialog):
         if self.cache.remove(key):
             self.reload()
 
-    def _save(self) -> None:
-        """把“名称”列写回 store.map_names(含还在编辑、刚输入的内容)。"""
-        self._commit_editor()
-        changed = 0
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 1)
-            if item is None:
-                continue
-            key = item.data(Qt.ItemDataRole.UserRole)
-            new = item.text().strip()
-            if new != self.store.name_of(key):
-                self.store.rename_map(key, new)
-                changed += 1
-        self.renamed += changed
-        log.info("地图管理: 保存了 %d 个地图名称", changed)
-        self.accept()
+    def done(self, result: int) -> None:
+        """关窗(含 Esc / 关闭按钮)前把输入框里还没回车的名字保存下来。"""
+        self._apply_name()
+        super().done(result)
 
 
 def _image_size_text(path: str) -> str:
