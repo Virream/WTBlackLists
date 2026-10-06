@@ -85,6 +85,9 @@ class RouteTesterWindow(QMainWindow):
         self._visible_ids: set[str] = set()
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
+        # “基准版本”: 双击某条轨迹后, 它的(地图键, 战区指纹)被锁为基准 ——
+        # 之后多选/回放只能在同一版本内进行(见 _group_of / _on_tree_selection_changed)
+        self._anchor: tuple[str, str] | None = None
         self._reselecting = False
         # “粘性状态栏文字”: 提示类信息(回放开始/结束、显示切换…)在若干秒内不被刷新覆盖
         self._sticky_text = ""
@@ -295,6 +298,8 @@ class RouteTesterWindow(QMainWindow):
         self.tree.customContextMenuRequested.connect(self._on_tree_menu)
         self.tree.itemClicked.connect(self._on_tree_item_clicked)
         self.tree.itemSelectionChanged.connect(self._on_tree_selection_changed)
+        # 双击轨迹行 = 把它所在的“地图·模式·版本”定为基准(之后多选只在该版本内)
+        self.tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
         layout.addWidget(self.tree, 1)
 
         hint = QLabel("点击每行前面的眼睛图标可显示/隐藏该轨迹\n"
@@ -546,6 +551,10 @@ class RouteTesterWindow(QMainWindow):
             top.setExpanded(True)
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
+        if self._anchor is not None and not any(
+                (rec := self.store.get(rid)) is not None and self._group_of(rec) == self._anchor
+                for rid in alive):
+            self._anchor = None          # 基准那些轨迹被删光了 → 解除锁定
         self._refresh_map_tracks()
         self._on_tree_selection_changed()
 
@@ -635,20 +644,28 @@ class RouteTesterWindow(QMainWindow):
             it.setSelected(it.data(0, _ROLE_ID) in want)
 
     def _on_tree_selection_changed(self) -> None:
-        """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图**。
+        """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
 
-        跨地图一起回放没有意义(底图只能是一张), 因此在新选中的地图与已选不同时,
-        保留“本次新加进来的那张地图”的条目, 其余取消选中。
+        跨地图(底图只能是一张)/跨版本(战区位置不同, 线路本来就不可比)一起回放没有意义,
+        所以选中了多个分组时只保留一个:
+
+        * 双击定过“基准”时, **基准优先** —— 点到别的版本也不会把基准换掉(锁住);
+        * 没定基准时, 保留“本次新加进来的那个分组”。
         """
         if self._reselecting or self._in_playback():
             return
         recs = self._selection_tracks()
-        if len({r.map_key for r in recs}) > 1:
-            new_ids = {r.route_id for r in recs} - self._sel_ids
-            keep_key = next((r.map_key for r in recs if r.route_id in new_ids), None)
-            if keep_key is None:
-                keep_key = recs[-1].map_key
-            recs = [r for r in recs if r.map_key == keep_key]
+        groups = {self._group_of(r) for r in recs}
+        if len(groups) > 1:
+            keep: tuple[str, str] | None = None
+            if self._anchor is not None and self._anchor in groups:
+                keep = self._anchor
+            else:
+                new_ids = {r.route_id for r in recs} - self._sel_ids
+                keep = next((self._group_of(r) for r in recs if r.route_id in new_ids), None)
+                if keep is None:
+                    keep = self._group_of(recs[-1])
+            recs = [r for r in recs if self._group_of(r) == keep]
             self._reselecting = True
             try:
                 self.tree.blockSignals(True)
@@ -656,23 +673,92 @@ class RouteTesterWindow(QMainWindow):
                 self.tree.blockSignals(False)
             finally:
                 self._reselecting = False
-            self._set_status("跨地图不能一起回放, 已只保留同一张地图的选中条目", sticky=3.0)
+            self._set_status(
+                "同一张地图的同一版本才能一起回放/显示, 已只保留一个版本内的选中条目",
+                sticky=3.0)
         self._sel_ids = {r.route_id for r in recs}
-        n = len(recs)
-        self.lbl_play.setText(f"待回放: {n} 条" if n else "回放: --")
+        self._update_play_label()
+
+    def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
+        """双击轨迹行 → 把它所在的版本定为**基准**(多选/回放锁定在该版本内)。
+
+        双击地图/模式/版本行不做处理(保留 Qt 默认的展开/折叠)。
+        """
+        if item.data(0, _ROLE_KIND) != "route":
+            return
+        if self._in_playback():
+            self._set_status("回放中无法切换基准, 请先点「■ 结束播放」", sticky=2.0)
+            return
+        rec = self.store.get(item.data(0, _ROLE_ID))
+        if rec is None:
+            return
+        self._anchor = self._group_of(rec)
+        self._reselecting = True
+        try:
+            self.tree.blockSignals(True)
+            self._select_route_ids([rec.route_id])     # 基准只选中这一条
+            self.tree.blockSignals(False)
+        finally:
+            self._reselecting = False
+        self._sel_ids = {rec.route_id}
+        self._update_play_label()
+        self._set_status(
+            f"基准已锁定: {self._group_name(*self._anchor)} —— "
+            f"之后只能在“{rec.label}”所在这个版本里多选/回放", sticky=4.0)
+
+    # --------------------------------------------------- 分组(地图 + 版本)
+    @staticmethod
+    def _group_of(rec: RouteRecord) -> tuple[str, str]:
+        """一条轨迹属于哪个分组: (地图键, 战区坐标指纹) —— 版本 = 战区位置。"""
+        return (rec.map_key or "", rec.zone_signature or "")
+
+    def _group_name(self, map_key: str, signature: str) -> str:
+        """分组的可读名字(地图 · 模式 · 版本)。"""
+        layout = self.store.layout_info(map_key, signature) or {}
+        mode = str(layout.get("mode") or "") or (
+            "未知模式" if not signature else "")
+        version = self.store.layout_display_name(map_key, signature)
+        parts = [self.store.display_name(map_key), mode, version]
+        return " · ".join(p for p in parts if p)
+
+    def _update_play_label(self) -> None:
+        """信息区“回放”那一栏: 显示基准版本 + 待回放条数。"""
+        n = len(self._sel_ids)
+        if self._anchor is not None:
+            base = self._group_name(*self._anchor)
+            self.lbl_play.setText(f"基准 {base} | 待回放 {n} 条" if n
+                                  else f"基准 {base} | 未选轨迹")
+        else:
+            self.lbl_play.setText(f"待回放: {n} 条" if n else "回放: --")
 
     def _show_all_tracks(self, shown: bool) -> None:
-        """一键显示/隐藏当前地图的全部轨迹。"""
-        for ch in self._iter_route_items():
-            rid = ch.data(0, _ROLE_ID)
-            if shown:
-                self._visible_ids.add(rid)
-            else:
-                self._visible_ids.discard(rid)
-            ch.setIcon(_COL_EYE, eye_icon(shown))
+        """一键显示/隐藏轨迹(**只限同一版本** —— 不同版本线路不可比)。
+
+        从树的第一个分组开始, 只点亮该分组内的轨迹(树的顺序是最新在前,
+        所以实际是“最新那个版本”); 想换版本就双击其它版本的轨迹改基准。
+        """
+        rows = list(self._iter_route_items())
+        groups: list[tuple[str, str]] = []
+        for ch in rows:
+            rec = self.store.get(ch.data(0, _ROLE_ID))
+            if rec is None:
+                continue
+            grp = self._group_of(rec)
+            if grp not in groups:
+                groups.append(grp)
+        keep = self._anchor if (self._anchor in groups) else (groups[0] if groups else None)
+        if shown:
+            keep_ids = {ch.data(0, _ROLE_ID) for ch in rows
+                        if keep is not None
+                        and (rec := self.store.get(ch.data(0, _ROLE_ID))) is not None
+                        and self._group_of(rec) == keep}
+            self._visible_ids = keep_ids       # 只显示这一个版本(其它版本一并隐掉)
+            self._set_status(f"已显示 {len(keep_ids)} 条轨迹(只限同一版本)", sticky=2.0)
+        else:
+            self._visible_ids.clear()
+            self._set_status("已隐藏全部轨迹", sticky=2.0)
+        self._refresh_eye_icons()
         self._refresh_map_tracks()
-        self._set_status(
-            f"已显示 {len(self._visible_ids)} 条轨迹" if shown else "已隐藏全部轨迹", sticky=2.0)
 
     def _on_tree_menu(self, pos) -> None:
         item = self.tree.itemAt(pos)
@@ -746,17 +832,38 @@ class RouteTesterWindow(QMainWindow):
         return "\n".join(lines)
 
     def _show_tracks_of(self, item: QTreeWidgetItem, shown: bool) -> None:
-        """把某一层(地图/模式/版本)下面的轨迹全部显示或隐藏。"""
-        ids = [it.data(0, _ROLE_ID) for it in self._iter_route_items_of(item)]
-        for rid in ids:
-            if shown:
-                self._visible_ids.add(rid)
-            else:
+        """把某一层(地图/模式/版本)下面的轨迹全部显示或隐藏。
+
+        显示时同样只保留**同一版本**: 从“版本”行点就是该版本全部轨迹;
+        从地图/模式行点则只取其中第一个版本(树木顺序=最新在前)。
+        """
+        rows = [it.data(0, _ROLE_ID) for it in self._iter_route_items_of(item)]
+        if shown:
+            # 这一分支里只保留一个版本(与 _show_all_tracks 同一规则)
+            groups: list[tuple[str, str]] = []
+            keep: tuple[str, str] | None = None
+            for rid in rows:
+                rec = self.store.get(rid)
+                if rec is None:
+                    continue
+                grp = self._group_of(rec)
+                if grp not in groups:
+                    groups.append(grp)
+            keep = groups[0] if groups else None
+            ids = [rid for rid in rows
+                   if (rec := self.store.get(rid)) is not None
+                   and keep is not None and self._group_of(rec) == keep]
+            self._visible_ids = set(ids)
+            extra = "(该分支含多个版本, 只显示了最新那个)" if len(groups) > 1 else ""
+        else:
+            ids = rows
+            for rid in ids:
                 self._visible_ids.discard(rid)
+            extra = ""
         self._refresh_eye_icons()
         self._refresh_map_tracks()
         verb = "已显示" if shown else "已隐藏"
-        self._set_status(f"{verb}该分支的 {len(ids)} 条轨迹", sticky=2.0)
+        self._set_status(f"{verb}该分支的 {len(ids)} 条轨迹{extra}", sticky=2.0)
 
     def _iter_route_items_of(self, item: QTreeWidgetItem):
         """递归取出某层下面的全部轨迹条目。"""
@@ -785,15 +892,19 @@ class RouteTesterWindow(QMainWindow):
         rec = self.store.get(route_id)
         if shown:
             self._visible_ids.add(route_id)
-            # 同一张地图才能一起显示: 点亮别的地图的轨迹时, 先把其它地图的隐掉
-            if rec is not None and rec.map_key:
+            # **同一版本**才能一起显示(同一张地图不够): 版本 = 战区位置,
+            # 不同交战区域的线路叠在一起毫无意义。点亮别的版本时先把它们隐掉。
+            if rec is not None:
+                grp = self._group_of(rec)
                 others = [rid for rid in self._visible_ids
                           if rid != route_id
                           and (o := self.store.get(rid)) is not None
-                          and o.map_key != rec.map_key]
+                          and self._group_of(o) != grp]
                 if others:
                     self._visible_ids -= set(others)
-                    self._set_status("同一张地图才能一起显示, 已隐藏其它地图的轨迹", sticky=3.0)
+                    self._set_status(
+                        "同一版本(同一张图 + 同一战区布局)才能一起显示, "
+                        "已隐藏其它版本的轨迹", sticky=3.0)
         else:
             self._visible_ids.discard(route_id)
         self._refresh_eye_icons()

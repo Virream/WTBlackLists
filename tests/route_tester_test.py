@@ -15,6 +15,7 @@ sys.path.insert(0, ROOT)
 
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, Qt
 from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractItemView, QApplication
 
 import wt81111g.route_window as rw
@@ -1274,7 +1275,7 @@ def test_cached_map_switch(tmpdir: str):
     app.processEvents()
     picked = [r.route_id for r in win._selection_tracks()]
     assert picked == [rec_b.route_id], picked
-    assert "跨地图" in win.lbl_status.text(), win.lbl_status.text()
+    assert "同一版本" in win.lbl_status.text(), win.lbl_status.text()
     assert [r.route_id for r in win._playable_tracks()] == [rec_b.route_id]
 
     # 4) 回放前会把底图切到选中轨迹的那张图
@@ -1471,9 +1472,12 @@ def test_zones_and_modes(tmpdir: str):
     app = QApplication.instance()
     app.processEvents()
     # 记录里带战区指纹(但 map_zones 没存过布局) → 从指纹还原出布局, 版本也能自动编号
-    for mode, sig in (("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
-                      ("战区争夺", "A@0.50,0.50"),
-                      ("战区争夺", "A@0.70,0.70")):
+    # 造 3 个版本: 攻陷/sig1 两条(用于同版本多选), 争夺/sig2、sig3 各一条
+    plan = [("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
+            ("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
+            ("战区争夺", "A@0.50,0.50"),
+            ("战区争夺", "A@0.70,0.70")]
+    for mode, sig in plan:
         rec = win.store.new_route("m2", "地图 2", "T-90M", 0.3, 0.3)
         rec.duration = 10.0
         rec.zone_count, rec.zone_signature, rec.mode_name = 2, sig, mode
@@ -1483,20 +1487,60 @@ def test_zones_and_modes(tmpdir: str):
     app.processEvents()
     assert win.tree.topLevelItemCount() == 1
     top = win.tree.topLevelItem(0)
-    assert top.text(2) == "3 条" and top.childCount() == 2      # 2 个模式
+    assert top.text(2) == "4 条" and top.childCount() == 2      # 2 个模式
     assert {top.child(i).text(1) for i in range(top.childCount())} == {"战区攻陷", "战区争夺"}
     by_mode = {top.child(i).text(1): top.child(i) for i in range(top.childCount())}
-    # 2 战区模式 → 单版本“区域 1”; 1 战区模式 → 两个随机点位“点位 1/2”
-    assert [by_mode["战区攻陷"].child(i).text(1) for i in range(by_mode["战区攻陷"].childCount())] \
-        == ["区域 1"]
+    # 2 战区模式 → 单版本“区域 1”(里面 2 条); 1 战区模式 → 两个随机点位“点位 1/2”
+    assert [by_mode["战区攻陷"].child(i).text(1)
+            for i in range(by_mode["战区攻陷"].childCount())] == ["区域 1"]
+    assert by_mode["战区攻陷"].child(0).childCount() == 2
     spots = [by_mode["战区争夺"].child(i).text(1)
              for i in range(by_mode["战区争夺"].childCount())]
     assert sorted(spots) == ["点位 1", "点位 2"], spots
     assert all(by_mode["战区争夺"].child(i).childCount() == 1
                for i in range(by_mode["战区争夺"].childCount()))
-    assert len(list(win._iter_route_items())) == 3        # 四层下仍能遍历到轨迹
-    win._show_all_tracks(True)                            # 一键显示要作用到最里层
-    assert len(win._visible_ids) == 3
+    assert len(list(win._iter_route_items())) == 4        # 四层下仍能遍历到轨迹
+    rows = list(win._iter_route_items())
+    assert win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID))) == \
+        win._group_of(win.store.get(rows[1].data(0, rw._ROLE_ID)))       # 前两条同版本
+    assert win._group_of(win.store.get(rows[2].data(0, rw._ROLE_ID))) != \
+        win._group_of(win.store.get(rows[0].data(0, rw._ROLE_ID)))
+
+    # 显示只限**同一版本**: 点亮其它版本的轨迹时, 原来的自动隐掉
+    win._set_visible(rows[0], True)
+    assert len(win._visible_ids) == 1
+    win._set_visible(rows[3], True)          # rows[3] 属于另一个版本
+    assert len(win._visible_ids) == 1, "不同版本不能共同显示"
+    assert rows[3].data(0, rw._ROLE_ID) in win._visible_ids
+    # 一键显示也只作用在一个版本上(树木顺序里第一个 = 攻陷/区域 1, 共 2 条)
+    win._show_all_tracks(True)
+    assert len(win._visible_ids) == 2
+    win._show_all_tracks(False)
+    assert win._visible_ids == set()
+
+    # 双击=定基准: 之后多选锁死在该版本内
+    # (必须用真实的 Ctrl+左键 —— QTreeWidgetItem.setSelected 是“清空后选中”语义,
+    #  与用户按住 Ctrl 多选的行为不同, 用它测不出这个拦截)
+    win._on_tree_double_clicked(rows[0], 1)
+    assert win._sel_ids == {rows[0].data(0, rw._ROLE_ID)}
+    assert win._anchor is not None and "基准" in win.lbl_play.text()
+
+    def ctrl_click(row):
+        QTest.mouseClick(win.tree.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier,
+                         win.tree.visualItemRect(row).center())
+        app.processEvents()
+
+    ctrl_click(rows[2])                      # 想去选另一个版本 → 被拦下
+    assert win._sel_ids == {rows[0].data(0, rw._ROLE_ID)}, win._sel_ids
+    assert not rows[2].isSelected()
+    ctrl_click(rows[1])                      # rows[1] 与基准同版本 → 允许
+    assert len(win._sel_ids) == 2
+    # 双击另一版本的轨迹 → 基准可以切换, 且只选中被双击的那一条
+    win._on_tree_double_clicked(rows[2], 1)
+    assert win._sel_ids == {rows[2].data(0, rw._ROLE_ID)}
+    assert win._anchor == win._group_of(win.store.get(rows[2].data(0, rw._ROLE_ID)))
+
     # 右键重命名版本 → 树里立刻换成新名字
     win.store.rename_layout("m2", "A@0.10,0.10;B@0.20,0.20", "大地图")
     win._reload_tree()
