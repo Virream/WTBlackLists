@@ -41,6 +41,7 @@ from .route_store import (
 )
 from .sound import play as play_sound
 from .sound import play_error as play_error_sound
+from .zones import zones_to_json
 
 log = logging.getLogger("route_window")
 
@@ -56,9 +57,9 @@ _COL_EYE = 0
 _COL_NAME = 1
 _COL_TIME = 2
 
-# 眼睛列宽度(px): 二级条目的单元格内容从「缩进×2」处开始, 图标 18px,
-# 再加一点间距 —— 取小了图标会压到名称列的文字上(见 _build_sidebar)
-EYE_COLUMN_WIDTH = 2 * 14 + 18 + 8
+# 眼睛列宽度(px): 轨迹条目在最里层(地图 → 模式 → 轨迹, 缩进 14×3),
+# 图标 18px, 再加一点间距 —— 取小了图标会被列边界裁掉/压到名称列的文字上
+EYE_COLUMN_WIDTH = 3 * 14 + 18 + 8
 
 
 class RouteTesterWindow(QMainWindow):
@@ -98,9 +99,15 @@ class RouteTesterWindow(QMainWindow):
         self._saved_on_move = False
         if self._settings.contains("start_on_move"):   # 清掉早期版本留下的值
             self._settings.remove("start_on_move")
+        # 「显示战区」(小菱形 + A/B/C 字母)开关: 菜单「设置」里勾选, 记住设置
+        try:
+            self._show_zones = int(self._settings.value("show_zones", 1)) != 0
+        except (TypeError, ValueError):
+            self._show_zones = True
 
         self._build_ui()
         self._build_menu()
+        self.map_view.set_show_zones(self._show_zones)
         self._reload_tree()
         # 后台轮询 8111
         self.recorder = RouteRecorder(self.store, parent=self, map_cache=self.map_cache)
@@ -146,7 +153,7 @@ class RouteTesterWindow(QMainWindow):
 
     # ==================================================================== UI
     def _build_menu(self) -> None:
-        """顶部菜单栏: 目前只有「地图」→ 地图管理 / 缓存目录。"""
+        """顶部菜单栏: 「地图」(管理/缓存) / 「设置」(显示开关) / 「帮助」。"""
         menu = self.menuBar().addMenu("地图(&M)")
         act_manage = QAction("地图管理(命名/预览/删除缓存)…", self)
         act_manage.triggered.connect(self._open_map_manager)
@@ -158,7 +165,33 @@ class RouteTesterWindow(QMainWindow):
         act_refresh = QAction("用缓存底图重新显示当前轨迹", self)
         act_refresh.triggered.connect(self._restore_map_for_current_view)
         menu.addAction(act_refresh)
-        self.menuBar().addMenu("帮助(&H)").addAction(self._make_about_action())
+
+        setting = self.menuBar().addMenu("设置(&S)")
+        self.act_zones = QAction("显示战区位置(A/B/C)", self)
+        self.act_zones.setCheckable(True)
+        self.act_zones.setChecked(self._show_zones)
+        self.act_zones.setToolTip(
+            "对战局内 8111 给出的战区(capture_zone)画小菱形 + 字母。\n"
+            "战局外/看缓存底图时, 画的是这张地图以前见过的战区布局。")
+        self.act_zones.toggled.connect(self._on_show_zones)
+        setting.addAction(self.act_zones)
+
+        help_menu = self.menuBar().addMenu("帮助(&H)")
+        help_menu.addAction(self._make_about_action())
+        act_mode = QAction("关于游戏模式怎么判定", self)
+        act_mode.triggered.connect(lambda: QMessageBox.information(
+            self, "关于游戏模式怎么判定",
+            "8111 **不提供模式名**, 但 /map_obj.json 里每个战区都是一个\n"
+            "capture_zone 对象(带 A/B/C 字母与地图坐标)。\n\n"
+            "所以程序按**战区数量**判定模式:\n"
+            "    3 个 → 战区控制(A/B/C 互相争夺)\n"
+            "    2 个 → 战区攻陷(开局双方各一个)\n"
+            "    1 个 → 战区争夺(单点争夺)\n\n"
+            "各战区坐标串作为“模式指纹”记进每条轨迹, 因此同一张图的不同模式\n"
+            "会被分开归组(侧栏: 地图 → 模式 → 轨迹)。\n"
+            "战区只在战局内才有数据; 见过的布局会存进 routes.json, 战局结束后\n"
+            "依旧能在地图上画出来。"))
+        help_menu.addAction(act_mode)
 
     def _make_about_action(self) -> QAction:
         act = QAction("关于地图命名", self)
@@ -169,6 +202,14 @@ class RouteTesterWindow(QMainWindow):
             "进入战局时图片会自动缓存到 data/maps/, 同一张图只存一次;\n"
             "地图名需要你在「地图」→「地图管理」里自己填, 填好后左侧列表就会显示你的名字。"))
         return act
+
+    def _on_show_zones(self, checked: bool) -> None:
+        """菜单开关: 是否在地图上画战区。"""
+        self._show_zones = bool(checked)
+        self._settings.setValue("show_zones", 1 if checked else 0)
+        self.map_view.set_show_zones(self._show_zones)
+        self._set_status("已显示地图上的战区位置" if checked else "已隐藏地图上的战区位置",
+                         sticky=2.0)
 
     def _open_map_dir(self) -> None:
         try:
@@ -400,35 +441,64 @@ class RouteTesterWindow(QMainWindow):
         return lbl
 
     # ==================================================================== 侧栏内容
+    def _iter_route_items(self):
+        """按侧栏顺序遍历全部**轨迹条目**。
+
+        侧栏现在是三层(地图 → 模式 → 轨迹), 不能再只循环两层;
+        同时兼容“没有模式层”的情况。
+        """
+        for i in range(self.tree.topLevelItemCount()):
+            top = self.tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                mid = top.child(j)
+                if mid.data(0, _ROLE_KIND) == "route":
+                    yield mid
+                    continue
+                for k in range(mid.childCount()):
+                    yield mid.child(k)
+
     def _reload_tree(self) -> None:
         self.tree.blockSignals(True)
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
-        grouped = self.store.grouped()
-        for map_key, routes in grouped.items():
-            top = QTreeWidgetItem(["", self.store.display_name(map_key), f"{len(routes)} 条"])
+        # 三层: 地图 → 模式(由 8111 的战区数量推出) → 轨迹
+        groups = self.store.grouped_by_mode()
+        for map_key, modes in groups.items():
+            total = sum(len(rows) for _name, rows in modes)
+            top = QTreeWidgetItem(["", self.store.display_name(map_key), f"{total} 条"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
             f = QFont()
             f.setBold(True)
             top.setFont(_COL_NAME, f)
             self.tree.addTopLevelItem(top)
-            for rec in routes:
-                child = QTreeWidgetItem(
-                    ["", rec.label, fmt_time(rec.duration)])
-                child.setData(0, _ROLE_KIND, "route")
-                child.setData(0, _ROLE_ID, rec.route_id)
-                child.setIcon(_COL_EYE, eye_icon(rec.route_id in self._visible_ids))
-                child.setToolTip(_COL_EYE, "点击显示 / 隐藏该轨迹")
-                child.setToolTip(_COL_NAME, f"{rec.map_name} | {rec.vehicle} | "
-                                            f"用时 {fmt_time(rec.duration)}")
-                top.addChild(child)
-                alive.add(rec.route_id)
+            for mode_label, routes in modes:
+                mid = QTreeWidgetItem(["", mode_label, f"{len(routes)} 条"])
+                mid.setData(0, _ROLE_KIND, "mode")
+                mid.setData(0, _ROLE_ID, map_key)
+                mid.setToolTip(_COL_NAME,
+                               f"{self.store.display_name(map_key)} · {mode_label}\n"
+                               f"模式由 8111 的战区(capture_zone)数量推出: "
+                               f"3 个=战区控制, 2 个=战区攻陷, 1 个=战区争夺")
+                top.addChild(mid)
+                for rec in routes:
+                    child = QTreeWidgetItem(
+                        ["", rec.label, fmt_time(rec.duration)])
+                    child.setData(0, _ROLE_KIND, "route")
+                    child.setData(0, _ROLE_ID, rec.route_id)
+                    child.setIcon(_COL_EYE, eye_icon(rec.route_id in self._visible_ids))
+                    child.setToolTip(_COL_EYE, "点击显示 / 隐藏该轨迹")
+                    child.setToolTip(_COL_NAME,
+                                     f"{rec.map_name} · {rec.mode_label} | {rec.vehicle} | "
+                                     f"用时 {fmt_time(rec.duration)}")
+                    mid.addChild(child)
+                    alive.add(rec.route_id)
+                mid.setExpanded(True)
             top.setExpanded(True)
         # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
         # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
         for map_key in self.store.ordered_map_keys():
-            if map_key in grouped or not self.map_cache.has(map_key):
+            if map_key in groups or not self.map_cache.has(map_key):
                 continue
             top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
             top.setData(0, _ROLE_KIND, "map")
@@ -437,8 +507,12 @@ class RouteTesterWindow(QMainWindow):
             f.setBold(True)
             top.setFont(_COL_NAME, f)
             top.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
-            top.setToolTip(_COL_NAME, "这张地图只缓存了图片, 还没录过轨迹\n"
-                                      "右键可重命名, 或菜单「地图 → 地图管理…」")
+            modes = "、".join(str(x.get("mode") or "?")
+                              for x in self.store.zone_layouts(map_key))
+            top.setToolTip(_COL_NAME,
+                           "这张地图只缓存了图片, 还没录过轨迹\n"
+                           f"见过的模式: {modes or '(还没见过战区)'}\n"
+                           "右键可重命名, 或菜单「地图 → 地图管理…」")
             self.tree.addTopLevelItem(top)
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
@@ -458,14 +532,8 @@ class RouteTesterWindow(QMainWindow):
 
     def _visible_route_ids(self) -> list[str]:
         """按侧栏顺序列出眼睛点亮的轨迹 id。"""
-        out: list[str] = []
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            for j in range(top.childCount()):
-                rid = top.child(j).data(0, _ROLE_ID)
-                if rid in self._visible_ids:
-                    out.append(rid)
-        return out
+        return [it.data(0, _ROLE_ID) for it in self._iter_route_items()
+                if it.data(0, _ROLE_ID) in self._visible_ids]
 
     def _refresh_map_tracks(self) -> None:
         """把“眼睛点亮的轨迹”交给地图显示(可多条, 用于对比多次跑图)。
@@ -486,8 +554,37 @@ class RouteTesterWindow(QMainWindow):
             hl = None
         self.map_view.set_visible_tracks(recs)
         self.map_view.set_live(hl)
+        self._apply_zones()
+
+    def _zone_signature_for_view(self) -> str:
+        """当前视图(回放中的 / 眼睛点亮的轨迹)对应的模式指纹(取不到就空串)。
+
+        多条轨迹时只在它们指纹一致时才返回 —— 否则无法决定画哪套战区。
+        """
+        recs = self.map_view.playback_records or self.map_view.visible_tracks
+        sigs = {r.zone_signature for r in recs if r.zone_signature}
+        return sigs.pop() if len(sigs) == 1 else ""
+
+    def _apply_zones(self, info: dict | None = None) -> None:
+        """决定地图上画哪套战区(小菱形 + A/B/C)。
+
+        战局内且 8111 正在给同一张图 → 用**实时**战区;
+        其它情况(游戏关了/在看缓存底图) → 用该地图存过的布局:
+        优先匹配“正在看的轨迹的模式指纹”, 没有就取最近一次见过的。
+        """
+        key = self.map_view.map_key
+        if not key:
+            return
+        recorder = getattr(self, "recorder", None)
+        live = list((info or {}).get("zones") or [])
+        if live and recorder is not None and recorder.map_key == key:
+            self.map_view.set_zones(zones_to_json(live))
+            return
+        layout = self.store.layout_for(key, self._zone_signature_for_view())
+        self.map_view.set_zones((layout or {}).get("zones") or [])
 
     def _selection_tracks(self) -> list[RouteRecord]:
+        """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""
         """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""
         out: list[RouteRecord] = []
         for it in self.tree.selectedItems():
@@ -501,11 +598,8 @@ class RouteTesterWindow(QMainWindow):
     def _select_route_ids(self, ids) -> None:
         """在侧栏中选中指定线路(不处理信号, 由调用方决定后续动作)。"""
         want = set(ids)
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            for j in range(top.childCount()):
-                ch = top.child(j)
-                ch.setSelected(ch.data(0, _ROLE_ID) in want)
+        for it in self._iter_route_items():
+            it.setSelected(it.data(0, _ROLE_ID) in want)
 
     def _on_tree_selection_changed(self) -> None:
         """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图**。
@@ -536,16 +630,13 @@ class RouteTesterWindow(QMainWindow):
 
     def _show_all_tracks(self, shown: bool) -> None:
         """一键显示/隐藏当前地图的全部轨迹。"""
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            for j in range(top.childCount()):
-                ch = top.child(j)
-                rid = ch.data(0, _ROLE_ID)
-                if shown:
-                    self._visible_ids.add(rid)
-                else:
-                    self._visible_ids.discard(rid)
-                ch.setIcon(_COL_EYE, eye_icon(shown))
+        for ch in self._iter_route_items():
+            rid = ch.data(0, _ROLE_ID)
+            if shown:
+                self._visible_ids.add(rid)
+            else:
+                self._visible_ids.discard(rid)
+            ch.setIcon(_COL_EYE, eye_icon(shown))
         self._refresh_map_tracks()
         self._set_status(
             f"已显示 {len(self._visible_ids)} 条轨迹" if shown else "已隐藏全部轨迹", sticky=2.0)
@@ -627,11 +718,8 @@ class RouteTesterWindow(QMainWindow):
 
     def _refresh_eye_icons(self) -> None:
         """按 _visible_ids 重刷所有条目的眼睛图标(不重建树, 避免调用方持有失效条目)。"""
-        for i in range(self.tree.topLevelItemCount()):
-            top = self.tree.topLevelItem(i)
-            for j in range(top.childCount()):
-                ch = top.child(j)
-                ch.setIcon(_COL_EYE, eye_icon(ch.data(0, _ROLE_ID) in self._visible_ids))
+        for ch in self._iter_route_items():
+            ch.setIcon(_COL_EYE, eye_icon(ch.data(0, _ROLE_ID) in self._visible_ids))
 
     def _delete_route(self, item: QTreeWidgetItem) -> None:
         route_id = item.data(0, _ROLE_ID)
@@ -867,7 +955,10 @@ class RouteTesterWindow(QMainWindow):
                 if info.get("player") is None:
                     self.lbl_status.setText("已连接 8111 | 等待进入对局/试车场(未获取到玩家位置)")
                 else:
-                    self.lbl_status.setText("已连接 8111 | 可开始录制")
+                    mode = str(info.get("mode") or "")
+                    self.lbl_status.setText(
+                        f"已连接 8111 | {mode} | 可开始录制" if mode
+                        else "已连接 8111 | 可开始录制")
 
             # 没有底图时(游戏没开/战局外)用本地缓存补上, 这样关掉游戏也能看回放
             if self.map_view.map_key is None and now - self._last_map_try >= 1.0:
@@ -875,12 +966,14 @@ class RouteTesterWindow(QMainWindow):
                 self._restore_map_for_current_view()
 
         self.map_view.set_player(info.get("player"))
+        self._apply_zones(info)
         self.map_view.update()
 
     def _on_map_changed(self, data: bytes) -> None:
         changed = self.map_view.set_map_bytes(data)
         if not changed:
             return
+        self._apply_zones()          # 换了地图 → 换用该地图的战区布局
         if self.recorder.map_key == PLACEHOLDER_MAP_KEY:
             # 战局外 8111 只有占位图: **不要**当换图清理, 而是尽量切回“正在看的轨迹”的缓存底图
             self._restore_map_for_current_view()
@@ -940,6 +1033,7 @@ class RouteTesterWindow(QMainWindow):
         if not key or self.map_view.map_key == key:
             return
         if self._show_cached_map(key):
+            self._apply_zones()          # 切了地图 → 换用该地图的战区布局
             self._set_status(f"已用缓存底图显示「{self.store.display_name(key)}」", sticky=2.5)
         elif self.map_view.map_key is None:
             self._set_status(

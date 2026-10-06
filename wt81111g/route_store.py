@@ -3,11 +3,21 @@
 8111 **不提供地图名称**(只有几何数据与地图图片), 因此用地图图片内容的
 指纹(sha1 前 12 位)作为地图唯一键; 显示名默认自动编号, 支持用户重命名。
 
+模式: 8111 也不给模式名, 但 `/map_obj.json` 里的 `capture_zone`(战区)能决定它 ——
+详见 `zones.py`。同一张图会有多种模式, 所以:
+
+* 每条轨迹记录下当时的 **战区数量 + 战区坐标串(模式指纹)+ 模式名**;
+* `map_zones` 按地图保存见过的战区布局, 战局结束后依旧能在地图上画出战区。
+
 数据文件: <data_dir>/routes.json
 结构:
 {
   "version": 1,
   "map_names": {"<地图指纹>": "地图名"},
+  "known_maps": ["<地图指纹>", ...],
+  "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
+                               "zones": [{"label": .., "x": .., "y": ..}],
+                               "seen_at": ..}, ...]},
   "routes": [ {路线记录}, ... ]
 }
 """
@@ -24,6 +34,9 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .config import data_dir
+from .zones import mode_name as zone_mode_name
+from .zones import signature as zones_signature
+from .zones import zones_to_json
 
 log = logging.getLogger("route_store")
 
@@ -65,7 +78,12 @@ class RouteMark:
 
 @dataclass
 class RouteRecord:
-    """一次完整的跑图录制。"""
+    """一次完整的跑图录制。
+
+    `zone_count` / `zone_signature` / `mode_name` 是录制开始时采集的战区信息:
+    8111 不给模式名, 由战区数量推出(见 zones.MODE_NAMES), 坐标串则是稳定的
+    “模式指纹”。旧记录没有这三个字段 → 归为“未知模式”。
+    """
     route_id: str
     map_key: str
     map_name: str
@@ -76,6 +94,9 @@ class RouteRecord:
     start_y: float
     points: list[RoutePoint] = field(default_factory=list)
     marks: list[RouteMark] = field(default_factory=list)
+    zone_count: int = 0
+    zone_signature: str = ""
+    mode_name: str = ""
 
     @property
     def label(self) -> str:
@@ -85,6 +106,11 @@ class RouteRecord:
         """
         ts = self.created_at[11:16] if len(self.created_at) >= 16 else ""
         return f"{ts}  {self.vehicle}".strip()
+
+    @property
+    def mode_label(self) -> str:
+        """模式显示名(旧记录没有存过 → 按战区数量现推, 推不出就“未知模式”)。"""
+        return self.mode_name or zone_mode_name(self.zone_count)
 
 
 def fmt_time(seconds: float) -> str:
@@ -215,6 +241,9 @@ class RouteStore:
         # 见过的地图键(含**只缓存了图片、还没录过轨迹**的地图):
         # 侧栏与「地图管理」的默认编号都基于它, 保证两边一致且稳定
         self.known_maps: list[str] = []
+        # 见过的战区布局: {地图键: [布局, ...]}(新的在前, 每种模式一条),
+        # 存下来才能在战局结束后依旧把 A/B/C 画在地图上
+        self.map_zones: dict[str, list[dict]] = {}
         self.routes: list[RouteRecord] = []
         self._load()
 
@@ -235,6 +264,11 @@ class RouteStore:
             known = data.get("known_maps")
             if isinstance(known, list):
                 self.known_maps = [str(k) for k in known if str(k)]
+            mz = data.get("map_zones")
+            if isinstance(mz, dict):
+                for key, layouts in mz.items():
+                    if isinstance(layouts, list):
+                        self.map_zones[str(key)] = [x for x in layouts if isinstance(x, dict)]
             for item in data.get("routes") or []:
                 try:
                     pts = [RoutePoint(**p) for p in item.get("points") or []]
@@ -249,6 +283,10 @@ class RouteStore:
                         start_x=float(item.get("start_x", 0.0)),
                         start_y=float(item.get("start_y", 0.0)),
                         points=pts, marks=mks,
+                        # 旧版本的记录没有这三个字段 → 默认 0/空 → 归为“未知模式”
+                        zone_count=int(item.get("zone_count") or 0),
+                        zone_signature=str(item.get("zone_signature") or ""),
+                        mode_name=str(item.get("mode_name") or ""),
                     ))
                 except (KeyError, TypeError, ValueError) as exc:
                     log.warning("跳过损坏的线路记录: %s", exc)
@@ -262,6 +300,7 @@ class RouteStore:
                 "version": 1,
                 "map_names": self.map_names,
                 "known_maps": self.ordered_map_keys(),
+                "map_zones": self.map_zones,
                 "routes": [
                     {
                         **{k: v for k, v in asdict(r).items()
@@ -375,4 +414,67 @@ class RouteStore:
             )
             if rows:
                 out[key] = rows
+        return out
+
+    # ------------------------------------------------------------------ 战区/模式
+    def remember_zones(self, map_key: str, zones) -> bool:
+        """记下某地图的战区布局(按坐标串去重)。返回是否是新布局。
+
+        必须按指纹去重: 同一张图的**不同模式**战区数量/位置不同, 它们是不同的布局,
+        而同一模式的多次对局指纹相同(只刷新 seen_at)。
+        """
+        if not map_key or not zones:
+            return False
+        sig = zones_signature(zones)
+        if not sig:
+            return False
+        with self._lock:
+            layouts = self.map_zones.setdefault(map_key, [])
+            now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            for item in layouts:
+                if item.get("sig") == sig:
+                    item["seen_at"] = now
+                    self.save()
+                    return False
+            layouts.insert(0, {
+                "sig": sig,
+                "count": len(zones),
+                "mode": zone_mode_name(len(zones)),
+                "zones": zones_to_json(zones),
+                "seen_at": now,
+            })
+            del layouts[8:]                 # 单张地图最多留 8 种布局
+        self.save()
+        return True
+
+    def zone_layouts(self, map_key: str) -> list[dict]:
+        """某地图已见过的战区布局(新的在前)。"""
+        return list(self.map_zones.get(map_key) or [])
+
+    def layout_for(self, map_key: str, signature: str = "") -> dict | None:
+        """取某地图的战区布局: 优先精确匹配指纹, 否则用最新见过的那张。"""
+        layouts = self.map_zones.get(map_key) or []
+        if signature:
+            for item in layouts:
+                if item.get("sig") == signature:
+                    return item
+        return layouts[0] if layouts else None
+
+    def grouped_by_mode(self) -> dict[str, list[tuple[str, list[RouteRecord]]]]:
+        """{地图键: [(模式名, [轨迹...]), ...]} —— 侧栏三层树用。
+
+        同一张图的不同模式分开成组(模式按组内最新一条的时间倒序),
+        这样“同一张图跑不同模式的线路”不会混在一起。
+        """
+        out: dict[str, list[tuple[str, list[RouteRecord]]]] = {}
+        for key, rows in self.grouped().items():
+            buckets: dict[str, list[RouteRecord]] = {}
+            order: list[str] = []
+            for rec in rows:            # rows 已按时间倒序 → 最近跑的模式排前面
+                name = rec.mode_label
+                if name not in buckets:
+                    buckets[name] = []
+                    order.append(name)
+                buckets[name].append(rec)
+            out[key] = [(name, buckets[name]) for name in order]
         return out

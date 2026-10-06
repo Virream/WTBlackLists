@@ -3,6 +3,7 @@
 数据来源:
 - 载具型号 / 速度 : GET /indicators  (type / speed)
 - 玩家坐标        : GET /map_obj.json (type == "player" 的 x/y, 0~1 归一化)
+- 战区坐标/模式   : GET /map_obj.json (type == "capture_zone", 见 zones.py)
 - 地图图片        : GET /map.img      (节流请求, 内容变化才上报)
 
 录制命令(开始/标记/结束)由 GUI 线程投递到队列, 在轮询线程内消费,
@@ -26,6 +27,8 @@ from .map_cache import MapCache
 from .route_store import (
     PLACEHOLDER_MAP_KEY, RouteMark, RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
 )
+from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
+from .zones import zones_from_objects
 
 log = logging.getLogger("route_recorder")
 
@@ -122,6 +125,10 @@ class RouteRecorder(QObject):
         self._map_key = "unknown"
         self._map_thread: threading.Thread | None = None
 
+        # 当前战局的战区(轮询线程写入, GUI 只读引用): 坐标是模式指纹的来源
+        self._zones: list[Zone] = []
+        self._zones_sig = ""
+
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
         if self._thread is not None:
@@ -208,6 +215,21 @@ class RouteRecorder(QObject):
         """当前地图指纹(地图线程更新, 战局外为占位图指纹)。"""
         return self._map_key
 
+    @property
+    def zones(self) -> list[Zone]:
+        """当前战局的战区(GUI 线程读: 列表引用整体替换, 无需加锁)。"""
+        return self._zones
+
+    @property
+    def zones_signature(self) -> str:
+        """当前战区指纹(空串 = 还不知道/战局外)。"""
+        return self._zones_sig
+
+    @property
+    def mode_name(self) -> str:
+        """由战区数量推出的模式名(战区未知时为空串)。"""
+        return zone_mode_name(len(self._zones)) if self._zones else ""
+
     # ------------------------------------------------------------------ 轮询
     def run(self) -> None:
         log.info("route recorder started (%.0f Hz)", self.target_hz())
@@ -242,7 +264,10 @@ class RouteRecorder(QObject):
         speed = _to_float(ind.get("speed")) or 0.0
 
         # 玩家坐标: 每帧请求(轨迹平滑的关键)
-        player = self._find_player(ind)
+        # 顺带从同一份数据里取战区 —— 不额外增加请求
+        objects = self.client.map_objects()
+        player = self._find_player(objects, ind)
+        self._update_zones(objects)
 
         # 最近采样缓冲(回溯起点用); 按时间从头部淘汰, 只留 START_LOOKBACK 秒
         if player is not None:
@@ -274,6 +299,8 @@ class RouteRecorder(QObject):
             "elapsed": elapsed,
             "marks": len(self._rec.marks) - 1 if self._rec is not None else 0,
             "rate": self._current_rate(),
+            "zones": self._zones,
+            "mode": self.mode_name,
         })
 
     def _current_rate(self) -> float:
@@ -283,9 +310,9 @@ class RouteRecorder(QObject):
         span = self._rate_window[-1] - self._rate_window[0]
         return (len(self._rate_window) - 1) / span if span > 0 else 0.0
 
-    def _find_player(self, ind: dict) -> tuple[float, float] | None:
-        """从 map_obj.json 找玩家自身坐标; 兜底读 indicators 的 map_x/map_y。"""
-        for obj in self.client.map_objects():
+    def _find_player(self, objects: list, ind: dict) -> tuple[float, float] | None:
+        """从 map_obj.json 找玩家自身坐标; 兼底读 indicators 的 map_x/map_y。"""
+        for obj in objects or []:
             if not isinstance(obj, dict) or not _is_player_obj(obj):
                 continue
             x, y = _to_float(obj.get("x")), _to_float(obj.get("y"))
@@ -296,6 +323,36 @@ class RouteRecorder(QObject):
             if x is not None and y is not None:
                 return (x, y)
         return None
+
+    def _update_zones(self, objects: list) -> None:
+        """从地图对象里提取战区, 指纹变化时入存并刷新尚缺战区信息的当前录制。
+
+        战区数量决定模式(3/2/1 → 控制/攻陷/争夺), 坐标串则是模式指纹; 布局按地图
+        落盘, 这样战局结束后依旧能把 A/B/C 画出来。
+        """
+        zones = zones_from_objects(objects)
+        sig = zones_signature(zones)
+        if sig == self._zones_sig:
+            return
+        self._zones = zones
+        self._zones_sig = sig
+        if not zones:
+            return
+        log.info("战区已更新: %s (%s)", self.mode_name, sig)
+        # 录制开始时可能还没拿到战区(进图瞬间) → 指纹变化时补写进当前录制
+        if self._rec is not None and not self._rec.zone_signature:
+            self._stamp_record(self._rec)
+        if self._map_key != PLACEHOLDER_MAP_KEY:
+            try:
+                self.store.remember_zones(self._map_key, zones)
+            except Exception as exc:  # noqa: BLE001 - 存盘失败不应影响录制
+                log.warning("保存战区布局失败: %s", exc)
+
+    def _stamp_record(self, rec: RouteRecord) -> None:
+        """把当前战局的战区信息写进记录(模式名/数量/指纹)。"""
+        rec.zone_count = len(self._zones)
+        rec.zone_signature = self._zones_sig
+        rec.mode_name = self.mode_name
 
     # ------------------------------------------------------------------ 录制
     def _drain_commands(self, now: float, player: tuple[float, float] | None,
@@ -331,6 +388,7 @@ class RouteRecorder(QObject):
             vehicle=pretty_vehicle(vehicle),
             start_x=player[0], start_y=player[1],
         )
+        self._stamp_record(rec)          # 模式 = 当前战局的战区布局(可能稍后才拿到)
         self._rec = rec
         if start_on_move:
             # 等速度不再为 0 再回溯定起点(见 _arm_check); 此时不开始计时

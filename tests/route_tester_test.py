@@ -24,10 +24,11 @@ from wt81111g.route_map_view import RouteMapView, build_speed_segments
 from wt81111g.route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from wt81111g.route_recorder import RouteRecorder, _is_player_obj
 from wt81111g.route_store import (
-    RouteMark, RoutePoint, RouteStore, fmt_speed, fmt_time, fmt_time_ms, point_at,
-    pretty_vehicle, split_points,
+    RouteMark, RoutePoint, RouteRecord, RouteStore, fmt_speed, fmt_time, fmt_time_ms,
+    point_at, pretty_vehicle, split_points,
 )
 from wt81111g.route_window import RouteTesterWindow
+from wt81111g.zones import mode_name, signature, zones_from_objects
 
 # 测试时不播放系统提示音
 rw.play_sound = lambda action: None
@@ -548,8 +549,9 @@ def test_window(tmpdir: str):
     top = win.tree.topLevelItem(0)
     # 列: 0=眼睛 1=地图/线路 2=用时
     assert top.text(1) == "地图 1" and top.text(2) == "1 条"
-    assert top.childCount() == 1
-    child = top.child(0)
+    rows = routes_of(top)                      # 地图 → 模式 → 轨迹
+    assert len(rows) == 1
+    child = rows[0]
     assert child.text(1) == rec.label and child.text(2) == "01:37"
 
     win._load_playback([rec])         # 载入回放 → 进入回放模式并锁定其余功能
@@ -858,39 +860,42 @@ def test_eye_visibility_opacity(tmpdir: str):
         "回放按“选中条目”决定播哪几条 → 需要 Shift/Ctrl 多选"
 
     top = win.tree.topLevelItem(0)
-    assert top.childCount() == 2
+    rows = routes_of(top)
+    assert len(rows) == 2
+    # 模式层不应有眼睛图标(只有轨迹条目才有)
+    assert top.child(0).icon(0).isNull()
     # 地图节点没有眼睛图标
     assert top.icon(0).isNull(), "一级(地图)条目不应有眼睛图标"
     # **选中条目 ≠ 显示轨迹**: 选中只影响“回放播哪几条”
-    top.child(0).setSelected(True)
+    rows[0].setSelected(True)
     app.processEvents()
     assert win.map_view.visible_tracks == [], "选中条目不应把轨迹显示到地图上"
-    top.child(0).setSelected(False)
+    rows[0].setSelected(False)
     app.processEvents()
     assert [r.route_id for r in win._playable_tracks()] == [], "无选中/无显示时没有可回放内容"
-    icon_before = top.child(0).icon(0).cacheKey()
+    icon_before = rows[0].icon(0).cacheKey()
 
-    win._on_tree_item_clicked(top.child(0), 0)      # 点第 1 条的眼睛
+    win._on_tree_item_clicked(rows[0], 0)      # 点第 1 条的眼睛
     assert [r.route_id for r in win.map_view.visible_tracks] == [r1.route_id]
-    assert top.child(0).icon(0).cacheKey() != icon_before, "图标应切换为“显示中”"
-    icon_shown = top.child(0).icon(0).cacheKey()
+    assert rows[0].icon(0).cacheKey() != icon_before, "图标应切换为“显示中”"
+    icon_shown = rows[0].icon(0).cacheKey()
 
-    win._on_tree_item_clicked(top.child(1), 0)      # 点第 2 条的眼睛 → 两条同时显示
+    win._on_tree_item_clicked(rows[1], 0)      # 点第 2 条的眼睛 → 两条同时显示
     assert {r.route_id for r in win.map_view.visible_tracks} == {r1.route_id, r2.route_id}
 
     # 点名字列(不是眼睛列)不改变显示状态
-    win._on_tree_item_clicked(top.child(0), 1)
+    win._on_tree_item_clicked(rows[0], 1)
     assert len(win.map_view.visible_tracks) == 2
 
-    win._on_tree_item_clicked(top.child(0), 0)      # 再点一次 → 隐藏
+    win._on_tree_item_clicked(rows[0], 0)      # 再点一次 → 隐藏
     assert [r.route_id for r in win.map_view.visible_tracks] == [r2.route_id]
-    assert top.child(0).icon(0).cacheKey() != icon_shown
+    assert rows[0].icon(0).cacheKey() != icon_shown
 
     # 侧栏重建(结束录制/重命名地图时会发生)不能丢掉“显示中”的状态
     win._reload_tree()
     assert [r.route_id for r in win.map_view.visible_tracks] == [r2.route_id], \
         "重建侧栏后眼睛状态应保持"
-    assert win.tree.topLevelItem(0).child(0).icon(0).cacheKey() != icon_shown
+    assert routes_of(win.tree.topLevelItem(0))[0].icon(0).cacheKey() != icon_shown
 
     # 一键显示/隐藏全部
     win._show_all_tracks(True)
@@ -963,7 +968,7 @@ def test_playback_lock(tmpdir: str):
     # 回放中直接调用眼睛点击入口也应被拒绝(防止绕过 UI 禁用)
     top = win.tree.topLevelItem(0)
     before = set(win._visible_ids)
-    win._on_tree_item_clicked(top.child(0), 0)
+    win._on_tree_item_clicked(routes_of(top)[0], 0)
     assert set(win._visible_ids) == before, "回放中不应改变轨迹显示"
     assert "结束播放" in win.lbl_status.text(), win.lbl_status.text()
 
@@ -987,7 +992,7 @@ def test_playback_lock(tmpdir: str):
     assert win.btn_play_stop.isEnabled() is False
 
     # 解锁后眼睛又能用了
-    win._on_tree_item_clicked(top.child(0), 0)
+    win._on_tree_item_clicked(routes_of(top)[0], 0)
     assert len(win.map_view.visible_tracks) == 1
     win.close()
     results.append("回放锁定其余功能 + 结束播放解锁 OK")
@@ -1017,7 +1022,7 @@ def test_eye_icon_no_overlap(tmpdir: str):
         win._reload_tree()
         app.processEvents()
 
-        row = win.tree.visualItemRect(win.tree.topLevelItem(0).child(0))
+        row = win.tree.visualItemRect(routes_of(win.tree.topLevelItem(0))[0])
         vp = win.tree.viewport()
         canvas = QImage(vp.width(), vp.height(), QImage.Format.Format_ARGB32)
         vp.render(canvas)
@@ -1066,6 +1071,18 @@ def make_window(tmpdir: str, name: str) -> RouteTesterWindow:
     return RouteTesterWindow(store, map_cache=cache, start_recorder=False)
 
 
+def routes_of(top) -> list:
+    """取某张地图节点下的全部**轨迹条目**(侧栏三层: 地图 → 模式 → 轨迹)。"""
+    out = []
+    for i in range(top.childCount()):
+        ch = top.child(i)
+        if ch.data(0, rw._ROLE_KIND) == "route":
+            out.append(ch)
+        else:
+            out.extend(ch.child(j) for j in range(ch.childCount()))
+    return out
+
+
 def test_recording_end_eye(tmpdir: str):
     """录制结束后: 轨迹仍显示在地图上 → 眼睛必须同时点亮(显示状态统一由 _visible_ids 决定)。
 
@@ -1085,7 +1102,7 @@ def test_recording_end_eye(tmpdir: str):
     win._on_recording_finished(rec)          # 模拟“结束录制”信号
     app.processEvents()
     assert rec.route_id in win._visible_ids, "刚录完的轨迹正在显示, 眼睛必须点亮"
-    child = win.tree.topLevelItem(0).child(0)
+    child = routes_of(win.tree.topLevelItem(0))[0]
     assert child.icon(0).cacheKey() == eye_icon(True).cacheKey(), "眼睛图标应显示为“显示中”"
     assert win.map_view.live_record is rec, "刚录完的那条用速度配色高亮"
     assert rec.route_id in [r.route_id for r in win.map_view.visible_tracks], \
@@ -1126,17 +1143,19 @@ def test_playback_source_selection(tmpdir: str):
     win._reload_tree()
     app.processEvents()
     top = win.tree.topLevelItem(0)
+    rows = routes_of(top)
+    assert len(rows) == 3
 
     # 没有任何选中、也没点亮眼睛 → 无内容可播
     assert win._playable_tracks() == []
 
     # 选中一条 → 只播这一条
-    top.child(1).setSelected(True)
+    rows[1].setSelected(True)
     app.processEvents()
     assert [r.route_id for r in win._playable_tracks()] == [recs[1].route_id]
 
     # 选中两条 → 播这两条(按侧栏顺序)
-    top.child(2).setSelected(True)
+    rows[2].setSelected(True)
     app.processEvents()
     assert [r.route_id for r in win._playable_tracks()] == \
         [recs[1].route_id, recs[2].route_id]
@@ -1146,15 +1165,15 @@ def test_playback_source_selection(tmpdir: str):
     win._end_playback()
 
     # 没选中时退回“眼睛点亮的轨迹”
-    for j in range(3):
-        top.child(j).setSelected(False)
+    for row in rows:
+        row.setSelected(False)
     app.processEvents()
     assert win._playable_tracks() == []
-    win._on_tree_item_clicked(top.child(0), 0)
+    win._on_tree_item_clicked(rows[0], 0)
     assert [r.route_id for r in win._playable_tracks()] == [recs[0].route_id]
 
     # 也没点亮时退回“刚录制的那条”
-    win._on_tree_item_clicked(top.child(0), 0)
+    win._on_tree_item_clicked(rows[0], 0)
     win._last_record = recs[2]
     assert [r.route_id for r in win._playable_tracks()] == [recs[2].route_id]
     win.close()
@@ -1233,8 +1252,8 @@ def test_cached_map_switch(tmpdir: str):
 
     # 两张地图各有自己的分组(侧栏按地图分组)
     assert win.tree.topLevelItemCount() == 2
-    child_a = win.tree.topLevelItem(0).child(0)
-    child_b = win.tree.topLevelItem(1).child(0)
+    child_a = routes_of(win.tree.topLevelItem(0))[0]
+    child_b = routes_of(win.tree.topLevelItem(1))[0]
 
     # 1) 显示 A 的轨迹 → 底图自动切成 A 的缓存图
     win._on_tree_item_clicked(child_a, 0)
@@ -1303,8 +1322,19 @@ def test_map_manager(tmpdir: str):
     assert dlg.table.rowCount() == 1, "地图管理应列出缓存的地图"
     assert dlg.table.item(0, 0).data(Qt.ItemDataRole.UserRole) == key
     assert dlg.table.item(0, 3).text() == "1"        # 该图的轨迹数
-    dlg.table.item(0, 1).setText("诺曼底")             # 相当于双击改名
-    dlg._save()
+    # 表格里一律不许就地编辑(以前双击图片会在图片格里弹出输入框)
+    assert dlg.table.editTriggers() == QAbstractItemView.EditTrigger.NoEditTriggers
+    assert not (dlg.table.model().flags(dlg.table.model().index(0, 0))
+                & Qt.ItemFlag.ItemIsEditable)
+    assert not (dlg.table.model().flags(dlg.table.model().index(0, 1))
+                & Qt.ItemFlag.ItemIsEditable)
+    # 改名走顶部固定的输入框: 回车即保存(立即写盘)
+    dlg.table.setCurrentCell(0, 0)
+    app.processEvents()
+    assert dlg.edit_name.isEnabled()
+    dlg.edit_name.setText("诺曼底")
+    dlg.edit_name.returnPressed.emit()
+    app.processEvents()
     assert win.store.name_of(key) == "诺曼底"
     win._reload_tree()
     app.processEvents()
@@ -1318,6 +1348,90 @@ def test_map_manager(tmpdir: str):
     dlg.close()
     win.close()
     results.append("地图管理(缓存列表/命名/落盘/菜单栏) OK")
+
+
+def test_zones_and_modes(tmpdir: str):
+    """战区 → 模式: 解析 / 指纹去重 / 录制时写进记录 / 侧栏三层树。
+
+    8111 不给模式名, 只能靠 /map_obj.json 里 capture_zone 的**数量**判定;
+    样本数据用实测格式(三战区局: A/B/C + 各自中心坐标)。
+    """
+    tri = [
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.4329, "y": 0.5561,
+         "zone_id": 0, "zone_label": "A", "zone_label_code": 65},
+        {"type": "ground_model", "icon": "Player", "x": 0.5, "y": 0.5},
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.5899, "y": 0.4277,
+         "zone_id": 2, "zone_label": "C", "zone_label_code": 67},
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.499, "y": 0.4985,
+         "zone_id": 1, "zone_label": "B", "zone_label_code": 66},
+    ]
+    zones = zones_from_objects(tri)
+    assert [z.label for z in zones] == ["A", "B", "C"]      # 顺序乱了也要按字母排好
+    assert [z.x for z in zones] == [0.4329, 0.499, 0.5899]
+    assert mode_name(3) == "战区控制" and mode_name(2) == "战区攻陷"
+    assert mode_name(1) == "战区争夺" and mode_name(0) == "未知模式"
+    sig3 = signature(zones)
+    assert sig3 == "A@0.4329,0.5561;B@0.4990,0.4985;C@0.5899,0.4277", sig3
+    assert zones_from_objects([]) == []
+    # 旧记录没存过模式 → 未知模式
+    bare = RouteRecord("r", "k", "m", "v", "2026-10-06T21:00:00", 1.0, 0.0, 0.0)
+    assert bare.mode_label == "未知模式"
+
+    # 战区布局按地图落盘, 同指纹(同模式)只留一条
+    store = RouteStore(os.path.join(tmpdir, "zones.json"))
+    assert store.remember_zones("m1", zones) is True
+    assert store.remember_zones("m1", zones) is False
+    assert [x["mode"] for x in store.zone_layouts("m1")] == ["战区控制"]
+    assert store.layout_for("m1", sig3)["count"] == 3
+    assert store.layout_for("m1", "X@0,0")["mode"] == "战区控制"   # 匹配不到就用最新的
+    again = RouteStore(os.path.join(tmpdir, "zones.json"))
+    assert len(again.zone_layouts("m1")) == 1                     # 持久化往返
+
+    # 录制线程从同一份 /map_obj.json 里抓战区, 并把模式写进记录
+    rstore = RouteStore(os.path.join(tmpdir, "zonerec.json"))
+    recorder = RouteRecorder(rstore, base_url="http://127.0.0.1:1",
+                             map_cache=MapCache(os.path.join(tmpdir, "maps_zonerec")))
+    fake = FakeClient()
+    fake.map_objects = lambda: tri
+    recorder.client = fake
+    recorder._map_key = "m1"
+    recorder._tick()
+    assert recorder.mode_name == "战区控制"
+    assert recorder.zones_signature == sig3
+    assert [x["mode"] for x in rstore.zone_layouts("m1")] == ["战区控制"]
+    recorder.request_start(False)
+    recorder._tick()
+    live = recorder._rec
+    assert live is not None
+    assert (live.zone_count, live.mode_name) == (3, "战区控制")
+    recorder.request_stop()
+    recorder._tick()
+    assert live in rstore.routes and live.mode_label == "战区控制"
+
+    # 侧栏三层树: 地图 → 模式 → 轨迹
+    win = make_window(tmpdir, "zonetree.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    app = QApplication.instance()
+    app.processEvents()
+    for mode in ("战区攻陷", "战区争夺"):
+        rec = win.store.new_route("m2", "地图 2", "T-90M", 0.3, 0.3)
+        rec.duration = 10.0
+        rec.zone_count, rec.zone_signature, rec.mode_name = 2, "A@0.1,0.1;B@0.2,0.2", mode
+        win.store.add(rec)
+    win._reload_tree()
+    app.processEvents()
+    assert win.tree.topLevelItemCount() == 1
+    top = win.tree.topLevelItem(0)
+    assert top.text(2) == "2 条" and top.childCount() == 2
+    assert {top.child(i).text(1) for i in range(top.childCount())} == {"战区攻陷", "战区争夺"}
+    assert top.child(0).childCount() == 1
+    assert len(list(win._iter_route_items())) == 2        # 三层下仍能遍历到轨迹
+    win._show_all_tracks(True)                           # 一键显示要作用到第三层
+    assert len(win._visible_ids) == 2
+    win.close()
+    results.append("战区解析/模式判定/录制写入/三层树 OK")
 
 
 def main() -> int:
@@ -1334,6 +1448,7 @@ def main() -> int:
     test_track_segments()
     test_point_at_and_split()
     test_playback()
+    test_zones_and_modes(tmpdir)
     test_multi_playback(tmpdir)
     test_map_render()
     test_map_zoom_pan()

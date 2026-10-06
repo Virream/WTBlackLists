@@ -32,6 +32,10 @@ COLOR_UNPLAYED = QColor(140, 160, 200, 120)
 COLOR_PLAYER = QColor("#38bdf8")
 COLOR_BG = QColor("#0f172a")
 COLOR_GRID = QColor(255, 255, 255, 18)
+# 战区: 白菱形 + 字母(深色描边保证在任何底图上都能看清)
+COLOR_ZONE = QColor("#f8fafc")
+COLOR_ZONE_FILL = QColor(15, 23, 42, 150)
+ZONE_RADIUS = 8.0
 
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 
@@ -102,6 +106,33 @@ class RouteMapView(QWidget):
         # 回放状态: 非空时进入回放绘制模式(按 playhead 切分进度, 可多条同时播放)
         self._playback_recs: list[RouteRecord] = []
         self._playhead = 0.0
+        # 战区(A/B/C): [{"label": "A", "x": .., "y": ..}], 由上层决定画哪个布局
+        self._zones: list[dict] = []
+        self._show_zones = True
+
+    def set_zones(self, zones: list[dict] | None) -> None:
+        """设置要绘制的战区(位置为地图归一化坐标)。"""
+        new = list(zones or [])
+        if new == self._zones:
+            return
+        self._zones = new
+        self.update()
+
+    def set_show_zones(self, show: bool) -> None:
+        """是否把战区画在地图上(菜单开关, 持久化在窗口侧)。"""
+        show = bool(show)
+        if show == self._show_zones:
+            return
+        self._show_zones = show
+        self.update()
+
+    @property
+    def show_zones(self) -> bool:
+        return self._show_zones
+
+    @property
+    def zones(self) -> list[dict]:
+        return list(self._zones)
 
     # ------------------------------------------------------------------ 数据
     def set_map_bytes(self, data: bytes | None) -> bool:
@@ -221,6 +252,7 @@ class RouteMapView(QWidget):
         self._hover_text = None
         self._playback_recs = []
         self._playhead = 0.0
+        self._zones = []
         self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -291,6 +323,9 @@ class RouteMapView(QWidget):
             p.drawPixmap(r, self._pixmap, QRectF(self._pixmap.rect()))
             p.setPen(QPen(COLOR_GRID, 1))
             p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
+
+            # 战区画在轨迹下面(它是背景信息, 不该盖住线路)
+            self._draw_zones(p)
 
             if self._playback_recs:
                 # 多条同时回放时不画时间标签(会完全重叠、无法阅读)
@@ -428,6 +463,39 @@ class RouteMapView(QWidget):
         # 注意: QRect 只接受 int, 坐标必须用 QRectF(否则运行期 TypeError)
         p.drawText(QRectF(x, y, tw, th),
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+    def _draw_zones(self, p: QPainter) -> None:
+        """画战区: 小菱形 + 中心字母(A/B/C, 由 8111 的 zone_label 提供)。
+
+        形状用菱形而不是圆圈: 图上圆圈已经表示起点/标记/终点, 菱形不会混淆。
+        """
+        if not self._show_zones or not self._zones:
+            return
+        font = QFont("Consolas", 9)
+        font.setBold(True)
+        for z in self._zones:
+            try:
+                x, y = float(z["x"]), float(z["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            c = self._to_px(x, y)
+            r = ZONE_RADIUS
+            diamond = QPolygonF([
+                QPointF(c.x(), c.y() - r), QPointF(c.x() + r, c.y()),
+                QPointF(c.x(), c.y() + r), QPointF(c.x() - r, c.y()),
+            ])
+            p.setBrush(QBrush(COLOR_ZONE_FILL))
+            p.setPen(QPen(QColor(15, 23, 42, 200), 3.4))   # 深色描边(浅底图上也能看清)
+            p.drawPolygon(diamond)
+            p.setPen(QPen(COLOR_ZONE, 1.8))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawPolygon(diamond)
+            label = str(z.get("label") or "").strip()
+            if label:
+                p.setFont(font)
+                p.setPen(QPen(COLOR_ZONE))
+                p.drawText(QRectF(c.x() - r, c.y() - r, r * 2, r * 2),
+                           int(Qt.AlignmentFlag.AlignCenter), label[:2])
 
     def _draw_player(self, p: QPainter) -> None:
         if self._player is None:
