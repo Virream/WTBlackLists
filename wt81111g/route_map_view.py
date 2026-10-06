@@ -7,8 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 
-from PyQt6.QtCore import QPointF, QRect, QRectF, Qt
+from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PyQt6.QtGui import (
     QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPixmap, QPolygonF,
 )
@@ -18,6 +19,7 @@ from .route_store import (
     PLACEHOLDER_MAP_SHA1, RoutePoint, RouteRecord, fmt_speed, fmt_time, fmt_time_ms,
     point_at, split_points,
 )
+from .zones import BLINK_COLOR, BLINK_PERIODS
 
 log = logging.getLogger("route_map_view")
 
@@ -40,6 +42,8 @@ ZONE_SIDE_COLORS = {
     "neutral": QColor("#f8fafc"),   # 白 = 中立/未占领(看缓存底图时也用它)
 }
 ZONE_RADIUS = 8.0
+# 被占领中的战区闪烁: 与官方 8111 页面一致(在归属色 ↔ 纯黄之间脉冲)
+BLINK_TICK_MS = 40
 
 _SPEED_BUCKETS = 24  # 轨迹按速度量化的颜色档数(减少画笔切换)
 
@@ -110,16 +114,40 @@ class RouteMapView(QWidget):
         # 回放状态: 非空时进入回放绘制模式(按 playhead 切分进度, 可多条同时播放)
         self._playback_recs: list[RouteRecord] = []
         self._playhead = 0.0
-        # 战区(A/B/C): [{"label": "A", "x": .., "y": ..}], 由上层决定画哪个布局
+        # 战区(A/B/C): [{"label": "A", "x": .., "y": .., "side": .., "blink": 0/1/2}]
         self._zones: list[dict] = []
         self._show_zones = True
+        # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
+        self._blink_t = 0.0
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(BLINK_TICK_MS)
+        self._blink_timer.timeout.connect(self._on_blink_tick)
+
+    def _on_blink_tick(self) -> None:
+        """推进闪烁相位并重画。"""
+        self._blink_t += BLINK_TICK_MS / 1000.0
+        self.update()
+
+    def _sync_blink_timer(self) -> None:
+        """按当前战区状态开关闪烁定时器。"""
+        need = self._show_zones and any(int(z.get("blink") or 0) > 0
+                                        for z in self._zones)
+        if need and not self._blink_timer.isActive():
+            self._blink_t = 0.0
+            self._blink_timer.start()
+        elif not need and self._blink_timer.isActive():
+            self._blink_timer.stop()
 
     def set_zones(self, zones: list[dict] | None) -> None:
-        """设置要绘制的战区(位置为地图归一化坐标)。"""
+        """设置要绘制的战区(位置为地图归一化坐标)。
+
+        比较包含归属色与 blink: 占领后坐标不变、只有颜色变, 也要刷新。
+        """
         new = list(zones or [])
         if new == self._zones:
             return
         self._zones = new
+        self._sync_blink_timer()
         self.update()
 
     def set_show_zones(self, show: bool) -> None:
@@ -128,6 +156,7 @@ class RouteMapView(QWidget):
         if show == self._show_zones:
             return
         self._show_zones = show
+        self._sync_blink_timer()
         self.update()
 
     @property
@@ -486,6 +515,18 @@ class RouteMapView(QWidget):
             side = str(z.get("side") or "neutral")
             fill = QColor(ZONE_SIDE_COLORS.get(side, ZONE_SIDE_COLORS["neutral"]))
             label_color = QColor("#0f172a") if side == "neutral" else QColor("#ffffff")
+            blink = int(z.get("blink") or 0)
+            if blink > 0:
+                # 正在被占领: 与官方页面一致 —— 在归属色↔纯黄之间脉冲
+                # (官方: bv = exp(-(5*t - 2)^4), t 在一个周期内 0→period)
+                period = BLINK_PERIODS.get(blink, BLINK_PERIODS[1])
+                t = self._blink_t % period
+                bv = math.exp(-((5.0 * t - 2.0) ** 4))
+                r, g, b = BLINK_COLOR
+                fill = QColor(int(fill.red() + (r - fill.red()) * bv),
+                              int(fill.green() + (g - fill.green()) * bv),
+                              int(fill.blue() + (b - fill.blue()) * bv))
+                label_color = QColor("#0f172a")
             c = self._to_px(x, y)
             r = ZONE_RADIUS
             diamond = QPolygonF([

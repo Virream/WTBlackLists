@@ -52,6 +52,10 @@ SIDE_NEUTRAL = "neutral"
 
 SIDE_LABELS = {SIDE_OURS: "我方", SIDE_ENEMY: "敌方", SIDE_NEUTRAL: "中立"}
 
+# 闪烁(被占领中): 8111 的 blink 值与官方页面的周期; 脉冲目标色是**纯黄**
+BLINK_PERIODS = {1: 2.0, 2: 1.2}
+BLINK_COLOR = (255, 255, 0)
+
 _COLOR_TO_SIDE = {
     COLOR_OURS.lower(): SIDE_OURS,
     COLOR_ENEMY.lower(): SIDE_ENEMY,
@@ -61,20 +65,29 @@ _COLOR_TO_SIDE = {
 
 @dataclass(frozen=True)
 class Zone:
-    """一个战区: 字母 + 地图归一化中心坐标 + 归属色。
+    """一个战区: 字母 + 地图归一化中心坐标 + 归属色 + 闪烁标志。
 
     `color` 保留 8111 原样字符串(如 `#174DFF`), `side` 是归一化后的归属
     (`ours`/`enemy`/`neutral`)。颜色**不进签名** —— 战局中归属会变。
+    `blink` 是 8111 原样字段: 0 = 不闪, 1 = 普通闪(周期 2.0s),
+    2 = 快闪(周期 1.2s); 实测值来自“正在被占领”的状态
+    (官方页面就是拿它在归属色 ↔ 黄色之间插值)。
     """
     label: str
     x: float
     y: float
     color: str = COLOR_NEUTRAL
     side: str = SIDE_NEUTRAL
+    blink: int = 0
 
     @property
     def side_label(self) -> str:
         return SIDE_LABELS.get(self.side, SIDE_LABELS[SIDE_NEUTRAL])
+
+    @property
+    def contested(self) -> bool:
+        """是否正在被占领(8111 会闪)."""
+        return self.blink > 0
 
 
 def side_of(color: str | None) -> str:
@@ -95,6 +108,13 @@ def _color_of(obj: dict) -> str:
         except (TypeError, ValueError):
             pass
     return COLOR_NEUTRAL
+
+
+def _to_int(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
 def _to_float(value) -> float | None:
@@ -123,20 +143,33 @@ def zones_from_objects(objects) -> list[Zone]:
             else:
                 label = str(obj.get("zone_id", len(out)))
         color = _color_of(obj)
-        out.append(Zone(label=label, x=x, y=y, color=color, side=side_of(color)))
+        out.append(Zone(label=label, x=x, y=y, color=color, side=side_of(color),
+                        blink=max(0, _to_int(obj.get("blink")))))
     out.sort(key=lambda z: (z.label, z.x, z.y))   # 字母序 → 签名稳定
     return out
 
 
+def zone_state(zones) -> tuple:
+    """战区**完整状态**(字母/坐标/归属/闪烁) —— 用来判断“该重画了”。
+
+    与 `signature()` 的区别: 签名只看坐标(区分模式), 这里连归属也看 ——
+    占领后坐标不变、只有颜色变, 只看签名就会漏掉刷新。
+    """
+    return tuple((z.label, round(z.x, _SIG_DIGITS), round(z.y, _SIG_DIGITS),
+                  z.side, z.blink) for z in zones or [])
+
+
 def ownership_text(zones) -> str:
-    """归属概览, 如 `我方 B, 敌方 A`(全中立时返回空串)。"""
+    """归属概览, 如 `我方 B, 敌方 A(占领中)`(全中立时返回空串)。"""
+    zones = list(zones or [])
     groups: dict[str, list[str]] = {}
-    for z in zones or []:
-        groups.setdefault(z.side, []).append(z.label)
+    for z in zones:
+        mark = "(占领中)" if z.contested else ""
+        groups.setdefault(z.side, []).append(f"{z.label}{mark}")
+    if not any(z.side != SIDE_NEUTRAL for z in zones):
+        return ""
     parts = [f"{SIDE_LABELS[side]} {'/'.join(groups[side])}"
              for side in (SIDE_OURS, SIDE_ENEMY, SIDE_NEUTRAL) if groups.get(side)]
-    if not any(z.side != SIDE_NEUTRAL for z in zones or []):
-        return ""
     return ", ".join(parts)
 
 
@@ -156,9 +189,9 @@ def signature(zones) -> str:
 
 
 def zones_to_json(zones) -> list[dict]:
-    """Zone 列表 → 可持久化的普通字典列表(带颜色, 供以后解析录像时参考)。"""
+    """Zone 列表 → 可绘制的普通字典列表(带颜色/归属/闪烁)。"""
     return [{"label": z.label, "x": round(z.x, _SIG_DIGITS), "y": round(z.y, _SIG_DIGITS),
-             "color": z.color, "side": z.side}
+             "color": z.color, "side": z.side, "blink": z.blink}
             for z in zones]
 
 
@@ -173,5 +206,6 @@ def zones_from_json(data) -> list[Zone]:
             continue
         color = str(item.get("color") or COLOR_NEUTRAL)
         out.append(Zone(label=str(item.get("label") or "?"), x=x, y=y,
-                        color=color, side=side_of(color)))
+                        color=color, side=side_of(color),
+                        blink=max(0, _to_int(item.get("blink")))))
     return out

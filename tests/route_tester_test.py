@@ -29,7 +29,7 @@ from wt81111g.route_store import (
 )
 from wt81111g.route_window import RouteTesterWindow
 from wt81111g.zones import (
-    Zone, mode_name, ownership_text, signature, zones_from_objects,
+    Zone, mode_name, ownership_text, signature, zone_state, zones_from_objects,
 )
 
 # 测试时不播放系统提示音
@@ -1395,6 +1395,22 @@ def test_zones_and_modes(tmpdir: str):
     flipped = [Zone("A", 0.4727, 0.5456, "#174DFF", "ours"),
                Zone("B", 0.5137, 0.4705, "#fa0C00", "enemy")]
     assert signature(flipped) == signature(duoz)
+    # 闪烁(被占领中): blink 1/2 → contested; zone_state 能看出归属/闪烁变化
+    blink = zones_from_objects([
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.5, "y": 0.5,
+         "zone_label": "A", "color": "#174DFF", "blink": 2},
+    ])
+    assert blink[0].contested and blink[0].side == "ours"
+    plain = zones_from_objects([
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.5, "y": 0.5,
+         "zone_label": "A", "color": "#174DFF"},
+    ])
+    assert not plain[0].contested
+    assert signature(blink) == signature(plain)          # 指纹只看坐标
+    assert zone_state(blink) != zone_state(plain)        # 完整状态看得出差别
+    enemy = [Zone("A", 0.5, 0.5, "#fa0C00", "enemy")]
+    assert zone_state(enemy) != zone_state(plain)        # 占领(颜色变)也要刷新
+    assert ownership_text(blink) == "我方 A(占领中)", ownership_text(blink)
     # 旧记录没存过模式 → 未知模式
     bare = RouteRecord("r", "k", "m", "v", "2026-10-06T21:00:00", 1.0, 0.0, 0.0)
     assert bare.mode_label == "未知模式"
@@ -1430,6 +1446,23 @@ def test_zones_and_modes(tmpdir: str):
     recorder._tick()
     assert live in rstore.routes and live.mode_label == "战区控制"
 
+    # 占领后**坐标不变、只有归属色变** → 必须刷新(以前只在坐标变时刷新, 图标就不变色)
+    assert recorder.zones[0].side == "neutral"
+    fake.map_objects = lambda: [dict(o, color="#174DFF") if o.get("type") == "capture_zone"
+                               and o.get("zone_label") == "A" else o for o in tri]
+    recorder._tick()
+    assert [z.side for z in recorder.zones][0] == "ours", recorder.zones
+    assert len(rstore.zone_layouts("m1")) == 1, "归属变化不能当成新布局重复落盘"
+    # 战区被敌人占走 → 同样要刷新成红色
+    fake.map_objects = lambda: [dict(o, color="#fa0C00") if o.get("type") == "capture_zone"
+                               and o.get("zone_label") == "A" else o for o in tri]
+    recorder._tick()
+    assert recorder.zones[0].side == "enemy"
+    # 退出战局 → 战区清空(再进图能重新上报)
+    fake.map_objects = lambda: []
+    recorder._tick()
+    assert recorder.zones == [] and recorder.zones_signature == ""
+
     # 侧栏三层树: 地图 → 模式 → 轨迹
     win = make_window(tmpdir, "zonetree.json")
     win.recorder.stop()
@@ -1452,6 +1485,25 @@ def test_zones_and_modes(tmpdir: str):
     assert len(list(win._iter_route_items())) == 2        # 三层下仍能遍历到轨迹
     win._show_all_tracks(True)                           # 一键显示要作用到第三层
     assert len(win._visible_ids) == 2
+
+    # 地图上的战区: 归属色变化要刷新, blink>0 时跑闪烁定时器
+    view = win.map_view
+    view.set_show_zones(True)
+    view.set_zones([{"label": "A", "x": 0.4, "y": 0.4, "side": "neutral"}])
+    assert not view._blink_timer.isActive()
+    view.set_zones([{"label": "A", "x": 0.4, "y": 0.4, "side": "ours"}])
+    assert view.zones[0]["side"] == "ours"               # 同坐标但归属变了 → 要生效
+    assert not view._blink_timer.isActive()
+    view.set_zones([{"label": "A", "x": 0.4, "y": 0.4, "side": "ours", "blink": 2}])
+    assert view._blink_timer.isActive(), "被占领中应闪烁"
+    view.set_zones([{"label": "A", "x": 0.4, "y": 0.4, "side": "ours", "blink": 0}])
+    assert not view._blink_timer.isActive()
+    # 关掉“显示战区”时不应空转
+    view.set_zones([{"label": "A", "x": 0.4, "y": 0.4, "side": "ours", "blink": 1}])
+    assert view._blink_timer.isActive()
+    view.set_show_zones(False)
+    assert not view._blink_timer.isActive()
+    view.set_zones([])
     win.close()
     results.append("战区解析/模式判定/录制写入/三层树 OK")
 

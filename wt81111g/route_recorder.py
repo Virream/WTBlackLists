@@ -28,7 +28,7 @@ from .route_store import (
     PLACEHOLDER_MAP_KEY, RouteMark, RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
 )
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
-from .zones import zones_from_objects
+from .zones import zone_state, zones_from_objects
 
 log = logging.getLogger("route_recorder")
 
@@ -127,7 +127,8 @@ class RouteRecorder(QObject):
 
         # 当前战局的战区(轮询线程写入, GUI 只读引用): 坐标是模式指纹的来源
         self._zones: list[Zone] = []
-        self._zones_sig = ""
+        self._zones_sig = ""          # 坐标指纹(= 模式)
+        self._zones_state: tuple = ()   # 完整状态(含归属/闪烁) —— 变了就刷新界面
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -325,24 +326,32 @@ class RouteRecorder(QObject):
         return None
 
     def _update_zones(self, objects: list) -> None:
-        """从地图对象里提取战区, 指纹变化时入存并刷新尚缺战区信息的当前录制。
+        """从地图对象里提取战区; **归属/闪烁变化也要上报**。
 
-        战区数量决定模式(3/2/1 → 控制/攻陷/争夺), 坐标串则是模式指纹; 布局按地图
-        落盘, 这样战局结束后依旧能把 A/B/C 画出来。
+        8111 每帧都给战区的当前归属色与 blink 标志, 但坐标不变 —— 只在“坐标变化”时
+        刷新的话, 占领后图标颜色会永远停在第一次见到的样子(用户报的 bug)。
+        所以: 用 `zone_state()`(字母/坐标/归属/闪烁)判断是否需要刷新;
+        而落盘的“布局”仍然只按**坐标指纹**去重(归属是反复变的, 不能当新模式)。
         """
         zones = zones_from_objects(objects)
-        sig = zones_signature(zones)
-        if sig == self._zones_sig:
+        state = zone_state(zones)
+        if state == self._zones_state:
             return
         self._zones = zones
-        self._zones_sig = sig
+        self._zones_state = state
         if not zones:
+            self._zones_sig = ""       # 退出战局: 指纹清空, 下次进图重新上报
             return
-        log.info("战区已更新: %s (%s)", self.mode_name, sig)
+        sig = zones_signature(zones)
+        new_layout = sig != self._zones_sig
+        self._zones_sig = sig
+        log.info("战区已刷新: %s %s", self.mode_name,
+                 ", ".join(f"{z.label}={z.side_label}{'*' if z.contested else ''}"
+                           for z in zones))
         # 录制开始时可能还没拿到战区(进图瞬间) → 指纹变化时补写进当前录制
-        if self._rec is not None and not self._rec.zone_signature:
+        if self._rec is not None and (new_layout or not self._rec.zone_signature):
             self._stamp_record(self._rec)
-        if self._map_key != PLACEHOLDER_MAP_KEY:
+        if new_layout and self._map_key != PLACEHOLDER_MAP_KEY:
             try:
                 self.store.remember_zones(self._map_key, zones)
             except Exception as exc:  # noqa: BLE001 - 存盘失败不应影响录制

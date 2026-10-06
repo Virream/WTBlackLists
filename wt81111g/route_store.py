@@ -440,7 +440,10 @@ class RouteStore:
                 "sig": sig,
                 "count": len(zones),
                 "mode": zone_mode_name(len(zones)),
-                "zones": zones_to_json(zones),
+                # 存位置 + 当次归属色(供以后录像解析参考); **不存 blink** —— 那只是
+                # “当时正在被占”的瞬时状态, 存下来会让旧布局一直闪
+                "zones": [{k: v for k, v in z.items() if k != "blink"}
+                          for z in zones_to_json(zones)],
                 "seen_at": now,
             })
             del layouts[8:]                 # 单张地图最多留 8 种布局
