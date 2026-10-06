@@ -906,7 +906,33 @@ def test_eye_visibility_opacity(tmpdir: str):
     win._show_all_tracks(False)
     assert win.map_view.visible_tracks == []
 
+    # 高亮层跟着“选中”走(可多条): 不再永远是“最后录制的那条”
+    win._last_record = r2
+    win._show_all_tracks(True)
+    win.tree.clearSelection()
+    win._on_tree_selection_changed()
+    assert [r.route_id for r in win.map_view.highlight_records] == [r2.route_id], \
+        "没有选中时退回“刚录制的那条”"
+    rows2 = list(win._iter_route_items())
+
+    def click_row(row, ctrl):
+        QTest.mouseClick(win.tree.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.ControlModifier if ctrl
+                         else Qt.KeyboardModifier.NoModifier,
+                         win.tree.visualItemRect(row).center())
+        app.processEvents()
+
+    click_row(rows2[0], ctrl=False)                       # 单选第一条
+    assert [r.route_id for r in win.map_view.highlight_records] == [r1.route_id]
+    click_row(rows2[1], ctrl=True)                        # 再 Ctrl 多选 → 两条都高亮
+    assert {r.route_id for r in win.map_view.highlight_records} == \
+        {r1.route_id, r2.route_id}
+    # 选中不影响“眼睛点亮的显示集合”(那份仍是灰色普通层)
+    assert {r.route_id for r in win.map_view.visible_tracks} == {r1.route_id, r2.route_id}
+
     # 删除记录后, 显示集合里自动移除
+    win.tree.clearSelection()
+    win._on_tree_selection_changed()
     win._show_all_tracks(True)
     gone = r1.route_id
     win.store.remove(gone)
@@ -1107,19 +1133,21 @@ def test_recording_end_eye(tmpdir: str):
     assert rec.route_id in win._visible_ids, "刚录完的轨迹正在显示, 眼睛必须点亮"
     child = routes_of(win.tree.topLevelItem(0))[0]
     assert child.icon(0).cacheKey() == eye_icon(True).cacheKey(), "眼睛图标应显示为“显示中”"
-    assert win.map_view.live_record is rec, "刚录完的那条用速度配色高亮"
+    assert [r.route_id for r in win.map_view.highlight_records] == [rec.route_id], \
+        "刚录完的那条用速度配色高亮"
     assert rec.route_id in [r.route_id for r in win.map_view.visible_tracks], \
-        "显示集合里必须有它(实际由 live 分支用速度配色绘制, 不重复画灰色那份)"
+        "显示集合里必须有它(实际由高亮层用速度配色绘制, 不重复画灰色那份)"
 
-    # 熄灭眼睛 → 彻底从地图上消失
+    # 熄灭眼睛 → 彻底从地图上消失(高亮层也一起退掉)
     win._on_tree_item_clicked(child, 0)
-    assert win.map_view.live_record is None, "眼睛关掉后不应再高亮显示"
+    assert win.map_view.highlight_records == [], "眼睛关掉后不应再高亮显示"
     assert win.map_view.visible_tracks == []
 
     # 再点亮 → 回到普通(不透明灰)显示
     win._on_tree_item_clicked(child, 0)
     assert [r.route_id for r in win.map_view.visible_tracks] == [rec.route_id]
-    assert win.map_view.live_record is rec, "仍是刚录完的那条 → 继续用速度配色"
+    assert [r.route_id for r in win.map_view.highlight_records] == [rec.route_id], \
+        "仍是刚录完的那条 → 继续用速度配色"
     win.close()
     results.append("录制结束→眼睛点亮且与实际显示一致 OK")
 

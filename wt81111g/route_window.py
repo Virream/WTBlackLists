@@ -585,24 +585,34 @@ class RouteTesterWindow(QMainWindow):
                 if it.data(0, _ROLE_ID) in self._visible_ids]
 
     def _refresh_map_tracks(self) -> None:
-        """把“眼睛点亮的轨迹”交给地图显示(可多条, 用于对比多次跑图)。
+        """把“眼睛点亮的轨迹”交给地图显示, 并把**选中的那几条**标为高亮。
 
-        显示状态只有 `_visible_ids` 一个来源 —— 图标亮/灭与实际是否显示永远一致。
-        额外: **刚录制的那条**若也在显示集合里, 同时交给 live 分支用速度配色画
-        (与录制中一致); 绘制时视图会自动跳过重复的那份(grey 那份不画)。
+        两层绘制:
+        * 普通层 = `_visible_ids`(眼睛点亮) → 不透明灰色;
+        * **高亮层 = 侧栏当前选中的那几条** → 速度配色(与录制中一致), 可多条;
+          没选中时才退回“刚录制的那条”(保持原来的习惯)。
+
+        高亮层的轨迹即使眼睛没点亮也会画出来 —— 你选了它, 就应该看得到它。
+        视图内部会对重复的记录去重(高亮那份优先)。
         """
         recs = [r for rid in self._visible_route_ids()
                 if (r := self.store.get(rid)) is not None]
+        picked = self._selection_tracks()
+        if picked:
+            highlight = list(picked)
+        else:
+            # 没选中时退回“刚录制的那条”(只在它还显示着的时候高亮)
+            hl = self._last_record
+            highlight = [hl] if (hl is not None and hl.route_id in self._visible_ids) else []
         recorder = getattr(self, "recorder", None)   # 构造早期还没有 recorder
         if recorder is not None and recorder.recording:
-            # 录制中 live 是正在录的那条, 不能覆盖
+            # 录制中 live 是正在录的那条, 不能被选中/高亮覆盖
             self.map_view.set_visible_tracks(recs)
+            self.map_view.set_highlight([])
             return
-        hl = self._last_record
-        if hl is not None and hl.route_id not in self._visible_ids:
-            hl = None
         self.map_view.set_visible_tracks(recs)
-        self.map_view.set_live(hl)
+        self.map_view.set_highlight(highlight)
+        self.map_view.set_live(None)
         self._apply_zones()
 
     def _zone_signature_for_view(self) -> str:
@@ -699,6 +709,7 @@ class RouteTesterWindow(QMainWindow):
             self._anchor = grp          # 基准跟着当前选中走
             self._refresh_anchor_icon()
         self._update_play_label()
+        self._refresh_map_tracks()      # 高亮层 = 选中的那几条 → 选中变了要重画
 
     def _on_tree_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         """双击轨迹行 → 定基准 + **把它显示到地图上并切到对应地图图片**。

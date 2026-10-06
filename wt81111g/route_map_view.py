@@ -112,6 +112,9 @@ class RouteMapView(QWidget):
         self._live: RouteRecord | None = None
         # 侧栏里“眼睛点亮的”历史轨迹(可多条): 全部以不透明灰色轨迹画在地图上
         self._visible: list[RouteRecord] = []
+        # **高亮层**: 侧栏当前选中的那几条 → 用速度配色画(可多条),
+        # 与“眼睛点亮”无关 —— 选了就应该看得到
+        self._highlight: list[RouteRecord] = []
         self._player: tuple[float, float] | None = None
         self._hover_text: str | None = None
         self._status = "等待 8111 地图数据…"
@@ -259,6 +262,10 @@ class RouteMapView(QWidget):
             self._playback_recs = []
             self._playhead = 0.0
             dropped.append("回放")
+        keep_hi = [r for r in self._highlight if r.map_key == map_key]
+        if len(keep_hi) != len(self._highlight):
+            self._highlight = keep_hi
+            dropped.append("高亮")
         if dropped:
             self.update()
         return dropped
@@ -270,6 +277,15 @@ class RouteMapView(QWidget):
         """设置要显示的历史轨迹(可多条, 按给定顺序绘制)。"""
         self._visible = list(recs or [])
         self.update()
+
+    def set_highlight(self, recs: list[RouteRecord] | None) -> None:
+        """设置高亮轨迹(侧栏选中的那几条) —— 用速度配色画在最上面。"""
+        self._highlight = list(recs or [])
+        self.update()
+
+    @property
+    def highlight_records(self) -> list[RouteRecord]:
+        return list(self._highlight)
 
     def set_playback(self, recs, playhead: float = 0.0) -> None:
         """进入/退出回放绘制模式(可多条同时回放)。
@@ -292,6 +308,7 @@ class RouteMapView(QWidget):
     def clear(self) -> None:
         self._live = None
         self._visible = []
+        self._highlight = []
         self._player = None
         self._hover_text = None
         self._playback_recs = []
@@ -377,17 +394,21 @@ class RouteMapView(QWidget):
                 for rec in self._playback_recs:
                     self._draw_playback(p, rec, self._playhead, labels=labels)
             else:
-                # 显示中的轨迹: 眼睛点亮的 + 刚录制的那条(live, 用速度配色)
-                total = len(self._visible) + (0 if self._live is None else 1)
+                # 显示中的轨迹: 灰色普通层 + 高亮层(选中的/正在录的)
+                hi = list(self._highlight)
+                if self._live is not None and all(r is not self._live for r in hi):
+                    hi.append(self._live)
+                hi_ids = {id(r) for r in hi}
+                total = len(self._visible) + len(hi)
                 labels = total <= 1      # 多条时时间标签会完全重叠、无法阅读
                 for rec in self._visible:
-                    if rec is self._live:
+                    if id(rec) in hi_ids:
                         continue        # 同一条不重复画(下面用速度配色画它)
                     self._draw_route(p, rec, history=True, vmax=self._vmax(rec),
                                      labels=labels)
-                if self._live is not None:
-                    self._draw_route(p, self._live, history=False,
-                                     vmax=self._vmax(self._live), labels=labels)
+                for rec in hi:
+                    self._draw_route(p, rec, history=False, vmax=self._vmax(rec),
+                                     labels=labels)
             self._draw_player(p)
 
             if self._hover_text:
