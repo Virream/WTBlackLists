@@ -31,7 +31,8 @@ from wt81111g.route_store import (
 )
 from wt81111g.route_window import RouteTesterWindow
 from wt81111g.zones import (
-    Zone, mode_name, ownership_text, signature, zone_state, zones_from_objects,
+    Spawn, Zone, ground_spawns, mode_name, ownership_text, side_of, signature, spawn_summary,
+    spawns_from_objects, spawns_to_json, zone_state, zones_from_objects,
 )
 
 # 测试时不播放系统提示音
@@ -460,6 +461,133 @@ def test_map_zoom_pan():
     view.mouseDoubleClickEvent(dbl)
     assert view._zoom == 1.0 and view._pan_x == 0.0 and view._pan_y == 0.0
     results.append("地图缩放/中键平移/双击复位 OK")
+
+
+def test_spawns(tmpdir: str):
+    """重生位置(respawn_base_*): 解析 / 归属色 / 跟布局一起落盘 / 地图上画空心方块。
+
+    8111 里一局有几十个 `respawn_base_tank` —— 就是“重生区域”里那堆候选位置
+    (玩家重生时从中随机分配一个)。
+    """
+    objs = [
+        {"type": "capture_zone", "icon": "capture_zone", "x": 0.5, "y": 0.5,
+         "zone_label": "A", "color": "#ffFFFA"},
+        # 我方(蓝) 3 个地面重生点
+        {"type": "respawn_base_tank", "icon": "respawn_base_tank", "x": 0.10,
+         "y": 0.10, "color": "#174DFF"},
+        {"type": "respawn_base_tank", "icon": "respawn_base_tank", "x": 0.11,
+         "y": 0.10, "color": "#174DFF"},
+        {"type": "respawn_base_tank", "icon": "respawn_base_tank", "x": 0.12,
+         "y": 0.11, "color": "#174DFF"},
+        # 敌方(红) 2 个
+        {"type": "respawn_base_tank", "icon": "respawn_base_tank", "x": 0.90,
+         "y": 0.90, "color": "#fa0C00"},
+        {"type": "respawn_base_tank", "icon": "respawn_base_tank", "x": 0.91,
+         "y": 0.90, "color": "#fa0C00"},
+        # 空军重生点(也解析/记录, 但地图上不画)
+        {"type": "respawn_base_fighter", "icon": "respawn_base_fighter", "x": 0.50,
+         "y": 0.05, "color": "#174DFF"},
+        # 干扰项: 机场 / 玩家 / 战区, 都不算重生位置
+        {"type": "airfield", "icon": "none", "x": 0.5, "y": 0.02, "color": "#174DFF"},
+        {"type": "ground_model", "icon": "Player", "x": 0.5, "y": 0.5},
+    ]
+    spawns = spawns_from_objects(objs)
+    assert len(spawns) == 6, [(s.kind, s.side) for s in spawns]
+    assert sum(1 for s in spawns if s.kind == "tank") == 5
+    assert {s.side for s in spawns if s.kind == "tank"} == {"ours", "enemy"}
+    assert sum(1 for s in spawns if s.side == "ours") == 4      # 含那架战斗机
+    ground = ground_spawns(spawns)
+    assert len(ground) == 5 and all(s.ground for s in ground)
+    assert spawn_summary(spawns) == "我方 4 · 敌方 2 (地面载具/战斗机)", spawn_summary(spawns)
+    assert spawns_from_objects([]) == []
+    # 归属色: 老版本/空战里的 #185AFF / #fa3200 也认得; 玩家自己的黄色不算敌方
+    assert side_of("#174DFF") == "ours" and side_of("#185AFF") == "ours"
+    assert side_of("#fa0C00") == "enemy" and side_of("#fa3200") == "enemy"
+    assert side_of("#faC81E") == "neutral", "玩家黄色不应被当成敌方"
+    assert side_of("#ffFFFA") == "neutral" and side_of(None) == "neutral"
+
+    # 落盘: 重生位置跟着**布局**存(按战区指纹去重)
+    store = RouteStore(os.path.join(tmpdir, "spawns.json"))
+    zones = zones_from_objects(objs)
+    sig = signature(zones)
+    assert store.remember_zones("m1", zones, spawns=spawns) is True
+    assert store.remember_zones("m1", zones, spawns=spawns) is False
+    layout = store.layout_for("m1", sig)
+    assert len(layout["spawns"]) == 6
+    again = RouteStore(os.path.join(tmpdir, "spawns.json"))
+    assert len(again.layout_for("m1", sig)["spawns"]) == 6       # 持久化往返
+    # 同一布局、重生位置变了(同一张图的另一个版本) → 更新进去, 不新增布局
+    moved = [Spawn("tank", 0.2, 0.2, side="ours"), Spawn("tank", 0.8, 0.8, side="enemy")]
+    assert store.remember_zones("m1", zones, spawns=moved) is False
+    assert len(store.zone_layouts("m1")) == 1
+    assert [s["side"] for s in store.layout_for("m1", sig)["spawns"]] == ["ours", "enemy"]
+
+    # 录制线程: 从同一份 map_obj.json 里抓重生位置并写进布局
+    rstore = RouteStore(os.path.join(tmpdir, "spawnrec.json"))
+    recorder = RouteRecorder(rstore, base_url="http://127.0.0.1:1",
+                             map_cache=MapCache(os.path.join(tmpdir, "maps_spawnrec")))
+    fake = FakeClient()
+    fake.map_objects = lambda: objs
+    recorder.client = fake
+    recorder._map_key = "k1"
+    recorder._tick()
+    assert len(recorder.spawns) == 6
+    assert len(rstore.layout_for("k1", sig)["spawns"]) == 6
+    fake.map_objects = lambda: []
+    recorder._tick()
+    assert recorder.spawns == [] and recorder.zones == []       # 退出战局清空
+
+    # 地图视图: 红(敌)/蓝(我)空心方块真的画上去了, 关掉开关就不画
+    view = RouteMapView()
+    view.resize(420, 420)                  # 必须设尺寸: render 只画控件占的那块
+    view.set_map_bytes(png_solid("#303030"))
+    view.set_spawns(spawns_to_json(ground))
+    assert len(view.spawns) == 5
+
+    def _has_color(img, rgb, tol: int = 40) -> bool:
+        tr, tg, tb = rgb
+        for y in range(img.height()):
+            for x in range(img.width()):
+                p = img.pixel(x, y) & 0xFFFFFF
+                if (abs(((p >> 16) & 255) - tr) < tol and abs(((p >> 8) & 255) - tg) < tol
+                        and abs((p & 255) - tb) < tol):
+                    return True
+        return False
+
+    img = QImage(420, 420, QImage.Format.Format_ARGB32)
+    view.render(img)
+    assert _has_color(img, (0x17, 0x4D, 0xFF)), "应画出我方的蓝色方块"
+    assert _has_color(img, (0xfa, 0x0C, 0x00)), "应画出敌方的红色方块"
+    view.set_show_spawns(False)
+    off = QImage(420, 420, QImage.Format.Format_ARGB32)
+    view.render(off)
+    assert not _has_color(off, (0x17, 0x4D, 0xFF))
+    assert not _has_color(off, (0xfa, 0x0C, 0x00))
+    view.set_show_spawns(True)
+    view.clear()
+    assert view.spawns == []
+
+    # 窗口: 实时那份 / 存下来的那份 都要能被画上; 菜单开关能关掉
+    win = make_window(tmpdir, "spawnwin.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    map_bytes = png_solid("#303030")
+    key = hashlib.sha1(map_bytes).hexdigest()[:12]      # 与 view.map_key 同一算法
+    win.map_view.set_map_bytes(map_bytes)
+    assert win.map_view.map_key == key
+    win.store.remember_zones(key, zones, spawns=spawns)
+    win.recorder._map_key = key                         # 假装 8111 正在给这张图
+    win._apply_zones()                                  # ① 看缓存底图: 用存下来的那份
+    assert len(win.map_view.spawns) == 5, win.map_view.spawns
+    win._apply_zones({"zones": zones, "spawns": spawns})   # ② 战局内: 用实时那份
+    assert len(win.map_view.spawns) == 5
+    assert win.act_spawns.isChecked(), "默认应勾选「显示重生位置」"
+    win.act_spawns.setChecked(False)
+    assert not win.map_view.show_spawns
+    win.act_spawns.setChecked(True)
+    win.close()
+    results.append("重生位置(解析/归属色/落盘/画红蓝空心方块) OK")
 
 
 def test_multi_playback(tmpdir: str):
@@ -1954,6 +2082,7 @@ def main() -> int:
     test_point_at_and_split()
     test_playback()
     test_zones_and_modes(tmpdir)
+    test_spawns(tmpdir)
     test_multi_playback(tmpdir)
     test_map_render()
     test_map_zoom_pan()

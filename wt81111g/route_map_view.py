@@ -48,6 +48,11 @@ BLINK_TICK_MS = 40
 BLINK_DIM = 0.4           # 脉冲谷底时保留的亮度比例(0.4 = 变暗到 40%)
 ZONE_DARK = QColor(15, 23, 42)    # 变暗时拉向的底色(与界面同色系)
 
+# 重生位置: **空心方块** —— 颜色与战区同一套(蓝=我方, 红=敌方)
+SPAWN_SIDE_COLORS = ZONE_SIDE_COLORS
+SPAWN_HALF = 3.4          # 方块半边长(px): 一个位置一个小方块, 连成一片就是重生区域
+SPAWN_PEN = 1.7
+
 
 def _blend(color: QColor, rgb: tuple[int, int, int], k: float) -> QColor:
     """从 color 按 k 比例拉向 rgb(k=0 不变, k=1 完全变成 rgb)。"""
@@ -131,6 +136,9 @@ class RouteMapView(QWidget):
         # 战区(A/B/C): [{"label": "A", "x": .., "y": .., "side": .., "blink": 0/1/2}]
         self._zones: list[dict] = []
         self._show_zones = True
+        # 重生位置: [{"kind": "tank", "x": .., "y": .., "side": "ours"/"enemy"}]
+        self._spawns: list[dict] = []
+        self._show_spawns = True
         # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
         self._blink_t = 0.0
         self._blink_timer = QTimer(self)
@@ -180,6 +188,30 @@ class RouteMapView(QWidget):
     @property
     def zones(self) -> list[dict]:
         return list(self._zones)
+
+    def set_spawns(self, spawns: list[dict] | None) -> None:
+        """设置要绘制的**重生位置**(地图归一化坐标)。"""
+        new = list(spawns or [])
+        if new == self._spawns:
+            return
+        self._spawns = new
+        self.update()
+
+    def set_show_spawns(self, show: bool) -> None:
+        """是否把重生位置画在地图上(菜单开关, 持久化在窗口侧)。"""
+        show = bool(show)
+        if show == self._show_spawns:
+            return
+        self._show_spawns = show
+        self.update()
+
+    @property
+    def show_spawns(self) -> bool:
+        return self._show_spawns
+
+    @property
+    def spawns(self) -> list[dict]:
+        return list(self._spawns)
 
     # ------------------------------------------------------------------ 数据
     def set_map_bytes(self, data: bytes | None) -> bool:
@@ -314,6 +346,7 @@ class RouteMapView(QWidget):
         self._playback_recs = []
         self._playhead = 0.0
         self._zones = []
+        self._spawns = []
         self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -385,9 +418,9 @@ class RouteMapView(QWidget):
             p.setPen(QPen(COLOR_GRID, 1))
             p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
 
-            # 战区画在轨迹下面(它是背景信息, 不该盖住线路)
+            # 战区/重生位置画在轨迹下面(它们是背景信息, 不该盖住线路)
             self._draw_zones(p)
-
+            self._draw_spawns(p)
             if self._playback_recs:
                 # 多条同时回放时不画时间标签(会完全重叠、无法阅读)
                 labels = len(self._playback_recs) <= 1
@@ -528,6 +561,32 @@ class RouteMapView(QWidget):
         # 注意: QRect 只接受 int, 坐标必须用 QRectF(否则运行期 TypeError)
         p.drawText(QRectF(x, y, tw, th),
                    int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), text)
+
+    def _draw_spawns(self, p: QPainter) -> None:
+        """画重生位置: **空心方块** —— 红 = 敌方, 蓝 = 我方(与战区同一套归属色)。
+
+        8111 里一批 `respawn_base_tank` 就是游戏“重生区域”里那一堆候选位置(实测
+        一局 40~64 个), 所以是一个位置一个小方块 —— 连成一片方块就是那个区域。
+        方块内部**不填充**: 免得盖住底图与轨迹。
+        """
+        if not self._show_spawns or not self._spawns:
+            return
+        dark = QColor(15, 23, 42, 200)      # 深色垫底描边(浅色底图上也能看清)
+        for s in self._spawns:
+            try:
+                x, y = float(s["x"]), float(s["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            side = str(s.get("side") or "neutral")
+            color = QColor(SPAWN_SIDE_COLORS.get(side, SPAWN_SIDE_COLORS["neutral"]))
+            c = self._to_px(x, y)
+            rect = QRectF(c.x() - SPAWN_HALF, c.y() - SPAWN_HALF,
+                          SPAWN_HALF * 2, SPAWN_HALF * 2)
+            p.setBrush(Qt.BrushStyle.NoBrush)      # 空心
+            p.setPen(QPen(dark, SPAWN_PEN + 1.4))
+            p.drawRect(rect)
+            p.setPen(QPen(color, SPAWN_PEN))
+            p.drawRect(rect)
 
     def _draw_zones(self, p: QPainter) -> None:
         """画战区: 小菱形 + 中心字母(A/B/C, 由 8111 的 zone_label 提供)。

@@ -41,7 +41,7 @@ from .config import data_dir
 from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
-from .zones import zones_from_signature, zones_to_json
+from .zones import spawns_to_json, zones_from_signature, zones_to_json
 
 log = logging.getLogger("route_store")
 
@@ -467,38 +467,49 @@ class RouteStore:
         return out
 
     # ------------------------------------------------------------------ 战区/模式
-    def remember_zones(self, map_key: str, zones) -> bool:
-        """记下某地图的战区布局(按坐标串去重)。返回是否是新布局。
+    def remember_zones(self, map_key: str, zones, spawns=None) -> bool:
+        """记下某地图的战区布局 + **重生位置**(按坐标串去重)。返回是否是新布局。
 
         必须按指纹去重: 同一张图的**不同模式**战区数量/位置不同, 它们是不同的布局,
         而同一模式的多次对局指纹相同(只刷新 seen_at)。
+
+        重生位置(`spawns`)跟着布局一起存 —— 它同样随模式/版本变(同一张图的
+        “区域1/区域2”双方重生位置不同), 所以同一个布局的多次对局只更新一份,
+        内容真的变了才写盘(战局内每帧都会调到这里)。
         """
         if not map_key or not zones:
             return False
         sig = zones_signature(zones)
         if not sig:
             return False
+        spawn_json = spawns_to_json(spawns or [])
         with self._lock:
             layouts = self.map_zones.setdefault(map_key, [])
             now = time.strftime("%Y-%m-%dT%H:%M:%S")
+            is_new = True
             for item in layouts:
                 if item.get("sig") == sig:
+                    is_new = False
                     item["seen_at"] = now
-                    self.save()
-                    return False
-            layouts.insert(0, {
-                "sig": sig,
-                "count": len(zones),
-                "mode": zone_mode_name(len(zones)),
-                # 存位置 + 当次归属色(供以后录像解析参考); **不存 blink** —— 那只是
-                # “当时正在被占”的瞬时状态, 存下来会让旧布局一直闪
-                "zones": [{k: v for k, v in z.items() if k != "blink"}
-                          for z in zones_to_json(zones)],
-                "seen_at": now,
-            })
-            del layouts[12:]                 # 单张地图最多留 12 种布局
+                    # 重生位置没变就不写盘(否则每帧一次存盘太浪费)
+                    if spawn_json and item.get("spawns") != spawn_json:
+                        item["spawns"] = spawn_json
+                    break
+            if is_new:
+                layouts.insert(0, {
+                    "sig": sig,
+                    "count": len(zones),
+                    "mode": zone_mode_name(len(zones)),
+                    # 存位置 + 当次归属色(供以后录像解析参考); **不存 blink** —— 那只是
+                    # “当时正在被占”的瞬时状态, 存下来会让旧布局一直闪
+                    "zones": [{k: v for k, v in z.items() if k != "blink"}
+                              for z in zones_to_json(zones)],
+                    "spawns": spawn_json,      # 重生位置(地图上画空心方块的就是它们)
+                    "seen_at": now,
+                })
+                del layouts[12:]                 # 单张地图最多留 12 种布局
         self.save()
-        return True
+        return is_new
 
     # ------------------------------------------------------------------ 版本(战区布局)
     def _layout_auto_names(self, map_key: str) -> list[tuple[str, str]]:

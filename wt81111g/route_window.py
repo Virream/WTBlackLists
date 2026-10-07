@@ -46,7 +46,8 @@ from .sound import play_error as play_error_sound
 from .sound import settings as sound_settings
 from .sound_dialog import SoundSettingsDialog
 from .tree_view import RouteTreeWidget
-from .zones import layout_spread, ownership_text, zones_to_json
+from .zones import ground_spawns, layout_spread, ownership_text, spawns_from_json
+from .zones import spawns_to_json, zones_to_json
 
 log = logging.getLogger("route_window")
 
@@ -122,10 +123,16 @@ class RouteTesterWindow(QMainWindow):
             self._show_zones = int(self._settings.value("show_zones", 1)) != 0
         except (TypeError, ValueError):
             self._show_zones = True
+        # 「显示重生位置」(红/蓝空心方块)开关: 同上
+        try:
+            self._show_spawns = int(self._settings.value("show_spawns", 1)) != 0
+        except (TypeError, ValueError):
+            self._show_spawns = True
 
         self._build_ui()
         self._build_menu()
         self.map_view.set_show_zones(self._show_zones)
+        self.map_view.set_show_spawns(self._show_spawns)
         self._reload_tree()
         # 后台轮询 8111
         self.recorder = RouteRecorder(self.store, parent=self, map_cache=self.map_cache)
@@ -194,6 +201,17 @@ class RouteTesterWindow(QMainWindow):
         self.act_zones.toggled.connect(self._on_show_zones)
         setting.addAction(self.act_zones)
 
+        self.act_spawns = QAction("显示重生位置(红/蓝方块)", self)
+        self.act_spawns.setCheckable(True)
+        self.act_spawns.setChecked(self._show_spawns)
+        self.act_spawns.setToolTip(
+            "对战局内 8111 给出的重生点(respawn_base_tank)画空心方块:\n"
+            "红 = 敌方, 蓝 = 我方。一个位置一个小方块 —— 连成一片的就是“重生区域”\n"
+            "(游戏里重生位置就在这个区域里随机分配)。\n"
+            "战局外/看缓存底图时, 画的是这张地图这个版本以前记下的重生位置。")
+        self.act_spawns.toggled.connect(self._on_show_spawns)
+        setting.addAction(self.act_spawns)
+
         snd_menu = self.menuBar().addMenu("音效(&A)")
         self.act_sound_on = QAction("启用提示音", self)
         self.act_sound_on.setCheckable(True)
@@ -245,6 +263,14 @@ class RouteTesterWindow(QMainWindow):
                          sticky=2.0)
         if on:
             play_sound("mark")          # 打开时响一声, 便于确认音量
+
+    def _on_show_spawns(self, checked: bool) -> None:
+        """菜单开关: 是否在地图上画重生位置(红/蓝空心方块)。"""
+        self._show_spawns = bool(checked)
+        self._settings.setValue("show_spawns", 1 if checked else 0)
+        self.map_view.set_show_spawns(self._show_spawns)
+        self._set_status("已显示地图上的重生位置(红=敌方, 蓝=我方)" if checked
+                         else "已隐藏地图上的重生位置", sticky=2.0)
 
     def _open_sound_settings(self) -> None:
         """菜单「音效 → 音效设置」: 音量 / 自定义音效文件(改动立即生效)。"""
@@ -715,8 +741,11 @@ class RouteTesterWindow(QMainWindow):
             return
         recorder = getattr(self, "recorder", None)
         live = list((info or {}).get("zones") or [])
+        live_spawns = list((info or {}).get("spawns") or [])
         if live and recorder is not None and recorder.map_key == key:
             self.map_view.set_zones(zones_to_json(live))
+            # 只画**地面**重生位置(空军的 fighter/bomber/ucav 也记了, 但地图上不画)
+            self.map_view.set_spawns(spawns_to_json(ground_spawns(live_spawns)))
             return
         # 旧布局: 只画字母 + 中立色 —— 当时谁占着哪个战区早已过期, 不拿来误导
         layout = self.store.layout_for(key, self._zone_signature_for_view())
@@ -724,6 +753,9 @@ class RouteTesterWindow(QMainWindow):
             {"label": z.get("label"), "x": z.get("x"), "y": z.get("y")}
             for z in (layout or {}).get("zones") or []
         ])
+        # 重生位置: 存过就画(同一张图不同版本存的是各自的那份)
+        self.map_view.set_spawns(spawns_to_json(ground_spawns(
+            spawns_from_json((layout or {}).get("spawns")))))
 
     def _selection_tracks(self) -> list[RouteRecord]:
         """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""

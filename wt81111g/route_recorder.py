@@ -28,7 +28,8 @@ from .route_store import (
     PLACEHOLDER_MAP_KEY, RouteMark, RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
 )
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
-from .zones import zone_state, zones_from_objects
+from .zones import (Spawn, spawn_state, spawn_summary, spawns_from_objects, zone_state,
+                    zones_from_objects)
 
 log = logging.getLogger("route_recorder")
 
@@ -129,6 +130,9 @@ class RouteRecorder(QObject):
         self._zones: list[Zone] = []
         self._zones_sig = ""          # 坐标指纹(= 模式)
         self._zones_state: tuple = ()   # 完整状态(含归属/闪烁) —— 变了就刷新界面
+        self._spawns: list[Spawn] = []  # 重生位置(respawn_base_*)
+        self._spawns_state: tuple = ()
+        self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -227,6 +231,11 @@ class RouteRecorder(QObject):
         return self._zones_sig
 
     @property
+    def spawns(self) -> list[Spawn]:
+        """当前战局解析到的重生位置(双方、地面/空中都在里面)。"""
+        return list(self._spawns)
+
+    @property
     def mode_name(self) -> str:
         """由战区数量推出的模式名(战区未知时为空串)。"""
         return zone_mode_name(len(self._zones)) if self._zones else ""
@@ -301,6 +310,7 @@ class RouteRecorder(QObject):
             "marks": len(self._rec.marks) - 1 if self._rec is not None else 0,
             "rate": self._current_rate(),
             "zones": self._zones,
+            "spawns": self._spawns,
             "mode": self.mode_name,
         })
 
@@ -326,19 +336,26 @@ class RouteRecorder(QObject):
         return None
 
     def _update_zones(self, objects: list) -> None:
-        """从地图对象里提取战区; **归属/闪烁变化也要上报**。
+        """从地图对象里提取战区与**重生位置**; **归属/闪烁变化也要上报**。
 
         8111 每帧都给战区的当前归属色与 blink 标志, 但坐标不变 —— 只在“坐标变化”时
         刷新的话, 占领后图标颜色会永远停在第一次见到的样子(用户报的 bug)。
         所以: 用 `zone_state()`(字母/坐标/归属/闪烁)判断是否需要刷新;
         而落盘的“布局”仍然只按**坐标指纹**去重(归属是反复变的, 不能当新模式)。
+
+        重生位置(`respawn_base_*`)也一样: 一局里成片出现且固定不变, 但**同一张图的
+        不同版本(区域1/区域2)位置不同**, 所以跟布局一起存(见 store.remember_zones)。
         """
         zones = zones_from_objects(objects)
-        state = zone_state(zones)
-        if state == self._zones_state:
-            return
+        spawns = spawns_from_objects(objects)
+        zstate = zone_state(zones)
+        sstate = spawn_state(spawns)
+        if zstate == self._zones_state and sstate == self._spawns_state:
+            return                       # 什么都没变 → 不刷新界面也不存盘
         self._zones = zones
-        self._zones_state = state
+        self._zones_state = zstate
+        self._spawns = spawns
+        self._spawns_state = sstate
         if not zones:
             self._zones_sig = ""       # 退出战局: 指纹清空, 下次进图重新上报
             return
@@ -348,14 +365,19 @@ class RouteRecorder(QObject):
         log.info("战区已刷新: %s %s", self.mode_name,
                  ", ".join(f"{z.label}={z.side_label}{'*' if z.contested else ''}"
                            for z in zones))
+        if spawns:
+            log.info("重生位置已刷新: %s", spawn_summary(spawns))
         # 录制开始时可能还没拿到战区(进图瞬间) → 指纹变化时补写进当前录制
         if self._rec is not None and (new_layout or not self._rec.zone_signature):
             self._stamp_record(self._rec)
-        if new_layout and self._map_key != PLACEHOLDER_MAP_KEY:
+        # 新布局、或同一布局但重生位置变了 → 存一份(带重生点)
+        if (new_layout or sstate != self._spawns_saved) \
+                and self._map_key != PLACEHOLDER_MAP_KEY:
             try:
-                self.store.remember_zones(self._map_key, zones)
+                self.store.remember_zones(self._map_key, zones, spawns=spawns)
+                self._spawns_saved = sstate
             except Exception as exc:  # noqa: BLE001 - 存盘失败不应影响录制
-                log.warning("保存战区布局失败: %s", exc)
+                log.warning("保存战区/重生位置失败: %s", exc)
 
     def _stamp_record(self, rec: RouteRecord) -> None:
         """把当前战局的战区信息写进记录(模式名/数量/指纹)。"""
