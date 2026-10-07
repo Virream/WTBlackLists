@@ -69,6 +69,9 @@ MAX_ZOOM = 20.0
 WHEEL_STEP = 1.15        # 每格滚轮的缩放倍率
 PAN_MARGIN = 40.0        # 平移时地图至少需留在视野内的像素
 
+# 悬停命中半径(px): 鼠标到轨迹点的距离小于它就算“悬停在这条线上”
+HOVER_RADIUS = 18.0
+
 
 def speed_color(speed: float, vmax: float) -> QColor:
     """速度 → 颜色: 慢(蓝) → 快(红)。"""
@@ -121,7 +124,10 @@ class RouteMapView(QWidget):
         # 与“眼睛点亮”无关 —— 选了就应该看得到
         self._highlight: list[RouteRecord] = []
         self._player: tuple[float, float] | None = None
+        # 悬停提示(左下角浮层): 命中的轨迹 + 轨迹上的那个点 + 逐行文本
         self._hover_text: str | None = None
+        self._hover_rec: RouteRecord | None = None
+        self._hover_pt: RoutePoint | None = None
         self._status = "等待 8111 地图数据…"
         # 视图变换: zoom 相对“适配窗口”, pan 为相对视图中心的像素偏移
         self._zoom = 1.0
@@ -308,11 +314,13 @@ class RouteMapView(QWidget):
     def set_visible_tracks(self, recs: list[RouteRecord] | None) -> None:
         """设置要显示的历史轨迹(可多条, 按给定顺序绘制)。"""
         self._visible = list(recs or [])
+        self._drop_hover_if_gone()
         self.update()
 
     def set_highlight(self, recs: list[RouteRecord] | None) -> None:
         """设置高亮轨迹(侧栏选中的那几条) —— 用速度配色画在最上面。"""
         self._highlight = list(recs or [])
+        self._drop_hover_if_gone()
         self.update()
 
     @property
@@ -332,6 +340,7 @@ class RouteMapView(QWidget):
         else:
             self._playback_recs = [recs]
         self._playhead = playhead
+        self._drop_hover_if_gone()
         self.update()
 
     def set_player(self, pos: tuple[float, float] | None) -> None:
@@ -342,7 +351,7 @@ class RouteMapView(QWidget):
         self._visible = []
         self._highlight = []
         self._player = None
-        self._hover_text = None
+        self._reset_hover()
         self._playback_recs = []
         self._playhead = 0.0
         self._zones = []
@@ -445,6 +454,7 @@ class RouteMapView(QWidget):
             self._draw_player(p)
 
             if self._hover_text:
+                self._draw_hover_mark(p)
                 self._draw_hover(p)
         finally:
             p.end()
@@ -646,19 +656,42 @@ class RouteMapView(QWidget):
         p.setBrush(QBrush(COLOR_PLAYER))
         p.drawEllipse(c, 4, 4)
 
+    def _draw_hover_mark(self, p: QPainter) -> None:
+        """在命中的那个轨迹点上画一圈白环。
+
+        多条轨迹叠在一起时, 只靠文字看不出“读的是哪条线” —— 白环指出具体位置。
+        """
+        if self._hover_pt is None or self._hover_rec is None:
+            return
+        if not any(r is self._hover_rec for r in self._drawn_records()):
+            return                                   # 命中的线已被隐藏/删除
+        c = self._to_px(self._hover_pt.x, self._hover_pt.y)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(15, 23, 42, 200), 4.0))
+        p.drawEllipse(c, 5.0, 5.0)
+        p.setPen(QPen(QColor("#f8fafc"), 1.8))
+        p.drawEllipse(c, 5.0, 5.0)
+
     def _draw_hover(self, p: QPainter) -> None:
+        """左下角悬停浮层(多行文本, 宽度超出时贴右边)。"""
         font = QFont("Microsoft YaHei", 9)
         p.setFont(font)
         fm = QFontMetrics(font)
-        text = self._hover_text or ""
-        tw, th = fm.horizontalAdvance(text), fm.height()
-        x, y = 10, self.height() - th - 12
+        lines = [ln for ln in (self._hover_text or "").split("\n")]
+        if not lines or not any(lines):
+            return
+        th = fm.height()
+        tw = max(fm.horizontalAdvance(ln) for ln in lines)
+        box_w = min(float(tw + 14), max(80.0, float(self.width() - 20)))
+        box_h = float(th * len(lines) + 8)
+        x, y = 10.0, float(self.height()) - box_h - 12.0
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(15, 23, 42, 215))
-        p.drawRoundedRect(QRectF(x, y, tw + 14, th + 8), 4, 4)
+        p.drawRoundedRect(QRectF(x, y, box_w, box_h), 4, 4)
         p.setPen(QPen(QColor("#e2e8f0")))
-        p.drawText(QRect(int(x) + 7, y, tw, th + 8),
-                   Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, text)
+        for i, ln in enumerate(lines):
+            p.drawText(QRect(int(x) + 7, int(y) + 4 + i * th, int(box_w) - 14, th),
+                       Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, ln)
 
     # ------------------------------------------------------------------ 交互
     def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
@@ -720,32 +753,86 @@ class RouteMapView(QWidget):
             self._clamp_pan()
             self.update()
             return
-        rec = self._live or (self._visible[0] if self._visible else None)
-        if rec is None or not rec.points:
-            if self._hover_text:
-                self._hover_text = None
-                self.update()
-            return
         r = self._map_rect()
-        if r.isEmpty():
+        if r.isEmpty() or not self._hover_candidates():
+            self._set_hover(None, None)
             return
-        mx, my = event.position().x(), event.position().y()
-        best: RoutePoint | None = None
-        best_d2 = 18.0 ** 2  # 命中半径 18px
-        for pt in rec.points:
-            px = self._to_px(pt.x, pt.y)
-            d2 = (px.x() - mx) ** 2 + (px.y() - my) ** 2
-            if d2 < best_d2:
-                best_d2, best = d2, pt
-        new_text = None
-        if best is not None:
-            # 悬停预览用毫秒精度(轨迹点本身就是高精度采样, 便于对比微小时差)
-            new_text = f"时间 {fmt_time_ms(best.t)}   速度 {fmt_speed(best.speed)} km/h"
-        if new_text != self._hover_text:
-            self._hover_text = new_text
-            self.update()
+        hit = self._hit_test(event.position().x(), event.position().y())
+        self._set_hover(*(hit or (None, None)))
+
+    # ------------------------------------------------------------------ 悬停
+    def _drawn_records(self) -> list[RouteRecord]:
+        """当前**真的画在地图上**的轨迹 —— 悬停只该命中看得见的线。
+
+        回放中画的是被回放的那几条; 否则是“眼睛点亮的” + 高亮层 + 正在录的那条。
+        """
+        if self._playback_recs:
+            return list(self._playback_recs)
+        out: list[RouteRecord] = []
+        seen: set[int] = set()
+        for rec in [*self._visible, *self._highlight, self._live]:
+            if rec is None or id(rec) in seen:
+                continue
+            seen.add(id(rec))
+            out.append(rec)
+        return out
+
+    def _hover_candidates(self) -> list[RouteRecord]:
+        return [r for r in self._drawn_records() if r.points]
+
+    def _hit_test(self, mx: float, my: float
+                  ) -> tuple[RouteRecord, RoutePoint] | None:
+        """在**所有显示中的轨迹**里找离鼠标最近的点(半径见 HOVER_RADIUS)。
+
+        以前只看实时轨迹 / 第一条可见轨迹 —— 于是只剩“刚录完那条”有提示,
+        其它眼睛点亮的线路移上去没反应(2026-10-07 修)。
+        """
+        best: tuple[RouteRecord, RoutePoint] | None = None
+        best_d2 = HOVER_RADIUS ** 2
+        for rec in self._hover_candidates():
+            for pt in rec.points:
+                px = self._to_px(pt.x, pt.y)
+                d2 = (px.x() - mx) ** 2 + (px.y() - my) ** 2
+                if d2 < best_d2:
+                    best_d2, best = d2, (rec, pt)
+        return best
+
+    def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
+        """悬停浮层文本。
+
+        第一行 = **这是哪条线路**(录制时刻 + 车型 + 用时; 与侧栏条目一一对应),
+        第二行 = 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差)。
+        """
+        if rec is self._live:
+            head = f"录制中 | 车型 {rec.vehicle}"
+        else:
+            ts = rec.created_at[11:16] if len(rec.created_at) >= 16 else ""
+            head = " | ".join(x for x in (ts, f"车型 {rec.vehicle}",
+                                          f"用时 {fmt_time(rec.duration)}") if x)
+        return (f"{head}\n"
+                f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h")
+
+    def _set_hover(self, rec: RouteRecord | None, pt: RoutePoint | None) -> None:
+        """更新悬停状态(文本 + 命中点), 有变化才重画。"""
+        text = None if rec is None or pt is None else self._hover_text_for(rec, pt)
+        if (text == self._hover_text and rec is self._hover_rec
+                and pt is self._hover_pt):
+            return
+        self._hover_text = text
+        self._hover_rec = rec
+        self._hover_pt = pt
+        self.update()
+
+    def _reset_hover(self) -> None:
+        self._hover_text = None
+        self._hover_rec = None
+        self._hover_pt = None
+
+    def _drop_hover_if_gone(self) -> None:
+        """命中的那条线被隐藏/换掉后, 悬停提示不该还留着。"""
+        if self._hover_rec is not None and not any(
+                r is self._hover_rec for r in self._drawn_records()):
+            self._reset_hover()
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        if self._hover_text:
-            self._hover_text = None
-            self.update()
+        self._set_hover(None, None)

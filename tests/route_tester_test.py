@@ -391,6 +391,83 @@ def test_map_render():
     results.append("地图渲染(轨迹/标记/时间标签/悬停) OK")
 
 
+def test_map_hover():
+    """地图悬停: **所有显示中的线路**都能读, 左下角浮层里要有车型/用时。
+
+    修复前只查“实时轨迹 / 第一条可见轨迹”, 于是只剩刚录完那条有提示,
+    其它眼睛点亮的线路鼠标移上去没反应。
+    """
+    from PyQt6.QtCore import QEvent, Qt
+    from PyQt6.QtGui import QMouseEvent
+
+    from wt81111g.route_map_view import RouteMapView
+
+    src = QImage(64, 64, QImage.Format.Format_RGB32)
+    src.fill(QColor("#334455"))
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    src.save(buf, "PNG")
+    buf.close()
+
+    view = RouteMapView()
+    view.resize(800, 600)
+    assert view.set_map_bytes(bytes(ba))
+    store = RouteStore(os.path.join(tempfile.gettempdir(), "rt_hover.json"))
+
+    a = store.new_route("k", "地图 1", "T-72B", 0.30, 0.30)
+    a.points = [RoutePoint(0.30, 0.30 + i * 0.02, i * 0.5, 10.0 + i * 3)
+                for i in range(4)]
+    a.duration = 1.5
+    b = store.new_route("k", "地图 1", "Leopard 2PL", 0.30, 0.70)
+    b.points = [RoutePoint(0.30, 0.70 + i * 0.02, i * 0.5, 50.0 + i * 3)
+                for i in range(4)]
+    b.duration = 1.5
+    view.set_visible_tracks([a, b])
+
+    def move_to(pt) -> None:
+        c = view._to_px(pt.x, pt.y)
+        view.mouseMoveEvent(QMouseEvent(
+            QEvent.Type.MouseMove, c, c, Qt.MouseButton.NoButton,
+            Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+
+    # ① 悬停在**后面的那条**(B): 修复前它完全没反应
+    move_to(b.points[2])
+    assert view._hover_text, "眼睛点亮的线路也应该能悬停读取"
+    assert view._hover_rec is b
+    assert "车型 Leopard 2PL" in view._hover_text and "T-72B" not in view._hover_text
+    assert fmt_time_ms(b.points[2].t) in view._hover_text
+    assert f"速度 {fmt_speed(b.points[2].speed)} km/h" in view._hover_text
+
+    # ② 悬停到另一条(A) → 提示跟着换(以前永远只有一条能被读到)
+    move_to(a.points[1])
+    assert view._hover_rec is a
+    assert "T-72B" in view._hover_text and "Leopard 2PL" not in view._hover_text
+
+    # ③ 移到远离所有轨迹的地方(左上角) → 提示消失
+    far = QPointF(4.0, 4.0)
+    view.mouseMoveEvent(QMouseEvent(
+        QEvent.Type.MouseMove, far, far, Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
+    assert view._hover_text is None
+    view.render(QImage(800, 600, QImage.Format.Format_ARGB32))   # 含白环也不应抛异常
+
+    # ④ 被悬停的那条被隐藏 → 提示立刻消失(不留别人的数据)
+    move_to(a.points[1])
+    assert view._hover_text
+    view.set_visible_tracks([b])
+    assert view._hover_text is None, "隐藏后的线路不该还留着悬停提示"
+
+    # ⑤ 回放模式: 悬停命中正在回放的那条
+    view.set_playback(a, a.duration * 0.5)
+    move_to(a.points[2])
+    assert view._hover_rec is a and "T-72B" in view._hover_text
+    view.set_playback(None)
+    view.leaveEvent(None)
+    assert view._hover_text is None
+    results.append("地图悬停(任意显示中的线路 + 车型/用时) OK")
+
+
 def test_map_zoom_pan():
     """地图交互: 滚轮缩放(鼠标锚点不动) / 中键拖拽平移 / 双击复位。"""
     from PyQt6.QtCore import QEvent, QPoint, Qt
@@ -2111,6 +2188,7 @@ def main() -> int:
     test_spawns(tmpdir)
     test_multi_playback(tmpdir)
     test_map_render()
+    test_map_hover()
     test_map_zoom_pan()
     test_map_switch(tmpdir)
     test_eye_visibility_opacity(tmpdir)
