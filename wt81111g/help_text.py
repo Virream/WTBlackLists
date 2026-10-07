@@ -93,7 +93,7 @@ def about_html() -> str:
 <ul>
 <li>开始 / 结束 / 标记 分别播不同的音效(默认就是 Windows 自带的
     <code>Speech On.wav</code>、<code>Speech Off.wav</code>、<code>Windows Balloon.wav</code>,
-    在 <code>%SystemRoot%\Media</code> 里), 以便在游戏中凭听觉确认;</li>
+    在 <code>%SystemRoot%\\Media</code> 里), 以便在游戏中凭听觉确认;</li>
 <li>菜单「<b>音效</b>」里可以: 一键<b>启用/关闭</b>提示音; 打开「音效设置」
     调<b>音量</b>(0~100%)、给四个动作分别<b>换成本地的 .wav 文件</b>(带试听), 或恢复默认;
     设置会记住;</li>
