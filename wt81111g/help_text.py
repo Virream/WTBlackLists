@@ -11,17 +11,18 @@ APP_TITLE = "跑图线路测试器"
 APP_SUBTITLE = "记录“重生后多久到达某位置”的独立小工具"
 
 
-def hotkey_lines() -> list[str]:
-    """三行快捷键说明(顺序: 开始 / 标记 / 结束)。"""
+def hotkey_lines(bindings: dict | None = None) -> list[str]:
+    """三行快捷键说明(顺序: 开始 / 标记 / 结束); 传当前绑定才能显示真实按键。"""
+    bindings = bindings or DEFAULT_BINDINGS
     return [
-        f"{ACTION_LABELS[a]} —— {describe_binding(DEFAULT_BINDINGS[a])}"
+        f"{ACTION_LABELS[a]} —— {describe_binding(bindings.get(a, DEFAULT_BINDINGS[a]))}"
         for a in ("start", "mark", "stop")
     ]
 
 
-def about_html() -> str:
+def about_html(bindings: dict | None = None) -> str:
     """功能说明正文(HTML, 给 QTextBrowser 用)。"""
-    keys = "".join(f"<li>{line}</li>" for line in hotkey_lines())
+    keys = "".join(f"<li>{line}</li>" for line in hotkey_lines(bindings))
     return f"""
 <h2>{APP_TITLE}</h2>
 <p style="color:#888">{APP_SUBTITLE} —— 与黑名单助手(WBBlackList)相互独立, 可单独运行。</p>
@@ -30,10 +31,13 @@ def about_html() -> str:
 <ul>{keys}</ul>
 <p>要点:</p>
 <ul>
-<li>只要<b>按住右Shift 再按小键盘对应数字</b>就会触发, <b>与其它按键是否按住无关</b>
-    (例如一直按着 W 前进时照样能触发);</li>
-<li>小键盘 NumLock <b>开或关都可以</b>;</li>
-<li>游戏需要以“全屏窗口(无边框)”或窗口模式运行, 单用全屏独占也不影响本程序按键监听;</li>
+<li><b>默认是 F5 / F6 / F7</b>(菜单「快捷键」里可改); 不带修饰键的单键最省事 ——
+    不需要和 W 之类的键同时按;</li>
+<li>只要按下该键就会触发, <b>与其它按键是否按住无关</b>(一直按着前进也能触发);</li>
+<li>程序<b>不拦截按键</b>: 游戏也会收到这个键, 所以最好选游戏里没绑功能的键
+    (或把游戏里对应的绑定解掉);</li>
+<li>按了没反应时: 先看 <code>data/route_tester.log</code> 里有没有“全局快捷键触发”,
+    有则说明按键收到了(是动作被拒), 没有就是按键没到达程序 —— 换个键试试;</li>
 <li>结束录制与标记只在录制中有效(未录制时按了会提示“当前没有在录制”)。</li>
 </ul>
 
@@ -108,6 +112,22 @@ def about_html() -> str:
     (Windows 的 waveaudio 驱动不支持单独给某个音效设音量);</li>
 <li>音量调到 0 等于静音; 自定义文件写错了/被删了会自动退回默认音效。</li>
 </ul>
+
+<h3>会不会影响反作弊?</h3>
+<p>不会踩到反作弊通常盯的那几类行为 —— 本程序只用两条<b>官方的、只收通知</b>的通道:</p>
+<ul>
+<li><b>系统热键</b>(<code>RegisterHotKey</code>): 主通道。向 Windows 注册一个快捷键, 由
+    系统在按下时通知本程序 —— 和截图工具、语音工具用的是同一个 API;</li>
+<li><b>按键轮询</b>(<code>GetAsyncKeyState</code>): 兜底通道, 只查询被绑定那几个键的
+    “是否按下/刚按过”。可在菜单「快捷键」里<b>关掉</b>它, 关掉后程序完全不查询按键状态。</li>
+</ul>
+<p>本程序<b>不会</b>: 安装键盘钩子(<code>SetWindowsHookEx</code>)、用
+   <code>SendInput</code>/<code>keybd_event</code> 注入按键、读写游戏内存、
+   打开游戏进程、注入 DLL、读写游戏文件 —— 也就是说没有“模拟输入/改游戏”这类
+   真正会被判定为作弊外挂的行为; 我们只是“在旁边听按键”, 而且<b>不拦截按键</b>
+   (游戏自己仍然收得到这个键)。</p>
+<p>需要注意的是: 因为它不拦截, 你绑的键在游戏里会同时生效 —— 所以最好选游戏里
+   没绑功能的键(默认的 F5 / F6 / F7 就不是默认功能键), 或者把游戏里对应的绑定解掉。</p>
 
 <h3>数据存在哪</h3>
 <ul>

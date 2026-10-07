@@ -30,8 +30,12 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
-from .global_hotkey import DEFAULT_BINDINGS, GlobalHotkeyWatcher, describe_binding
+from .global_hotkey import (
+    ACTION_LABELS, DEFAULT_BINDINGS, GlobalHotkey, GlobalHotkeyWatcher, describe_binding,
+    load_bindings, reset_bindings, save_bindings,
+)
 from .help_text import about_html
+from .hotkey_dialog import HotkeyDialog
 from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
@@ -129,6 +133,14 @@ class RouteTesterWindow(QMainWindow):
         except (TypeError, ValueError):
             self._show_spawns = True
 
+        # 快捷键设置必须先读(菜单里的「同时使用按键轮询」勾选状态要用), 监控对象在后面再建
+        self._hotkey_bindings = load_bindings(self._settings)
+        self._last_hotkey_at: dict[str, float] = {}
+        try:
+            self._poll_enabled = int(self._settings.value("hotkey_poll", 1)) != 0
+        except (TypeError, ValueError):
+            self._poll_enabled = True
+
         self._build_ui()
         self._build_menu()
         self.map_view.set_show_zones(self._show_zones)
@@ -165,10 +177,17 @@ class RouteTesterWindow(QMainWindow):
             self.cmb_speed.setCurrentIndex(idx_speed)
         self.player.set_speed(saved_speed)
 
-        # 全局快捷键(右Shift + 小键盘 1/2/3)
-        self.hotkeys = GlobalHotkeyWatcher(parent=self)
-        self.hotkeys.triggered.connect(self._handle_action)
-        self.hotkeys.start()
+        # 全局快捷键: **两套通道**同时开着 —— 系统热键(RegisterHotKey)+ 轮询
+        # (GetAsyncKeyState); 任意一套命中就触发, 同一动作 0.3s 内去重。
+        # 为什么两套: 用户反馈游戏里右Shift+小键盘按了没反应(疑似键盘多键冲突/被挡),
+        # 系统热键不靠定时器也不读按键状态, 最可靠; 轮询则能区分左右 Shift 等精确组合。
+        self.hotkeys = GlobalHotkeyWatcher(self._hotkey_bindings, parent=self)
+        self.hotkeys.triggered.connect(self._hotkey_action)
+        if self._poll_enabled:
+            self.hotkeys.start()
+        self.sys_hotkeys = GlobalHotkey(self._hotkey_bindings, parent=self)
+        self.sys_hotkeys.triggered.connect(self._hotkey_action)
+        self.sys_hotkeys.start()
 
         self._update_buttons(False)
         if not GlobalHotkeyWatcher.supported():
@@ -212,6 +231,28 @@ class RouteTesterWindow(QMainWindow):
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
 
+        hk_menu = self.menuBar().addMenu("快捷键(&K)")
+        act_hk_set = QAction("快捷键设置(按键 / 修饰键)…", self)
+        act_hk_set.setToolTip("给“开始录制 / 结束录制 / 标记位置”分别指定按键, 改动立即生效。")
+        act_hk_set.triggered.connect(self._open_hotkey_settings)
+        hk_menu.addAction(act_hk_set)
+        self.act_poll = QAction("同时使用按键轮询(可区分左右 Shift)", self)
+        self.act_poll.setCheckable(True)
+        self.act_poll.setChecked(self._poll_enabled)
+        self.act_poll.setToolTip(
+            "主通道是**系统热键**(RegisterHotKey): 由 Windows 直接把按键事件通知本程序,\n"
+            "本程序既不读按键状态也不挂钩子。\n"
+            "这一项是额外的兜底通道(GetAsyncKeyState 轮询), 好处是能区分“右Shift”这种精确组合,\n"
+            "而且能兼容某些系统热键注册失败的键。\n"
+            "如果你不想让程序去查询按键状态, 可以关掉它(只留系统热键)。\n"
+            "两条通道都只是“接收按键通知”: 不注入按键、不挂钩子、不碰游戏进程。")
+        self.act_poll.toggled.connect(self._on_poll_toggled)
+        hk_menu.addAction(self.act_poll)
+        hk_menu.addSeparator()
+        act_hk_reset = QAction("恢复默认快捷键(F5 / F6 / F7)", self)
+        act_hk_reset.triggered.connect(self._reset_hotkeys)
+        hk_menu.addAction(act_hk_reset)
+
         snd_menu = self.menuBar().addMenu("音效(&A)")
         self.act_sound_on = QAction("启用提示音", self)
         self.act_sound_on.setCheckable(True)
@@ -240,7 +281,7 @@ class RouteTesterWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         view = QTextBrowser(dlg)
         view.setOpenExternalLinks(True)
-        view.setHtml(about_html())
+        view.setHtml(about_html(self._hotkey_bindings))
         layout.addWidget(view, 1)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dlg)
         buttons.rejected.connect(dlg.reject)
@@ -1131,6 +1172,53 @@ class RouteTesterWindow(QMainWindow):
         self._set_status(f"已把该版本命名为「{shown}」", sticky=3.0)
 
     # ==================================================================== 动作
+    def _hotkey_action(self, action: str) -> None:
+        """两套全局快捷键通道的统一入口(先去掉重复命中, 再走按钮那条路)。"""
+        now = time.monotonic()
+        if now - self._last_hotkey_at.get(action, 0.0) < 0.3:
+            return                    # 系统热键与轮询可能同时命中 → 只算一次
+        self._last_hotkey_at[action] = now
+        self._handle_action(action)
+
+    def apply_hotkey(self, action: str, binding: tuple[str, str]) -> None:
+        """改某个动作的快捷键: 两套通道立即生效并存盘(设置对话框调用)。"""
+        self._hotkey_bindings[action] = (binding[0] or "", binding[1])
+        self.hotkeys.set_bindings(self._hotkey_bindings)
+        self.sys_hotkeys.apply(self._hotkey_bindings)
+        save_bindings(self._settings, {action: self._hotkey_bindings[action]})
+        self._update_buttons()
+        self._set_status(f"{ACTION_LABELS[action]} 的快捷键已改为 "
+                         f"{describe_binding(self._hotkey_bindings[action])}", sticky=3.0)
+
+    def _on_poll_toggled(self, on: bool) -> None:
+        """菜单开关: 是否同时用 GetAsyncKeyState 轮询(系统热键通道始终在跑)。"""
+        self._poll_enabled = bool(on)
+        self._settings.setValue("hotkey_poll", 1 if on else 0)
+        if on:
+            self.hotkeys.start()
+        else:
+            self.hotkeys.stop()
+        self._set_status("已启用按键轮询(可区分左右 Shift)" if on
+                         else "已关闭按键轮询, 只使用系统热键(不读按键状态)", sticky=3.0)
+
+    def _reset_hotkeys(self) -> None:
+        """菜单: 把三个快捷键恢复默认(F5 开始 / F6 结束 / F7 标记)。"""
+        for action, binding in DEFAULT_BINDINGS.items():
+            self._hotkey_bindings[action] = binding
+        self.hotkeys.set_bindings(self._hotkey_bindings)
+        self.sys_hotkeys.apply(self._hotkey_bindings)
+        reset_bindings(self._settings)
+        self._set_status("快捷键已恢复默认: F5 开始 / F6 结束 / F7 标记", sticky=4.0)
+
+    def _open_hotkey_settings(self) -> None:
+        """菜单「快捷键 → 快捷键设置」: 改按键/修饰键, 改动立即生效。"""
+        dlg = HotkeyDialog(self, self)
+        dlg.exec()
+        self._set_status("快捷键: " + " · ".join(
+            f"{ACTION_LABELS[a]}={describe_binding(b)}"
+            for a, b in self._hotkey_bindings.items()), sticky=4.0)
+        self._update_buttons()
+
     def _handle_action(self, action: str) -> None:
         """按钮与全局快捷键的统一入口: 先播放提示音, 再投递录制命令。"""
         if self._in_playback():
@@ -1502,7 +1590,8 @@ class RouteTesterWindow(QMainWindow):
         else:
             self.lbl_status.setText(
                 f"录制中… 地图: {rec.map_name} | 载具: {rec.vehicle} "
-                f"| 起点已标注 (按 {describe_binding(DEFAULT_BINDINGS['stop'])} 结束){note}"
+                f"| 起点已标注 (按 "
+                f"{describe_binding(self._hotkey_bindings.get('stop'))} 结束){note}"
             )
 
     def _on_recording_cancelled(self) -> None:
@@ -1533,6 +1622,7 @@ class RouteTesterWindow(QMainWindow):
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt 命名
         try:
             self.hotkeys.stop()
+            self.sys_hotkeys.stop()
             self.player.pause()
             self.recorder.stop()
             self.store.save()
