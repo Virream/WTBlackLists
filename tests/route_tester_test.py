@@ -468,6 +468,183 @@ def test_map_hover():
     results.append("地图悬停(任意显示中的线路 + 车型/用时) OK")
 
 
+def test_map_draw_cache():
+    """地图绘制缓存: 状态没变时重复重绘**不该**再重算几何 / 重建缓存层。
+
+    背景: 5 条线 3766 个点, 状态没变时每帧都要在 Python 里重建分桶几何(30ms)
+    再逐段 drawLines(10ms) —— 25Hz 刷新一次 41ms, 界面直接卡死
+    (2026-10-08 用户反馈“选 5 条卡得不得了”)。修复 = 几何缓存 + 离屏缓存层。
+    """
+    import wt81111g.route_map_view as mv
+
+    src = QImage(64, 64, QImage.Format.Format_RGB32)
+    src.fill(QColor("#334455"))
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    src.save(buf, "PNG")
+    buf.close()
+
+    view = RouteMapView()
+    view.resize(800, 600)
+    assert view.set_map_bytes(bytes(ba))
+    store = RouteStore(os.path.join(tempfile.gettempdir(), "rt_layer.json"))
+    recs = []
+    for i in range(5):
+        rec = store.new_route("k", "地图 1", f"载具{i}", 0.25, 0.15 + i * 0.1)
+        rec.points = [RoutePoint(0.25 + j * 0.001, 0.15 + i * 0.1 + j * 0.0005,
+                                 j * 0.1, 10.0 + j)
+                      for j in range(300)]
+        recs.append(rec)
+    view.set_visible_tracks(recs)
+    view.set_highlight(recs)
+    view.set_player((0.3, 0.3))
+    canvas = QImage(800, 600, QImage.Format.Format_ARGB32)
+
+    seg_calls: list[int] = []
+    lay_calls: list[int] = []
+    real_seg, real_layer = mv.build_speed_segments, RouteMapView._make_layer
+    mv.build_speed_segments = lambda *a, **k: (seg_calls.append(1), real_seg(*a, **k))[1]
+    RouteMapView._make_layer = lambda self, *a, **k: (
+        lay_calls.append(1), real_layer(self, *a, **k))[1]
+    try:
+        view.render(canvas)                     # 首帧: 建缓存(底图 + 轨迹两层)
+        n_seg, n_lay = len(seg_calls), len(lay_calls)
+        assert n_seg == 5, f"5 条线各算一次分桶几何: {n_seg}"
+        assert n_lay == 2, f"底图层 + 轨迹层: {n_lay}"
+
+        # 玩家点在动(录制/预览时每个 tick 都重绘): 不该重算几何 / 重建层
+        for i in range(4):
+            view.set_player((0.3 + i * 0.001, 0.3))
+            view.render(canvas)
+        assert len(seg_calls) == n_seg, "重复重绘不该重算分桶几何"
+        assert len(lay_calls) == n_lay, "状态没变就不该重建缓存层"
+
+        # 轨迹仍画在图上(缓存层不是空白)
+        pt0 = recs[0].points[150]
+        px = view._to_px(pt0.x, pt0.y)
+        img = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img)
+        assert img.pixelColor(int(px.x()), int(px.y())) != QColor("#334455"), "轨迹应画出来"
+
+        # 悬停浮层是动态内容 → 不该拖累缓存层
+        view._hover_text = "时间 00:01.000 | 速度 20 km/h"
+        view.render(canvas)
+        assert len(lay_calls) == n_lay, "悬停不该重建轨迹层"
+        view._hover_text = None
+
+        # 缩放 → 必须重建(否则轨迹画在旧位置)
+        view._zoom = 2.5
+        view.render(canvas)
+        assert len(lay_calls) > n_lay, "缩放后必须重建缓存层"
+        before = len(lay_calls)
+
+        # 隐藏线路 → 也必须重建
+        view.set_visible_tracks(recs[:3])
+        view.set_highlight(recs[:3])
+        view.render(canvas)
+        assert len(lay_calls) > before, "隐藏线路后必须重建缓存层"
+
+        # 全清掉 → 轨迹应从画面上消失(缓存层被正确替换)
+        view.set_visible_tracks([])
+        view.set_highlight([])
+        img2 = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img2)
+        assert img2.pixelColor(int(px.x()), int(px.y())) == QColor("#334455"), "清空后不该还有轨迹"
+
+        t0 = time.perf_counter()
+        for _ in range(10):
+            view.render(canvas)
+        per = (time.perf_counter() - t0) / 10 * 1000
+        results.append(f"地图绘制缓存(5 条线重复重绘 {per:.1f} ms/帧) OK")
+    finally:
+        mv.build_speed_segments = real_seg
+        RouteMapView._make_layer = real_layer
+
+
+def test_playback_draw_cache():
+    """回放累加层: 进度推进只**补新段**, 不重建整层(否则 5 条线回放 40ms/帧)。
+
+    只有“往回拖拽 / 缩放平移 / 换回放对象”才允许重建。
+    """
+    from wt81111g.route_map_view import RouteMapView
+
+    src = QImage(64, 64, QImage.Format.Format_RGB32)
+    src.fill(QColor("#334455"))
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    src.save(buf, "PNG")
+    buf.close()
+
+    view = RouteMapView()
+    view.resize(800, 600)
+    assert view.set_map_bytes(bytes(ba))
+    store = RouteStore(os.path.join(tempfile.gettempdir(), "rt_play.json"))
+    rec = store.new_route("k", "地图 1", "Leopard 2PL", 0.2, 0.2)
+    rec.points = [RoutePoint(0.2 + i * 0.002, 0.2 + i * 0.002, i * 0.1, 20.0 + i)
+                  for i in range(200)]
+    rec.duration = 20.0
+    canvas = QImage(800, 600, QImage.Format.Format_ARGB32)
+
+    lay_calls: list[int] = []
+    real_layer = RouteMapView._make_layer
+    RouteMapView._make_layer = lambda self, *a, **k: (
+        lay_calls.append(1), real_layer(self, *a, **k))[1]
+    try:
+        view.set_playback([rec], 0.0)
+        view.render(canvas)
+        n = len(lay_calls)
+        assert n == 2, f"底图层 + 回放累加层: {n}"      # 底图 + 累加层
+
+        # ① 进度一格格推进(每帧 set_playback + 重绘) → 不该重建
+        for i in range(1, 11):
+            view.set_playback([rec], rec.duration * i / 10)
+            view.render(canvas)
+        assert len(lay_calls) == n, "回放推进不该重建累加层(只补新段)"
+
+        # ② 播放到的部分要真的画上去(颜色与未播放的半透明底衬不同)
+        pt = rec.points[-1]
+        px = view._to_px(pt.x, pt.y)
+        img_end = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_end)
+        view.set_playback([rec], 0.0)
+        img_start = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_start)
+        assert img_end.pixelColor(int(px.x()), int(px.y())) != \
+            img_start.pixelColor(int(px.x()), int(px.y())), "已播放段应覆盖未播放底衬"
+
+        # ③ 往回拖拽 → 必须重建(否则已播放的段留在图上擦不掉)
+        view.set_playback([rec], rec.duration * 0.2)
+        view.render(canvas)
+        assert len(lay_calls) > n, "往回拖拽必须重建累加层"
+        n2 = len(lay_calls)
+
+        # ④ 缩放/平移 → 必须重建
+        view._zoom = 3.0
+        view.render(canvas)
+        assert len(lay_calls) > n2, "缩放后必须重建累加层"
+        n3 = len(lay_calls)
+
+        # ⑤ 退出回放(切回预览层)再重新进入 → 累加层必须重建
+        #    (否则会拿着退出前那张残留画面继续画)
+        view.set_playback([], 0.0)
+        view.render(canvas)
+        n_exit = len(lay_calls)
+        view.set_playback([rec], 0.0)
+        view.render(canvas)
+        assert len(lay_calls) > n_exit, "重新进入回放应重建累加层"
+
+        t0 = time.perf_counter()
+        for i in range(10):
+            view.set_playback([rec], rec.duration * (i + 1) / 10)
+            view.render(canvas)
+        per = (time.perf_counter() - t0) / 10 * 1000
+        results.append(f"回放累加层(推进不重建, {per:.1f} ms/帧) OK")
+    finally:
+        RouteMapView._make_layer = real_layer
+
+
 def test_map_zoom_pan():
     """地图交互: 滚轮缩放(鼠标锚点不动) / 中键拖拽平移 / 双击复位。"""
     from PyQt6.QtCore import QEvent, QPoint, Qt
@@ -1907,10 +2084,14 @@ def test_zones_and_modes(tmpdir: str):
             ("战区攻陷", "A@0.10,0.10;B@0.20,0.20"),
             ("战区争夺", "A@0.50,0.50"),
             ("战区争夺", "A@0.70,0.70")]
-    for mode, sig in plan:
+    for i, (mode, sig) in enumerate(plan):
         rec = win.store.new_route("m2", "地图 2", "T-90M", 0.3, 0.3)
         rec.duration = 10.0
         rec.zone_count, rec.zone_signature, rec.mode_name = 2, sig, mode
+        # 时间戳**固定**(与 plan 反序 → 攻陷最新 → 侧栏里排前面)。
+        # 不能用 new_route 默认的“当前秒”: 造数据跨过整秒边界时, 侧栏按时间倒序排,
+        # 模式的先后会翻转 → 下面“前两条同版本”就会偶发失败(2026-10-08 修)
+        rec.created_at = f"2026-01-01T10:{len(plan) - i:02d}:00"
         win.store.add(rec)
     assert len(win.store.zone_layouts("m2")) == 3, "应从轨迹指纹补回 3 个版本布局"
     win._reload_tree()
@@ -2189,6 +2370,8 @@ def main() -> int:
     test_multi_playback(tmpdir)
     test_map_render()
     test_map_hover()
+    test_map_draw_cache()
+    test_playback_draw_cache()
     test_map_zoom_pan()
     test_map_switch(tmpdir)
     test_eye_visibility_opacity(tmpdir)
