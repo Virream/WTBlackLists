@@ -12,7 +12,8 @@ from bisect import bisect_right
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen, QPixmap, QPolygonF,
+    QBrush, QColor, QFont, QFontMetrics, QImage, QPainter, QPainterPath, QPen, QPixmap,
+    QPolygonF,
 )
 from PyQt6.QtWidgets import QWidget
 
@@ -72,6 +73,17 @@ PAN_MARGIN = 40.0        # 平移时地图至少需留在视野内的像素
 
 # 悬停命中半径(px): 鼠标到轨迹点的距离小于它就算“悬停在这条线上”
 HOVER_RADIUS = 18.0
+# 缓存层四周多画的反向余量(占控件尺寸比例): 拖动地图时靠偏移贴图复用整层,
+# 超出余量才重建(见 _layer_tracks / _layer_stale)
+LAYER_MARGIN = 0.35
+# 轨迹线宽(px): 归一化几何 + 缩放画笔, 实际线宽 = 它们(见 _draw_route)
+TRACK_PEN = 2.4          # 选中的/正在录的(速度配色)
+PLAY_PEN = 2.6           # 回放中已播放的段
+
+
+def _normalized(x: float, y: float) -> QPointF:
+    """`build_speed_segments` 用的“坐标变换”: 原样返回归一化坐标。"""
+    return QPointF(x, y)
 
 
 def speed_color(speed: float, vmax: float) -> QColor:
@@ -96,15 +108,17 @@ def build_speed_segments(points: list[RoutePoint], vmax: float,
     关键: 同一桶内的多段**不一定相邻**(速度波动时 A→B、C→D 同桶而 B→C 不同桶),
     因此必须用 `QPainter.drawLines(polygon)`(按点对解释为独立线段)绘制。
     若错用 `drawPolyline`, 它会把不相邻的段首尾相连, 地图上就会出现**分叉的斜线**。
+
+    实现注意: 先往普通 list 里攒点、最后一次性构造 QPolygonF ——
+    比反复 `QPolygonF.append()` 快 2~3 倍(每次 append 都是一次 Python→C++ 调用,
+    5 条线 3766 个点原本要 30ms)。
     """
-    buckets: dict[int, QPolygonF] = {}
+    tmp: dict[int, list[QPointF]] = {}
     for i in range(1, len(points)):
         a, b = points[i - 1], points[i]
         idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
-        poly = buckets.setdefault(idx, QPolygonF())
-        poly.append(to_px(a.x, a.y))
-        poly.append(to_px(b.x, b.y))
-    return buckets
+        tmp.setdefault(idx, []).extend((to_px(a.x, a.y), to_px(b.x, b.y)))
+    return {idx: QPolygonF(pts) for idx, pts in tmp.items()}
 
 
 class RouteMapView(QWidget):
@@ -145,17 +159,20 @@ class RouteMapView(QWidget):
         self._show_zones = True
         # 重生位置: [{"kind": "tank", "x": .., "y": .., "side": "ours"/"enemy"}]
         self._spawns: list[dict] = []
-        self._spawns_ver = 0        # 内容版本号(变化 → 轨迹层缓存失效)
+        self._spawns_ver = 0        # 内容版本号(变化 → 轨迹层/方块路径缓存失效)
+        self._spawn_key: tuple | None = None
+        self._spawn_cache: dict[str, QPainterPath] = {}
         self._show_spawns = True
-        # 离屏缓存层: 底图(不透明) + 轨迹/重生方块(半透明)。
-        # 每帧重画几千个线段太贵(见 _seg_cache 说明), 而这部分内容在“只动玩家点”
-        # 或“战区闪烁”时并没有变 —— 缓存后每帧只剩两次贴图。
-        self._base_layer: QPixmap | None = None
-        self._base_key: tuple | None = None
-        self._track_layer: QPixmap | None = None
+        # 离屏缓存层: 轨迹/重生方块(半透明)。每帧重画几千个线段太贵(见 _seg_cache 说明),
+        # 而这部分内容在“只动玩家点”“战区闪烁”“拖动地图”时并没有变 —— 缓存后每帧只剩两次贴图。
+        # (底图不缓存: 缩放贴图本身只要 ~0.5ms, 还省掉了一张窗口大小的位图)
+        self._track_layer: QImage | None = None
         self._track_key: tuple | None = None
-        self._play_layer: QPixmap | None = None     # 回放累加层(见 _layer_playback)
+        self._track_anchor: tuple[float, float] | None = None
+        self._paint_dpr = 0.0                       # 当前画笔设备的缩放比(建层用)
+        self._play_layer: QImage | None = None     # 回放累加层(见 _layer_playback)
         self._play_key: tuple | None = None
+        self._play_anchor: tuple[float, float] | None = None
         self._play_drawn: dict[str, int] = {}       # route_id -> 已画进累加层的点数
         # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
         self._blink_t = 0.0
@@ -434,8 +451,21 @@ class RouteMapView(QWidget):
         self.update()
 
     def _to_px(self, x: float, y: float) -> QPointF:
+        """归一化坐标 → **地图本地像素**(以地图左上角为原点, **不含平移**)。
+
+        故意不含平移: 平移只是“把整张图挪一下”, 用 `QPainter.translate` 平移画笔即可
+        —— 这样拖动地图时缓存的分桶几何/折线**完全不用重算**
+        (2026-10-08: 以前平移算进几何指纹, 拖一下就要在 Python 里重算 30ms)。
+        需要控件坐标时用 `map_pos()`。
+        """
+        w, h = self._map_size()
+        return QPointF(x * w, y * h)
+
+    def map_pos(self, x: float, y: float) -> QPointF:
+        """归一化坐标 → **控件像素坐标**(含缩放与平移); 交互命中测试与测试用。"""
         r = self._map_rect()
-        return QPointF(r.left() + x * r.width(), r.top() + y * r.height())
+        q = self._to_px(x, y)
+        return QPointF(r.left() + q.x(), r.top() + q.y())
 
     # ------------------------------------------------------------------ 绘制
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
@@ -457,11 +487,11 @@ class RouteMapView(QWidget):
                 p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._status)
                 return
 
-            base = self._layer_base()
-            if base is not None:
-                p.drawPixmap(0, 0, base)          # 底图(缓存): 一次贴图
-            else:
-                self._draw_base(p)
+            # 底图用**控件坐标**直接画(与平移无关, 也保持与旧实现逐像素一致)
+            self._draw_base(p)
+            # 其余内容都画在“地图本地坐标”里(见 _to_px) → 平移只动画笔, 不改几何缓存
+            self._paint_dpr = p.device().devicePixelRatio() or 1.0
+            p.translate(r.left(), r.top())
             # 战区会闪烁 → 不进缓存层, 每帧现画(几个菱形, 便宜); 位置在轨迹之下
             self._draw_zones(p)
             if self._playback_recs:
@@ -470,7 +500,7 @@ class RouteMapView(QWidget):
                 labels = len(self._playback_recs) <= 1
                 layer = self._layer_playback()
                 if layer is not None:
-                    p.drawPixmap(0, 0, layer)
+                    self._blit_layer(p, layer, self._play_anchor)
                     for rec in self._playback_recs:
                         self._draw_play_marks(p, rec, self._playhead, labels=labels)
                         self._draw_play_cursor(p, rec, self._playhead)
@@ -480,21 +510,29 @@ class RouteMapView(QWidget):
             else:
                 top = self._layer_tracks()
                 if top is not None:
-                    p.drawPixmap(0, 0, top)       # 重生位置 + 轨迹 + 标记(缓存)
+                    self._blit_layer(p, top, self._track_anchor)
                 else:
                     self._draw_tracks(p)
             self._draw_player(p)
 
             if self._hover_text:
                 self._draw_hover_mark(p)
-                self._draw_hover(p)
+            p.translate(-r.left(), -r.top())
+            if self._hover_text:
+                self._draw_hover(p)               # 左下角浮层用控件坐标
         finally:
             p.end()
 
     # ------------------------------------------------------------ 绘制缓存层
     def _draw_base(self, p: QPainter) -> None:
-        """底图层内容: 地图图片 + 边框。"""
+        """底图: 地图图片 + 边框(用控件坐标画, 每帧一次 —— 缩放贴图只要零点几毫秒)。
+
+        注意: 它**不使用**“地图本地坐标 + 平移画笔”那套(见 _paint), 因为直接用整张
+        地图矩形贴图既最简单, 也与旧实现逐像素一致。
+        """
         r = self._map_rect()
+        if r.isEmpty():
+            return
         p.drawPixmap(r, self._pixmap, QRectF(self._pixmap.rect()))
         p.setPen(QPen(COLOR_GRID, 1))
         p.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
@@ -518,35 +556,62 @@ class RouteMapView(QWidget):
         for rec in hi:
             self._draw_route(p, rec, history=False, vmax=self._vmax(rec), labels=labels)
 
-    def _make_layer(self, opaque: bool, draw) -> QPixmap | None:
-        """把一次绘制结果渲进离屏位图(拿不到就返回 None, 上层退回直接绘制)。"""
-        dpr = self.devicePixelRatioF() or 1.0
-        pm = QPixmap(int(round(self.width() * dpr)), int(round(self.height() * dpr)))
-        if pm.isNull():
+    def _margin(self) -> tuple[float, float]:
+        """缓存层四周的余量(像素): 拖动地图时靠偏移贴图复用, 不必重建。"""
+        return (self.width() * LAYER_MARGIN, self.height() * LAYER_MARGIN)
+
+    def _make_layer(self, draw, anchor: tuple[float, float]) -> QImage | None:
+        """把一次绘制结果渲进离屏图像(拿不到就返回 None, 上层退回直接绘制)。
+
+        * 用 **QImage** 而不是 QPixmap: 同样是 ARGB32_Premultiplied, 但往 QPixmap
+          上画在本机要慢一倍(实测 5 条线 21ms vs 12ms)。
+        * 图像比控件大一圈(`_margin`), 且用 `anchor`(=当时地图矩形左上角)定位 ——
+          之后平移范围在余量内就能直接**偏移贴图**, 一帧都不重画。
+        """
+        mx, my = self._margin()
+        dpr = self._paint_dpr or 1.0     # 与画笔设备一致 → 贴图时 1:1, 不会被重采样
+        img = QImage(int(round((self.width() + 2 * mx) * dpr)),
+                     int(round((self.height() + 2 * my) * dpr)),
+                     QImage.Format.Format_ARGB32_Premultiplied)
+        if img.isNull():
             return None
-        pm.setDevicePixelRatio(dpr)
-        pm.fill(COLOR_BG if opaque else Qt.GlobalColor.transparent)
-        lp = QPainter(pm)
+        img.setDevicePixelRatio(dpr)
+        img.fill(Qt.GlobalColor.transparent)
+        lp = QPainter(img)
         try:
             lp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            # 层覆盖“控件坐标 [-余量, 尺寸+余量]”这一块: 地图本地坐标 + 锚点 + 余量 = 层像素
+            lp.translate(anchor[0] + mx, anchor[1] + my)
             draw(lp)
         except Exception:  # noqa: BLE001
             log.exception("绘制缓存层失败")
             return None
         finally:
             lp.end()
-        return pm
+        return img
 
-    def _layer_base(self) -> QPixmap | None:
-        """底图层(地图图片): 只有几何变化才重建。"""
-        key = self._geom_key()
-        if self._base_layer is None or self._base_key != key:
-            self._base_layer = self._make_layer(True, self._draw_base)
-            self._base_key = key
-        return self._base_layer
+    def _blit_layer(self, p: QPainter, layer: QImage, anchor: tuple[float, float]) -> None:
+        """把缓存层贴到当前视图(画笔已平移到地图本地坐标)。
+
+        显式给出目标矩形: 层图带 devicePixelRatio(高 DPI 屏上 1.5/2.0),
+        用 `drawImage(QPointF, img)` 不一定会按逻辑尺寸贴(实测 150% 缩放下会偏)。
+        """
+        mx, my = self._margin()
+        dpr = layer.devicePixelRatio() or 1.0
+        p.drawImage(QRectF(-mx - anchor[0], -my - anchor[1],
+                           layer.width() / dpr, layer.height() / dpr),
+                    layer, QRectF(0, 0, layer.width(), layer.height()))
+
+    def _layer_stale(self, anchor: tuple[float, float] | None) -> bool:
+        """层的定位锚点离当前位置太远(超出余量)→ 必须重新渲染。"""
+        if anchor is None:
+            return True
+        mx, my = self._margin()
+        r = self._map_rect()
+        return (abs(r.left() - anchor[0]) > mx or abs(r.top() - anchor[1]) > my)
 
     def _tracks_key(self) -> tuple:
-        """轨迹层的内容指纹(点数/标记数/回放进度/重生方块都在内)。"""
+        """轨迹层的内容指纹(点数/标记数/回放进度/重生方块都在内) —— **不含平移**。"""
         live = self._live
 
         def sig(recs) -> tuple:
@@ -558,25 +623,27 @@ class RouteMapView(QWidget):
                 round(self._playhead, 3) if self._playback_recs else None,
                 self._show_spawns, self._spawns_ver)
 
-    def _layer_tracks(self) -> QPixmap | None:
-        """轨迹层(半透明): 缩放/平移/尺寸/轨迹/回放进度/重生方块变了才重建。"""
+    def _layer_tracks(self) -> QImage | None:
+        """轨迹层(半透明, 带余量): 内容或定位超出余量才重建。"""
         key = self._tracks_key()
-        if self._track_layer is None or self._track_key != key:
-            self._track_layer = self._make_layer(False, self._draw_tracks)
+        if (self._track_layer is None or self._track_key != key
+                or self._layer_stale(self._track_anchor)):
+            self._track_anchor = (self._map_rect().left(), self._map_rect().top())
+            self._track_layer = self._make_layer(self._draw_tracks, self._track_anchor)
             self._track_key = key
         return self._track_layer
 
     def _drop_layers(self) -> None:
-        self._base_layer = None
-        self._base_key = None
         self._track_layer = None
         self._track_key = None
+        self._track_anchor = None
         self._play_layer = None
         self._play_key = None
+        self._play_anchor = None
         self._play_drawn = {}
 
     def _play_layer_key(self) -> tuple:
-        return (self._geom_key(), tuple(r.route_id for r in self._playback_recs),
+        return (self._geom_key(), tuple(r0.route_id for r0 in self._playback_recs),
                 self._show_spawns, self._spawns_ver)
 
     def _draw_play_static(self, p: QPainter) -> None:
@@ -589,28 +656,32 @@ class RouteMapView(QWidget):
             k, _mid = self._played_prefix(rec, self._playhead)
             self._extend_play(p, rec, 0, k)
 
-    def _layer_playback(self) -> QPixmap | None:
+    def _layer_playback(self) -> QImage | None:
         """回放**累加层**(半透明): 未播放底衬 + 已播放的着色段。
 
         回放时进度每帧都在推进, 而“已播放”是只增不减的前缀 —— 于是把画好的部分
-        **留在位图里**, 每帧只补新播放到的几段。否则每帧都要重画全部已播放线段
+        **留在图像里**, 每帧只补新播放到的几段。否则每帧都要重画全部已播放线段
         (5 条线要 35ms/帧, 30fps 下必卡)。
-        往回拖拽 / 缩放平移 / 换底图 / 换回放对象 → 重建。
+        往回拖拽 / 定位超出余量 / 缩放 / 换底图 / 换回放对象 → 重建。
         """
         key = self._play_layer_key()
         back = any(self._played_prefix(r, self._playhead)[0]
                    < self._play_drawn.get(r.route_id, 0) for r in self._playback_recs)
-        if self._play_layer is None or self._play_key != key or back:
+        if (self._play_layer is None or self._play_key != key or back
+                or self._layer_stale(self._play_anchor)):
             self._play_drawn = {}
-            self._play_layer = self._make_layer(False, self._draw_play_static)
+            self._play_anchor = (self._map_rect().left(), self._map_rect().top())
+            self._play_layer = self._make_layer(self._draw_play_static, self._play_anchor)
             self._play_key = key
             if self._play_layer is None:
                 return None
             for rec in self._playback_recs:          # 记下已经画到哪
                 self._play_drawn[rec.route_id], _ = self._played_prefix(rec, self._playhead)
+        mx, my = self._margin()
         p = QPainter(self._play_layer)
         try:
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.translate(self._play_anchor[0] + mx, self._play_anchor[1] + my)
             for rec in self._playback_recs:
                 k, _mid = self._played_prefix(rec, self._playhead)
                 done = self._play_drawn.get(rec.route_id, 0)
@@ -622,17 +693,30 @@ class RouteMapView(QWidget):
         return self._play_layer
 
     def _geom_key(self) -> tuple:
-        """几何指纹: 缩放/平移/窗口尺寸/底图任何一个变了, 缓存的像素坐标就失效。"""
-        return (round(self._zoom, 6), round(self._pan_x, 3), round(self._pan_y, 3),
-                self.width(), self.height(), self._map_digest)
+        """**像素坐标**的几何指纹: 缩放/窗口尺寸/底图变了, 缓存像素的东西就失效。
 
-    def _sync_geom_cache(self) -> None:
-        """几何变了就清空像素坐标缓存(否则轨迹会画在旧位置)。"""
-        geom = self._geom_key()
-        if geom != self._geom:
-            self._geom = geom
-            self._seg_cache.clear()
-            self._line_cache.clear()
+        只有需要真实像素的东西靠它(战区/重生方块的路径);
+        轨迹的分桶几何是**归一化**的, 不靠它 —— 缩放拖动都不用重算。
+        不含平移: 平移只动画笔(`QPainter.translate`)。
+        """
+        return (round(self._zoom, 6), self.width(), self.height(), self._map_digest)
+
+    def _px_scale(self) -> float:
+        """归一化坐标 → 像素的缩放比 = 地图在屏幕上的边长(宽高均值, 用于线宽补偿)。"""
+        w, h = self._map_size()
+        return (w + h) / 2.0
+
+    def _scaled(self, p: QPainter) -> bool:
+        """进入“归一化坐标 × 地图边长”的坐标系(用于画轨迹折线)。
+
+        返回 False 表示地图尺寸无效(调用方直接跳过)。调用方负责 `p.restore()`。
+        """
+        w, h = self._map_size()
+        if w <= 0 or h <= 0:
+            return False
+        p.save()
+        p.scale(w, h)
+        return True
 
     def _vmax(self, rec: RouteRecord) -> float:
         """该轨迹的峰值速度(速度配色的基准), 按记录 + 点数缓存。"""
@@ -645,30 +729,33 @@ class RouteMapView(QWidget):
         return value
 
     def _speed_segments(self, rec: RouteRecord, vmax: float) -> dict[int, QPolygonF]:
-        """按速度分桶的轨迹几何(缓存版, 见 `build_speed_segments`)。"""
-        self._sync_geom_cache()
+        """按速度分桶的轨迹几何(**归一化坐标**, 缓存; 见 `build_speed_segments`)。
+
+        归一化的好处: 缩放 / 改窗口大小 / 拖动都**不用重算几何** —— 画的时候
+        用 `p.scale(s, s)` 缩放画笔、并把线宽设为 `宽度 / s` 即可
+        (否则每次滚轮缩放都要在 Python 里重算 3766 个点)。
+        """
         n = len(rec.points)
         got = self._seg_cache.get(rec.route_id)
         if got is None or got[0] != n:
-            got = (n, build_speed_segments(rec.points, vmax, self._to_px))
+            got = (n, build_speed_segments(rec.points, vmax, _normalized))
             self._seg_cache[rec.route_id] = got
         return got[1]
 
-    def _gray_line(self, rec: RouteRecord) -> QPolygonF:
-        """整条轨迹的像素折线(同样缓存): 灰色历史轨迹与回放未播放段共用。
+    def _px_line(self, rec: RouteRecord) -> QPolygonF:
+        """整条轨迹的归一化折线(同样缓存): 灰色历史轨迹与回放未播放段共用。
 
-        注意: 只取几何, 颜色由调用方自己设 —— 回放里它是半透明淡色的底衬。
+        注意: 只取几何, 颜色/线宽由调用方自己设 —— 回放里它是半透明淡色的底衬。
         """
-        self._sync_geom_cache()
         n = len(rec.points)
         got = self._line_cache.get(rec.route_id)
         if got is None or got[0] != n:
-            got = (n, QPolygonF([self._to_px(pt.x, pt.y) for pt in rec.points]))
+            got = (n, QPolygonF([QPointF(pt.x, pt.y) for pt in rec.points]))
             self._line_cache[rec.route_id] = got
         return got[1]
 
-    # 回放几何缓存用的别名(名字更贴切)
-    _px_line = _gray_line
+    # 旧名(灰色历史轨迹就是这条折线)
+    _gray_line = _px_line
 
     def _times(self, rec: RouteRecord) -> list[float]:
         """轨迹点的时间列表(缓存; 回放每帧要用它二分找已播放前缀)。"""
@@ -693,19 +780,23 @@ class RouteMapView(QWidget):
         """把 [done, k) 这些**已播放**的段按速度配色画上去(回放每帧只补新段)。"""
         pts = rec.points
         vmax = self._vmax(rec)
-        buckets: dict[int, QPolygonF] = {}
+        buckets: dict[int, list[QPointF]] = {}
         for i in range(max(1, done), k):
             a, b = pts[i - 1], pts[i]
             idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
-            poly = buckets.setdefault(idx, QPolygonF())
-            poly.append(self._to_px(a.x, a.y))
-            poly.append(self._to_px(b.x, b.y))
-        for idx, poly in buckets.items():
-            speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
-            p.setPen(QPen(speed_color(speed, vmax), 2.6,
-                          Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                          Qt.PenJoinStyle.RoundJoin))
-            p.drawLines(poly)
+            buckets.setdefault(idx, []).extend((QPointF(a.x, a.y), QPointF(b.x, b.y)))
+        if not buckets or not self._scaled(p):
+            return
+        s = self._px_scale()
+        try:
+            for idx, pts_px in buckets.items():
+                speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
+                p.setPen(QPen(speed_color(speed, vmax), PLAY_PEN / s,
+                              Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                              Qt.PenJoinStyle.RoundJoin))
+                p.drawLines(QPolygonF(pts_px))
+        finally:
+            p.restore()
 
     def _draw_play_underlay(self, p: QPainter, rec: RouteRecord) -> None:
         """未播放部分的底衬: 整条轨迹的半透明描边。
@@ -714,9 +805,13 @@ class RouteMapView(QWidget):
         不透明的速度配色盖在上面, 效果与“只画未播放段”一致, 但省掉了每帧构造
         未播放段多边形的开销。
         """
-        if len(rec.points) >= 2:
-            p.setPen(QPen(COLOR_UNPLAYED, 2.0))
+        if len(rec.points) < 2 or not self._scaled(p):
+            return
+        try:
+            p.setPen(QPen(COLOR_UNPLAYED, 2.0 / self._px_scale()))
             p.drawPolyline(self._px_line(rec))
+        finally:
+            p.restore()
 
     def _draw_play_marks(self, p: QPainter, rec: RouteRecord, head: float,
                          labels: bool = True) -> None:
@@ -767,21 +862,25 @@ class RouteMapView(QWidget):
     def _draw_route(self, p: QPainter, rec: RouteRecord, history: bool, vmax: float,
                     labels: bool = True) -> None:
         pts = rec.points
-        if len(pts) >= 2:
-            if history:
-                # 选中的历史轨迹: 不透明(半透明只用于回放中未播放的段)
-                p.setPen(QPen(COLOR_HISTORY, 2.0,
-                              Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
-                              Qt.PenJoinStyle.RoundJoin))
-                p.drawPolyline(self._gray_line(rec))
-            else:
-                # 按速度分桶着色; 每段独立绘制(见 build_speed_segments 说明)
-                for idx, poly in self._speed_segments(rec, vmax).items():
-                    speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
-                    p.setPen(QPen(speed_color(speed, vmax), 2.4,
+        if len(pts) >= 2 and self._scaled(p):
+            s = self._px_scale()
+            try:
+                if history:
+                    # 未选中的历史轨迹: 不透明灰蓝(半透明只用于回放中未播放的段)
+                    p.setPen(QPen(COLOR_HISTORY, 2.0 / s,
                                   Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
                                   Qt.PenJoinStyle.RoundJoin))
-                    p.drawLines(poly)
+                    p.drawPolyline(self._px_line(rec))
+                else:
+                    # 按速度分桶着色; 每段独立绘制(见 build_speed_segments 说明)
+                    for idx, poly in self._speed_segments(rec, vmax).items():
+                        speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
+                        p.setPen(QPen(speed_color(speed, vmax), TRACK_PEN / s,
+                                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                      Qt.PenJoinStyle.RoundJoin))
+                        p.drawLines(poly)
+            finally:
+                p.restore()
 
         for mk in rec.marks:
             # 起点圈对**所有**轨迹都要画: 以前只画实时轨迹, 导致同一张图上
@@ -831,7 +930,28 @@ class RouteMapView(QWidget):
         if not self._show_spawns or not self._spawns:
             return
         dark = QColor(15, 23, 42, 200)      # 深色垫底描边(浅色底图上也能看清)
-        paths: dict[str, QPainterPath] = {}     # 按归属分堆(QColor 不可作字典键)
+        paths = self._spawn_paths()
+        if not paths:
+            return
+        p.setBrush(Qt.BrushStyle.NoBrush)      # 空心
+        p.setPen(QPen(dark, SPAWN_PEN + 1.4))
+        for path in paths.values():
+            p.drawPath(path)
+        for side, path in paths.items():
+            color = SPAWN_SIDE_COLORS.get(side, SPAWN_SIDE_COLORS["neutral"])
+            p.setPen(QPen(color, SPAWN_PEN))
+            p.drawPath(path)
+
+    def _spawn_paths(self) -> dict[str, QPainterPath]:
+        """重生方块按归属色分堆的路径 —— 缓存(只跟缩放/尺寸/方块内容有关)。
+
+        一局 128 个方块: 逐个 drawRect 要 ~3ms, 合成路径后每帧只剩两次 drawPath;
+        再缓存住路径, 拖动/闪烁时连合成都不用做。
+        """
+        key = (self._geom_key(), self._spawns_ver)
+        if self._spawn_key == key:
+            return self._spawn_cache
+        paths: dict[str, QPainterPath] = {}    # 按归属分堆(QColor 不可作字典键)
         for s in self._spawns:
             try:
                 x, y = float(s["x"]), float(s["y"])
@@ -842,14 +962,9 @@ class RouteMapView(QWidget):
             path = paths.setdefault(side, QPainterPath())
             path.addRect(QRectF(c.x() - SPAWN_HALF, c.y() - SPAWN_HALF,
                                 SPAWN_HALF * 2, SPAWN_HALF * 2))
-        p.setBrush(Qt.BrushStyle.NoBrush)      # 空心
-        p.setPen(QPen(dark, SPAWN_PEN + 1.4))
-        for path in paths.values():
-            p.drawPath(path)
-        for side, path in paths.items():
-            color = SPAWN_SIDE_COLORS.get(side, SPAWN_SIDE_COLORS["neutral"])
-            p.setPen(QPen(color, SPAWN_PEN))
-            p.drawPath(path)
+        self._spawn_key = key
+        self._spawn_cache = paths
+        return paths
 
     def _draw_zones(self, p: QPainter) -> None:
         """画战区: 小菱形 + 中心字母(A/B/C, 由 8111 的 zone_label 提供)。
@@ -1039,7 +1154,10 @@ class RouteMapView(QWidget):
 
         以前只看实时轨迹 / 第一条可见轨迹 —— 于是只剩“刚录完那条”有提示,
         其它眼睛点亮的线路移上去没反应(2026-10-07 修)。
+        注意: `_to_px` 给的是“地图本地像素”(不含平移), 所以先把鼠标位置换算过去。
         """
+        r = self._map_rect()
+        mx, my = mx - r.left(), my - r.top()
         best: tuple[RouteRecord, RoutePoint] | None = None
         best_d2 = HOVER_RADIUS ** 2
         for rec in self._hover_candidates():

@@ -426,7 +426,7 @@ def test_map_hover():
     view.set_visible_tracks([a, b])
 
     def move_to(pt) -> None:
-        c = view._to_px(pt.x, pt.y)
+        c = view.map_pos(pt.x, pt.y)          # _to_px 是地图本地坐标, 鼠标事件要控件坐标
         view.mouseMoveEvent(QMouseEvent(
             QEvent.Type.MouseMove, c, c, Qt.MouseButton.NoButton,
             Qt.MouseButton.NoButton, Qt.KeyboardModifier.NoModifier))
@@ -463,6 +463,14 @@ def test_map_hover():
     move_to(a.points[2])
     assert view._hover_rec is a and "T-72B" in view._hover_text
     view.set_playback(None)
+
+    # ⑥ 平移后仍然命中正确的位置(命中测试要把鼠标坐标换算到地图本地坐标)
+    view._pan_x, view._pan_y = -60.0, 35.0
+    move_to(b.points[1])
+    assert view._hover_rec is b, "平移后悬停仍应命中同一条线"
+    assert fmt_time_ms(b.points[1].t) in view._hover_text
+    view.reset_view()
+
     view.leaveEvent(None)
     assert view._hover_text is None
     results.append("地图悬停(任意显示中的线路 + 车型/用时) OK")
@@ -508,10 +516,10 @@ def test_map_draw_cache():
     RouteMapView._make_layer = lambda self, *a, **k: (
         lay_calls.append(1), real_layer(self, *a, **k))[1]
     try:
-        view.render(canvas)                     # 首帧: 建缓存(底图 + 轨迹两层)
+        view.render(canvas)                     # 首帧: 建轨迹缓存层(底图每帧直接贴, 不缓存)
         n_seg, n_lay = len(seg_calls), len(lay_calls)
         assert n_seg == 5, f"5 条线各算一次分桶几何: {n_seg}"
-        assert n_lay == 2, f"底图层 + 轨迹层: {n_lay}"
+        assert n_lay == 1, f"只有轨迹层一张: {n_lay}"
 
         # 玩家点在动(录制/预览时每个 tick 都重绘): 不该重算几何 / 重建层
         for i in range(4):
@@ -522,7 +530,7 @@ def test_map_draw_cache():
 
         # 轨迹仍画在图上(缓存层不是空白)
         pt0 = recs[0].points[150]
-        px = view._to_px(pt0.x, pt0.y)
+        px = view.map_pos(pt0.x, pt0.y)
         img = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img)
         assert img.pixelColor(int(px.x()), int(px.y())) != QColor("#334455"), "轨迹应画出来"
@@ -533,13 +541,30 @@ def test_map_draw_cache():
         assert len(lay_calls) == n_lay, "悬停不该重建轨迹层"
         view._hover_text = None
 
-        # 缩放 → 必须重建(否则轨迹画在旧位置)
+        # 拖动(平移)在余量内 → **一帧都不重建**(2026-10-08: 靠偏移贴图)
+        view._pan_x, view._pan_y = 60.0, 40.0
+        for i in range(6):
+            view._pan_x += 12.0
+            view.render(canvas)
+        assert len(lay_calls) == n_lay, "拖动不该重建缓存层(余量内只贴图)"
+        assert len(seg_calls) == n_seg, "拖动更不该重算分桶几何"
+
+        # 拖出余量 → 必须重建(否则边缘会出现空白/旧内容)
+        view._pan_x += view.width()
+        view.render(canvas)
+        assert len(lay_calls) > n_lay, "拖出余量后必须重建缓存层"
+        view.reset_view()
+        view.render(canvas)
+        n_lay = len(lay_calls)
+
+        # 缩放 → 必须重建层, 但**几何是归一化的, 不该重算分桶几何**
         view._zoom = 2.5
         view.render(canvas)
         assert len(lay_calls) > n_lay, "缩放后必须重建缓存层"
+        assert len(seg_calls) == n_seg, "缩放不该重算分桶几何(归一化 + 缩放画笔)"
         before = len(lay_calls)
 
-        # 隐藏线路 → 也必须重建
+        # 隐藏线路 → 也必须重建(几何仍缓存着)
         view.set_visible_tracks(recs[:3])
         view.set_highlight(recs[:3])
         view.render(canvas)
@@ -595,7 +620,7 @@ def test_playback_draw_cache():
         view.set_playback([rec], 0.0)
         view.render(canvas)
         n = len(lay_calls)
-        assert n == 2, f"底图层 + 回放累加层: {n}"      # 底图 + 累加层
+        assert n == 1, f"回放累加层一张(底图每帧直接贴): {n}"
 
         # ① 进度一格格推进(每帧 set_playback + 重绘) → 不该重建
         for i in range(1, 11):
@@ -605,7 +630,7 @@ def test_playback_draw_cache():
 
         # ② 播放到的部分要真的画上去(颜色与未播放的半透明底衬不同)
         pt = rec.points[-1]
-        px = view._to_px(pt.x, pt.y)
+        px = view.map_pos(pt.x, pt.y)
         img_end = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img_end)
         view.set_playback([rec], 0.0)
