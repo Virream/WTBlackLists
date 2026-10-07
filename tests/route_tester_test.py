@@ -538,6 +538,24 @@ def test_multi_playback(tmpdir: str):
     results.append("多轨迹同时回放(统一时间轴/最长决定结束/跨轨迹下一标记) OK")
 
 
+def test_single_instance():
+    """单实例锁: 同名锁第二次必须判为“已在运行”。
+
+    用**独立的名字**: 不能去碰真实的那把锁 —— 万一用户正开着程序, 本测试会
+    把它判成“已在运行”并且真的去请求置前(甚至弹出“已在运行中”提示)。
+    """
+    from wt81111g.route_instance import acquire_mutex, release_mutex
+
+    name = f"WTRouteTester_Test_{os.getpid()}"
+    first, h1 = acquire_mutex(name)
+    second, h2 = acquire_mutex(name)
+    assert first is True, "第一次取锁应成功"
+    assert second is False, "第二次取同名锁应判为已在运行"
+    release_mutex(h1)
+    release_mutex(h2)
+    results.append("单实例锁(同名第二次判为已在运行) OK")
+
+
 def test_tree_expand_state(tmpdir: str):
     """侧栏重建后要保住展开/折叠状态。
 
@@ -1906,6 +1924,7 @@ def main() -> int:
     test_refresh_rate()
     test_global_hotkey()
     test_sound(tmpdir)
+    test_single_instance()
     test_track_segments()
     test_point_at_and_split()
     test_playback()

@@ -16,6 +16,10 @@
 
 启动: `python route_tester.py`;打包版 `WTRouteTester.exe`(见 §10)。
 
+> **单实例**: 只允许运行一份 —— 重复启动不会开出第二个窗口, 而是把已有窗口调到前面
+> (全屏游戏里抢不到焦点时闪任务栏) + 弹“程序已在运行中”。与黑名单主程序的单实例
+> 互不影响, 两个程序可同时开。实现见 §12 `wt81111g/route_instance.py`。
+
 ---
 
 ## 2. 界面布局
@@ -216,6 +220,7 @@
 | `wt81111g/help_text.py` | 「关于 / 功能说明」正文 |
 | `wt81111g/sound.py` | 提示音(系统音效文件 / 音量重采样 / 开关与自定义文件) |
 | `wt81111g/sound_dialog.py` | 「音效设置」对话框 |
+| `wt81111g/route_instance.py` | 单实例锁(命名互斥体)+ 第二次启动时枚举窗口把已有窗口调到前面(纯 Win32, 不用 QtNetwork) |
 | `wt81111g/global_hotkey.py`、`sound.py`、`config.py`、`api8111.py` | 快捷键、提示音、路径与 8111 客户端 |
 | `tools/make_app_icon.py` | PNG → 多尺寸 ICO(打包图标) |
 | `tests/route_tester_test.py` | 离屏回归测试(25 项) |

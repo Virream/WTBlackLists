@@ -7,6 +7,9 @@
 依赖: PyQt6(项目既有依赖), 无需任何额外第三方库。
 游戏需运行并开启 8111 本地接口(战争雷霆默认开启)。
 
+**单实例**: 已经有窗口在跑时, 再启动只会把那一份调到前面并退出(见 route_instance.py);
+与黑名单主程序的单实例互不影响, 两个程序可以同时开。
+
 日志: <data>/route_tester.log —— 打包版是 --windowed(无控制台),
       出错时靠该日志排查。
 """
@@ -19,6 +22,7 @@ from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from wt81111g.config import data_dir, resource_path
+from wt81111g.route_instance import SingleInstance
 from wt81111g.route_store import RouteStore
 from wt81111g.route_window import RouteTesterWindow
 
@@ -77,6 +81,18 @@ def main() -> int:
             log.info("窗口图标已加载: %s", icon_path)
     else:
         log.warning("窗口图标资源缺失: %s", icon_path)
+
+    # 单实例: 已经有窗口在跑 → 把那一份调到前面, 然后本进程直接退出
+    # (不能开第二份: 两个进程同时轮询 8111 / 同时录制会互相抢地图与数据)
+    instance = SingleInstance()
+    if not instance.is_primary:
+        instance.focus_existing()
+        QMessageBox.information(
+            None, "跑图线路测试器",
+            "程序已在运行中。\n\n已尝试把已打开的窗口调到前面 —— "
+            "如果没看到它, 请检查任务栏或按 Alt+Tab。",
+        )
+        return 0
 
     try:
         win = RouteTesterWindow(RouteStore())
