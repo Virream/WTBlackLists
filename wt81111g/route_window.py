@@ -57,6 +57,8 @@ INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
 _ROLE_KIND = Qt.ItemDataRole.UserRole
 _ROLE_ID = Qt.ItemDataRole.UserRole + 1
 _ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 版本(战区布局)的坐标指纹
+# 分组行的稳定标识(地图/模式/版本): 侧栏重建后用它对上“原来折起来的是哪几个分组”
+_ROLE_KEY = Qt.ItemDataRole.UserRole + 3
 
 # 层级行(地图/模式/版本)只当“分组标题”: 可点击展开、可右键, 但**不可被选中** ——
 # 否则多选时会把标题行也选进去(回放/基准只应以轨迹条目为单位)。
@@ -488,6 +490,9 @@ class RouteTesterWindow(QMainWindow):
         yield from walk(root)
 
     def _reload_tree(self) -> None:
+        # 重建前先记住哪些分组是折叠的: 「地图管理」关掉、录完一条轨迹、改名或删除
+        # 之后都会走这里重建侧栏, 否则用户刚折起来的分组会被全部重新展开。
+        folded = self._folded_keys()
         self.tree.blockSignals(True)
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
@@ -498,6 +503,7 @@ class RouteTesterWindow(QMainWindow):
             top = QTreeWidgetItem(["", self.store.display_name(map_key), f"{total} 条"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
+            top.setData(0, _ROLE_KEY, f"map|{map_key}")
             top.setFlags(GROUP_ITEM_FLAGS)
             f = QFont()
             f.setBold(True)
@@ -508,6 +514,7 @@ class RouteTesterWindow(QMainWindow):
                 mid = QTreeWidgetItem(["", mode_label, f"{n_mode} 条"])
                 mid.setData(0, _ROLE_KIND, "mode")
                 mid.setData(0, _ROLE_ID, map_key)
+                mid.setData(0, _ROLE_KEY, f"mode|{map_key}|{mode_label}")
                 mid.setFlags(GROUP_ITEM_FLAGS)
                 mid.setToolTip(_COL_NAME,
                                f"{self.store.display_name(map_key)} · {mode_label}\n"
@@ -519,6 +526,7 @@ class RouteTesterWindow(QMainWindow):
                     var.setData(0, _ROLE_KIND, "variant")
                     var.setData(0, _ROLE_ID, map_key)
                     var.setData(0, _ROLE_SIG, sig)
+                    var.setData(0, _ROLE_KEY, f"variant|{map_key}|{sig}")
                     var.setFlags(GROUP_ITEM_FLAGS)
                     var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
                     mid.addChild(var)
@@ -534,9 +542,7 @@ class RouteTesterWindow(QMainWindow):
                                          f"{rec.vehicle} | 用时 {fmt_time(rec.duration)}")
                         var.addChild(child)
                         alive.add(rec.route_id)
-                    var.setExpanded(True)
-                mid.setExpanded(True)
-            top.setExpanded(True)
+        # 展开/折叠统一放在重建末尾恢复(见 _restore_folded)
         # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
         # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
         # 顺便把它们**已见过的模式版本**也挂上(0 条) —— 还没录到轨迹时就能右键
@@ -547,6 +553,7 @@ class RouteTesterWindow(QMainWindow):
             top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
+            top.setData(0, _ROLE_KEY, f"map|{map_key}")
             top.setFlags(GROUP_ITEM_FLAGS)
             f = QFont()
             f.setBold(True)
@@ -570,11 +577,12 @@ class RouteTesterWindow(QMainWindow):
                 var.setData(0, _ROLE_KIND, "variant")
                 var.setData(0, _ROLE_ID, map_key)
                 var.setData(0, _ROLE_SIG, sig)
+                var.setData(0, _ROLE_KEY, f"variant|{map_key}|{sig}")
                 var.setFlags(GROUP_ITEM_FLAGS)
                 var.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
                 var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
                 top.addChild(var)
-            top.setExpanded(True)
+        self._restore_folded(folded)
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
         if self._anchor is not None and not any(
@@ -584,6 +592,36 @@ class RouteTesterWindow(QMainWindow):
         self._refresh_anchor_icon()      # 图钉要跟着基准标回对应版本行
         self._refresh_map_tracks()
         self._on_tree_selection_changed()
+
+    def _folded_keys(self) -> set[str]:
+        """当前被**折叠**的分组标识(`_ROLE_KEY`); 用于侧栏重建后恢复展开状态。"""
+        folded: set[str] = set()
+
+        def walk(item: QTreeWidgetItem) -> None:
+            key = item.data(0, _ROLE_KEY)
+            if key and not item.isExpanded():
+                folded.add(key)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            walk(root.child(i))
+        return folded
+
+    def _restore_folded(self, folded: set[str]) -> None:
+        """按 `folded` 恢复展开状态: **默认展开**(新出现的地图/模式/版本直接可见),
+        只有原先就被用户折起来的分组保持折叠。"""
+        def walk(item: QTreeWidgetItem) -> None:
+            key = item.data(0, _ROLE_KEY)
+            if key:
+                item.setExpanded(key not in folded)
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            walk(root.child(i))
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, col: int) -> None:
         """点击第一列的**眼睛图标** → 切换该轨迹在地图上的显示/隐藏。"""

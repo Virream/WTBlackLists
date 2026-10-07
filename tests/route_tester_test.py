@@ -538,6 +538,57 @@ def test_multi_playback(tmpdir: str):
     results.append("多轨迹同时回放(统一时间轴/最长决定结束/跨轨迹下一标记) OK")
 
 
+def test_tree_expand_state(tmpdir: str):
+    """侧栏重建后要保住展开/折叠状态。
+
+    回归: `_reload_tree` 以前对每个分组硬编码 setExpanded(True), 于是一旦重建
+    (关掉「地图管理」、录完一条轨迹、改名、删除都会走这里), 用户刚折起来的
+    层级就被全部展开。
+    """
+    win = make_window(tmpdir, "win_expand.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    for i, veh in enumerate(("T-72B", "M1A1")):
+        rec = win.store.new_route("k1", "地图 1", veh, 0.2 + i * 0.1, 0.3)
+        rec.duration = 30.0 + i
+        win.store.add(rec)
+    rec = win.store.new_route("k2", "地图 2", "BMP-2", 0.5, 0.5)
+    rec.duration = 20.0
+    win.store.add(rec)
+    win._reload_tree()
+
+    # 新建出来的侧栏默认全展开
+    assert win.tree.topLevelItemCount() == 2
+    top0 = win.tree.topLevelItem(0)
+    assert top0.isExpanded() and top0.child(0).isExpanded()
+    assert top0.child(0).child(0).isExpanded()
+
+    # 折叠第一个地图 + 它的模式层; 第二个地图保持展开
+    top0.setExpanded(False)
+    top0.child(0).setExpanded(False)
+    # 走真实路径(只把模态对话框的 exec 换成"立刻关掉"): 「地图管理」关掉后重建侧栏
+    real_exec = rw.MapManagerDialog.exec
+    rw.MapManagerDialog.exec = lambda self: None
+    try:
+        win._open_map_manager()
+    finally:
+        rw.MapManagerDialog.exec = real_exec
+
+    top0 = win.tree.topLevelItem(0)
+    assert not top0.isExpanded(), "重建后应仍折叠着"
+    assert not top0.child(0).isExpanded(), "模式层也应仍折叠着"
+    assert win.tree.topLevelItem(1).isExpanded(), "没折叠的分组仍应展开"
+    assert win.tree.topLevelItem(1).child(0).child(0).isExpanded()
+
+    # 再展开回去 → 重建后也应保持展开
+    top0.setExpanded(True)
+    win._reload_tree()
+    assert win.tree.topLevelItem(0).isExpanded()
+    win.close()
+    results.append("侧栏重建后保持展开/折叠状态 OK")
+
+
 def test_window(tmpdir: str):
     win = make_window(tmpdir, "win_routes.json")
     win.recorder.stop()               # 关闭真实 8111 轮询
@@ -1872,6 +1923,7 @@ def main() -> int:
     test_map_manager(tmpdir)
     test_eye_icon_no_overlap(tmpdir)
     test_eye_click(tmpdir)
+    test_tree_expand_state(tmpdir)
     test_window(tmpdir)
     for line in results:
         print("[OK]", line)
