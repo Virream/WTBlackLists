@@ -3,7 +3,14 @@
 通过 user32.GetAsyncKeyState 定时轮询按键状态实现:
 - **可区分左右修饰键**(如"右 Shift"),这是 RegisterHotKey 做不到的;
 - 无需消息钩子,不拦截按键,游戏仍能收到该按键;
-- 采用"边沿触发"(松开→按下 瞬间才触发一次),避免长按重复。
+- **不要求组合键同时被按住**: 游戏里常是先按住 W 再按右Shift+小键盘 ——
+  判定只看"修饰键 + 小键盘键",与其它按键(W/鼠标…)无关。
+
+可靠性: GetAsyncKeyState 返回值的**最低位**表示"自上次调用以来该键被按过"。
+主线程被游戏挤占、定时器被拖到几百毫秒才跑一次时,这一位也不会丢 ——
+所以即使按下的一瞬间没被采样到,下一次轮询仍能发现"刚按过"并触发;
+修饰键同样看这一位(右Shift 与小键盘键"在同一个被拖长的间隔里都按过"也算命中)。
+反过来只用"当前是否按住"判定会漏按 —— 这是以前的写法, 游戏里经常按了没反应。
 
 小键盘兼容:NumLock 开启时小键盘 1/2/3 是 VK_NUMPAD1/2/3,
 关闭时退化为 End/Down/PageDown,因此每个键同时监听两种虚拟键码。
@@ -14,7 +21,7 @@ import ctypes
 import logging
 import sys
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal
 
 log = logging.getLogger("global_hotkey")
 
@@ -69,16 +76,23 @@ def describe_binding(binding: tuple[str, str]) -> str:
 
 
 class GlobalHotkeyWatcher(QObject):
-    """全局快捷键轮询器: 命中时发出 triggered(动作名)。"""
+    """全局快捷键轮询器: 命中时发出 triggered(动作名)。
+
+    触发条件 = 小键盘键"刚按下或正按住" **且** 其修饰键"刚按下或正按住"。
+    同理, 与其它按键无关 —— 一直按着 W 前进时照样能触发。
+    按住不放只触发一次, 松开(或再按一次)后才会再触发。
+    """
 
     triggered = pyqtSignal(str)
 
     def __init__(self, bindings: dict[str, tuple[str, str]] | None = None,
-                 interval_ms: int = 25, parent=None):
+                 interval_ms: int = 20, parent=None):
         super().__init__(parent)
         self.bindings = dict(bindings or DEFAULT_BINDINGS)
-        self._interval = max(10, int(interval_ms))
-        self._state: dict[str, bool] = {a: False for a in self.bindings}
+        # 20ms 足够跟手(人按一下也有几十毫秒), 配合低位锁存不会漏按;
+        # 不取更小是为了少打扰系统(这个轮询在游戏运行时一直在跑)
+        self._interval = max(5, int(interval_ms))
+        self._fired: dict[str, bool] = {a: False for a in self.bindings}
         self._user32 = None
         self._timer: QTimer | None = None
         if sys.platform == "win32":
@@ -101,9 +115,12 @@ class GlobalHotkeyWatcher(QObject):
             return
         self._timer = QTimer(self)
         self._timer.setInterval(self._interval)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._timer.timeout.connect(self._poll)
         self._timer.start()
-        log.info("全局快捷键已启动: %s", {a: describe_binding(b) for a, b in self.bindings.items()})
+        log.info("全局快捷键已启动(每 %d ms 轮询): %s",
+                 self._interval,
+                 {a: describe_binding(b) for a, b in self.bindings.items()})
 
     def stop(self) -> None:
         if self._timer is not None:
@@ -112,9 +129,14 @@ class GlobalHotkeyWatcher(QObject):
             self._timer = None
 
     # ------------------------------------------------------------------
-    def _down(self, vk: int) -> bool:
-        """GetAsyncKeyState 最高位为 1 表示当前按下(SHORT 为负)。"""
-        return self._user32.GetAsyncKeyState(vk) < 0
+    def _sample(self, vk: int) -> tuple[bool, bool]:
+        """读一个键的状态 → (现在是否按住, 自上次调用以来是否被按过)。
+
+        GetAsyncKeyState 返回值: 最高位 = 当前按下, 最低位 = 自上回查询以来按过。
+        取 `& 0xFFFF` 是因为 ctypes 把它读成了有符号 short(高位为 1 时是负数)。
+        """
+        raw = int(self._user32.GetAsyncKeyState(vk)) & 0xFFFF
+        return bool(raw & 0x8000), bool(raw & 0x0001)
 
     def _poll(self) -> None:
         for action, (mod_name, key_name) in self.bindings.items():
@@ -122,9 +144,21 @@ class GlobalHotkeyWatcher(QObject):
             keys = VK_NUMPADS.get(key_name)
             if mod_vk is None or keys is None:
                 continue
-            active = self._down(mod_vk) and any(self._down(vk) for vk in keys)
-            # 边沿触发: 仅在"上次未按下 → 本次按下"时发出信号
-            if active and not self._state.get(action, False):
-                log.debug("快捷键触发: %s", action)
-                self.triggered.emit(action)
-            self._state[action] = active
+            mod_down, mod_pressed = self._sample(mod_vk)
+            key_down = key_pressed = False
+            for vk in keys:          # NumLock 开/关两种键码都听
+                down, pressed = self._sample(vk)
+                key_down = key_down or down
+                key_pressed = key_pressed or pressed
+
+            if not key_down and not mod_down:
+                self._fired[action] = False      # 组合完全松开 → 重新武装
+            if not (key_pressed or key_down):
+                continue
+            if not (mod_pressed or mod_down):
+                continue
+            if self._fired[action] and not key_pressed:
+                continue                          # 按住不放只触发一次
+            self._fired[action] = True
+            log.info("全局快捷键触发: %s (%s)", action, describe_binding((mod_name, key_name)))
+            self.triggered.emit(action)

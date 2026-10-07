@@ -24,12 +24,14 @@ import time
 from PyQt6.QtCore import QSettings, QSize, Qt
 from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont, QIcon
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QFrame, QGridLayout, QHeaderView,
-    QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox, QPushButton,
-    QSizePolicy, QSplitter, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
+    QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu,
+    QMessageBox, QPushButton, QSizePolicy, QSplitter, QTextBrowser, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
-from .global_hotkey import ACTION_LABELS, DEFAULT_BINDINGS, GlobalHotkeyWatcher, describe_binding
+from .global_hotkey import DEFAULT_BINDINGS, GlobalHotkeyWatcher, describe_binding
+from .help_text import about_html
 from .icons import ICON_SIZE, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
@@ -41,6 +43,7 @@ from .route_store import (
 )
 from .sound import play as play_sound
 from .sound import play_error as play_error_sound
+from .tree_view import RouteTreeWidget
 from .zones import layout_spread, ownership_text, zones_to_json
 
 log = logging.getLogger("route_window")
@@ -57,7 +60,7 @@ _ROLE_SIG = Qt.ItemDataRole.UserRole + 2      # 版本(战区布局)的坐标指
 # 否则多选时会把标题行也选进去(回放/基准只应以轨迹条目为单位)。
 GROUP_ITEM_FLAGS = Qt.ItemFlag.ItemIsEnabled
 
-# 侧栏列: 0=眼睛(显示/隐藏轨迹) 1=地图/线路 2=用时
+# 侧栏列: 0=展开/收起(眼睛图标) 1=地图/模式/版本/线路 2=信息(条数或用时)
 _COL_EYE = 0
 _COL_NAME = 1
 _COL_TIME = 2
@@ -185,34 +188,30 @@ class RouteTesterWindow(QMainWindow):
         setting.addAction(self.act_zones)
 
         help_menu = self.menuBar().addMenu("帮助(&H)")
-        help_menu.addAction(self._make_about_action())
-        act_mode = QAction("关于游戏模式怎么判定", self)
-        act_mode.triggered.connect(lambda: QMessageBox.information(
-            self, "关于游戏模式怎么判定",
-            "8111 **不提供模式名**, 但 /map_obj.json 里每个战区都是一个\n"
-            "capture_zone 对象(带 A/B/C 字母与地图坐标)。\n\n"
-            "所以程序按**战区数量**判定模式:\n"
-            "    3 个 → 战区控制(A/B/C 互相争夺)\n"
-            "    2 个 → 战区攻陷(开局双方各一个)\n"
-            "    1 个 → 战区争夺(单点争夺)\n\n"
-            "战区颜色就是**归属**(站在玩家视角):\n"
-            "    蓝 #174DFF = 我方, 红 #fa0C00 = 敌方, 白 #ffFFFA = 中立/未被占领\n"
-            "(实测: 双方重生点/机场的蓝、红对象成对出现, 旁证了这个约定)\n\n"
-            "各战区坐标串作为“模式指纹”记进每条轨迹, 因此同一张图的不同模式\n"
-            "会被分开归组(侧栏: 地图 → 模式 → 轨迹)。\n"
-            "战区只在战局内才有数据; 见过的布局(含颜色)会存进 routes.json,\n"
-            "战局结束后依旧能在地图上画出战区(归属以中立色显示)。"))
-        help_menu.addAction(act_mode)
+        act_about = QAction("关于 / 功能说明(快捷键、界面用法)…", self)
+        act_about.triggered.connect(self._show_about)
+        help_menu.addAction(act_about)
 
-    def _make_about_action(self) -> QAction:
-        act = QAction("关于地图命名", self)
-        act.triggered.connect(lambda: QMessageBox.information(
-            self, "关于地图命名",
-            "8111 本地接口**不提供地图名**(已实测: map_info / mission / 官方页面都没有),\n"
-            "所以程序用「地图图片的哈希」区分地图。\n\n"
-            "进入战局时图片会自动缓存到 data/maps/, 同一张图只存一次;\n"
-            "地图名需要你在「地图」→「地图管理」里自己填, 填好后左侧列表就会显示你的名字。"))
-        return act
+    def _show_about(self) -> None:
+        """菜单「帮助 → 关于」: 全部说明都收在这里。
+
+        界面上不再放常驻提示文字(侧栏底部、信息区那几行已删除) ——
+        那些文字只在第一次用的时候有用, 之后纯粹是占地方。
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle("关于 / 功能说明 —— 跑图线路测试器")
+        dlg.resize(780, 660)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(10, 10, 10, 10)
+        view = QTextBrowser(dlg)
+        view.setOpenExternalLinks(True)
+        view.setHtml(about_html())
+        layout.addWidget(view, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dlg)
+        buttons.rejected.connect(dlg.reject)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     def _on_show_zones(self, checked: bool) -> None:
         """菜单开关: 是否在地图上画战区。"""
@@ -278,9 +277,9 @@ class RouteTesterWindow(QMainWindow):
         title.setFont(f)
         layout.addWidget(title)
 
-        self.tree = QTreeWidget(box)
+        self.tree = RouteTreeWidget(box)
         self.tree.setColumnCount(3)
-        self.tree.setHeaderLabels(["", "地图 / 线路", "用时"])
+        self.tree.setHeaderLabels(["展开/收起", "地图 / 线路", "信息"])
         # 缩进会占用第 0 列: 二级条目内容从 ~2×缩进 处开始, 因此眼睛列必须够宽,
         # 否则图标会溢出到名称列、与文字叠在一起(Qt 不会把图标裁剪在列内)
         self.tree.setIndentation(12)
@@ -294,7 +293,6 @@ class RouteTesterWindow(QMainWindow):
         header.setSectionResizeMode(_COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
         header.setMinimumSectionSize(24)
         self.tree.setColumnWidth(_COL_EYE, EYE_COLUMN_WIDTH)
-        self.tree.setAlternatingRowColors(True)
         # 选中的条目决定「回放」播哪几条(可 Shift/Ctrl 多选);
         # 而「地图上有没有显示」完全由眼睛图标控制 —— 两者职责分开。
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -305,12 +303,6 @@ class RouteTesterWindow(QMainWindow):
         # 双击轨迹行 = 把它所在的“地图·模式·版本”定为基准(之后多选只在该版本内)
         self.tree.itemDoubleClicked.connect(self._on_tree_double_clicked)
         layout.addWidget(self.tree, 1)
-
-        hint = QLabel("点击每行前面的眼睛图标可显示/隐藏该轨迹\n"
-                      "Shift/Ctrl 多选: 「回放」会播放选中的那几条\n"
-                      "右键二级条目可删除")
-        hint.setStyleSheet("color:#94a3b8; font-size:11px;")
-        layout.addWidget(hint)
         return box
 
     # -------------------------------------------------------------- 信息显示区
@@ -432,15 +424,7 @@ class RouteTesterWindow(QMainWindow):
             "注: 若开始时车已在行驶(回溯窗口内没有速度为 0 的时刻), 仍按按下时刻计时。")
         self.chk_start_on_move.stateChanged.connect(self._on_start_on_move_changed)
         btns.addWidget(self.chk_start_on_move)
-
-        keys = "   ".join(
-            f"{ACTION_LABELS[a]} = {describe_binding(DEFAULT_BINDINGS[a])}"
-            for a in ("start", "mark", "stop")
-        )
-        tip = QLabel(keys)
-        tip.setStyleSheet("color:#94a3b8; font-size:11px;")
-        tip.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        btns.addWidget(tip, 1)
+        btns.addStretch(1)
         grid.addLayout(btns, 4, 0, 1, 4)
 
         grid.setColumnStretch(0, 0)

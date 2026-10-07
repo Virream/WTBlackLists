@@ -1663,6 +1663,89 @@ def test_zones_and_modes(tmpdir: str):
     results.append("战区解析/模式判定/录制写入/三层树 OK")
 
 
+def test_global_hotkey():
+    """全局快捷键: 只认"修饰键 + 小键盘键", 与其它按键无关; 轮询被拖长也不漏按。
+
+    用假的 user32.GetAsyncKeyState 复现两种情况:
+    1. 正常按住右Shift + 小键盘1(同时还按着 W 前进);
+    2. **定时器被游戏挤占**: 一次轮询之间组合键就已经按完松开 —— 此时只能靠
+       GetAsyncKeyState 的最低位("自上次查询以来按过")发现, 这正是修复的要点。
+    """
+    from wt81111g.global_hotkey import VK_MODIFIERS, VK_NUMPADS, GlobalHotkeyWatcher
+
+    class FakeUser32:
+        """按下集合 + "自上次查询以来按过"集合(最低位只报一次, 与真实 API 一致)。"""
+
+        def __init__(self):
+            self.down: set[int] = set()
+            self.pressed: set[int] = set()
+
+        def GetAsyncKeyState(self, vk: int) -> int:
+            raw = (0x8000 if vk in self.down else 0) | (0x0001 if vk in self.pressed else 0)
+            self.pressed.discard(vk)
+            return raw
+
+    rshift = VK_MODIFIERS["rshift"]
+    num1_nl_on, num1_nl_off = VK_NUMPADS["num1"]
+    num2_nl_on, _ = VK_NUMPADS["num2"]
+    vk_w = 0x57                                     # W: 与本程序无关的按键
+    fake = FakeUser32()
+    watcher = GlobalHotkeyWatcher()
+    watcher._user32 = fake
+    got: list[str] = []
+    watcher.triggered.connect(got.append)
+
+    # 1) 按着 W 前进 + 右Shift + 小键盘1(小键盘号两种键码都要认)
+    for num1 in (num1_nl_on, num1_nl_off):
+        got.clear()
+        fake.__init__()
+        fake.down = {vk_w, rshift, num1}
+        fake.pressed = {rshift, num1}
+        watcher._poll()
+        assert got == ["start"], f"按住 W 时也应触发: {got}"
+        # 2) 按住不放: 只触发一次
+        watcher._poll()
+        watcher._poll()
+        assert got == ["start"], f"按住不放不应重复触发: {got}"
+        # 3) 松开后重新按: 再次触发
+        fake.down = {vk_w}                           # 组合键已松开(低位也不再置位)
+        fake.pressed = set()
+        watcher._poll()                              # 松开 → 重新武装
+        assert got == ["start"], f"松开后不应额外触发: {got}"
+        fake.down = {vk_w, rshift, num1}
+        fake.pressed = {rshift, num1}
+        watcher._poll()
+        assert got == ["start", "start"], f"松开再按应再次触发: {got}"
+
+    # 4) 定时器被拖长: 两次轮询之间组合键已按完松开(低位兜底)
+    got.clear()
+    fake.__init__()
+    fake.pressed = {rshift, num1_nl_on}
+    watcher._poll()
+    assert got == ["start"], f"轮询被拖长时不应漏按: {got}"
+
+    # 5) 只按小键盘1(没按右Shift)/ 只按右Shift: 都不触发
+    got.clear()
+    fake.__init__()
+    fake.down = {vk_w, num1_nl_on}
+    fake.pressed = {num1_nl_on}
+    watcher._poll()
+    fake.__init__()
+    fake.down = {rshift}
+    fake.pressed = {rshift}
+    watcher._poll()
+    assert got == [], f"缺少修饰键/主键时不应触发: {got}"
+
+    # 6) 两个动作互不串扰(小键盘2 触发 stop)
+    got.clear()
+    fake.__init__()
+    fake.down = {rshift, num2_nl_on}
+    fake.pressed = {rshift, num2_nl_on}
+    watcher._poll()
+    assert got == ["stop"], f"小键盘2 应触发 stop: {got}"
+    results.append("全局快捷键(右Shift+小键盘 1/2/3) OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -1674,6 +1757,7 @@ def main() -> int:
     test_recorder_placeholder()
     test_start_on_move(tmpdir)
     test_refresh_rate()
+    test_global_hotkey()
     test_track_segments()
     test_point_at_and_split()
     test_playback()
