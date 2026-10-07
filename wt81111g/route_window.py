@@ -100,6 +100,9 @@ class RouteTesterWindow(QMainWindow):
         # 之后多选/回放只能在同一版本内进行(见 _group_of / _on_tree_selection_changed)
         self._anchor: tuple[str, str] | None = None
         self._reselecting = False
+        # 侧栏是否已经建过一次: 首次构建(= 刚启动)默认**全部折叠**, 之后的重建
+        # 才按用户手动展开/折叠过的状态恢复(见 _restore_folded)
+        self._tree_built = False
         # “粘性状态栏文字”: 提示类信息(回放开始/结束、显示切换…)在若干秒内不被刷新覆盖
         self._sticky_text = ""
         self._sticky_until = 0.0
@@ -493,6 +496,7 @@ class RouteTesterWindow(QMainWindow):
         # 重建前先记住哪些分组是折叠的: 「地图管理」关掉、录完一条轨迹、改名或删除
         # 之后都会走这里重建侧栏, 否则用户刚折起来的分组会被全部重新展开。
         folded = self._folded_keys()
+        first_build = not getattr(self, "_tree_built", False)   # 刚启动的那一次
         self.tree.blockSignals(True)
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
@@ -582,7 +586,8 @@ class RouteTesterWindow(QMainWindow):
                 var.setForeground(_COL_NAME, QBrush(Qt.GlobalColor.gray))
                 var.setToolTip(_COL_NAME, self._variant_tip(map_key, sig, vname))
                 top.addChild(var)
-        self._restore_folded(folded)
+        self._restore_folded(folded, collapse_all=first_build)
+        self._tree_built = True
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
         if self._anchor is not None and not any(
@@ -609,19 +614,38 @@ class RouteTesterWindow(QMainWindow):
             walk(root.child(i))
         return folded
 
-    def _restore_folded(self, folded: set[str]) -> None:
-        """按 `folded` 恢复展开状态: **默认展开**(新出现的地图/模式/版本直接可见),
-        只有原先就被用户折起来的分组保持折叠。"""
+    def _restore_folded(self, folded: set[str], collapse_all: bool = False) -> None:
+        """恢复展开状态。
+
+        * `collapse_all=True`(刚启动的那一次): **全部折叠** —— 打开软件先看到一排地图/线路,
+          想看哪张再自己展开;
+        * 之后的重建(关掉「地图管理」、录完一条、改名、删除): 用户折起来的保持折叠,
+          用户展开过的保持展开; **新出现的**分组(新地图/新模式/新版本)默认展开。
+        """
         def walk(item: QTreeWidgetItem) -> None:
             key = item.data(0, _ROLE_KEY)
             if key:
-                item.setExpanded(key not in folded)
+                item.setExpanded(False if collapse_all else key not in folded)
             for i in range(item.childCount()):
                 walk(item.child(i))
 
         root = self.tree.invisibleRootItem()
         for i in range(root.childCount()):
             walk(root.child(i))
+
+    def _expand_to_route(self, route_id: str) -> None:
+        """把某条轨迹的各级分组全部展开(录完一条后至少能看到它自己)。
+
+        启动时分组是折叠的, 新录的这条会藏在里面 —— 不展开的话侧栏看起来几乎没变化。
+        """
+        for item in self._iter_route_items():
+            if item.data(0, _ROLE_ID) != route_id:
+                continue
+            parent = item.parent()
+            while parent is not None:
+                parent.setExpanded(True)
+                parent = parent.parent()
+            return
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, col: int) -> None:
         """点击第一列的**眼睛图标** → 切换该轨迹在地图上的显示/隐藏。"""
@@ -1465,6 +1489,7 @@ class RouteTesterWindow(QMainWindow):
         self._visible_ids.add(rec.route_id)
         self._update_buttons(False)
         self._reload_tree()          # 内部会 _refresh_map_tracks(): 该条用速度配色高亮
+        self._expand_to_route(rec.route_id)   # 分组可能是折叠的 → 展开到刚录的这条
         self._set_status(
             f"录制完成: {rec.map_name} | {rec.vehicle} | 用时 {fmt_time(rec.duration)} "
             f"| 轨迹点 {len(rec.points)} | 标记 {len(rec.marks) - 1} 个", sticky=6.0)

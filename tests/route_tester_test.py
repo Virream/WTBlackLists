@@ -557,54 +557,79 @@ def test_single_instance():
 
 
 def test_tree_expand_state(tmpdir: str):
-    """侧栏重建后要保住展开/折叠状态。
+    """侧栏: **启动默认全部折叠**, 之后重建要保住用户手动改过的展开状态。
 
     回归: `_reload_tree` 以前对每个分组硬编码 setExpanded(True), 于是一旦重建
     (关掉「地图管理」、录完一条轨迹、改名、删除都会走这里), 用户刚折起来的
     层级就被全部展开。
     """
-    win = make_window(tmpdir, "win_expand.json")
+    name = "win_expand.json"
+    # 先造好数据再开窗口 —— 模拟"启动时库里已有轨迹"(窗口首次建侧栏就该全折叠)
+    seed = RouteStore(os.path.join(tmpdir, name))
+    for i, veh in enumerate(("T-72B", "M1A1")):
+        rec = seed.new_route("k1", "地图 1", veh, 0.2 + i * 0.1, 0.3)
+        rec.duration = 30.0 + i
+        seed.add(rec)
+    rec = seed.new_route("k2", "地图 2", "BMP-2", 0.5, 0.5)
+    rec.duration = 20.0
+    seed.add(rec)
+
+    win = make_window(tmpdir, name)
     win.recorder.stop()
     win.hotkeys.stop()
     win.show()
-    for i, veh in enumerate(("T-72B", "M1A1")):
-        rec = win.store.new_route("k1", "地图 1", veh, 0.2 + i * 0.1, 0.3)
-        rec.duration = 30.0 + i
-        win.store.add(rec)
-    rec = win.store.new_route("k2", "地图 2", "BMP-2", 0.5, 0.5)
-    rec.duration = 20.0
-    win.store.add(rec)
-    win._reload_tree()
 
-    # 新建出来的侧栏默认全展开
+    # ① 启动默认: 全部折叠(顶层的地图行本身仍然看得见)
     assert win.tree.topLevelItemCount() == 2
-    top0 = win.tree.topLevelItem(0)
-    assert top0.isExpanded() and top0.child(0).isExpanded()
-    assert top0.child(0).child(0).isExpanded()
+    assert win.tree.topLevelItem(0).text(1) == "地图 1"
+    assert not win.tree.topLevelItem(0).isExpanded(), "启动时应默认折叠"
+    assert not win.tree.topLevelItem(1).isExpanded(), "启动时应默认折叠"
 
-    # 折叠第一个地图 + 它的模式层; 第二个地图保持展开
+    # ② 手动展开第一张地图 + 它的模式层 → 重建后保持展开; 第二张仍旧折叠
+    top0 = win.tree.topLevelItem(0)
+    top0.setExpanded(True)
+    top0.child(0).setExpanded(True)
+    win._reload_tree()
+    top0 = win.tree.topLevelItem(0)
+    assert top0.isExpanded(), "用户展开过的分组重建后应保持展开"
+    assert top0.child(0).isExpanded()
+    assert not win.tree.topLevelItem(1).isExpanded(), "没展开的应保持折叠"
+
+    # ③ 再折叠回去 → 重建后仍折叠
     top0.setExpanded(False)
-    top0.child(0).setExpanded(False)
-    # 走真实路径(只把模态对话框的 exec 换成"立刻关掉"): 「地图管理」关掉后重建侧栏
+    win._reload_tree()
+    assert not win.tree.topLevelItem(0).isExpanded(), "用户折叠过的分组重建后应保持折叠"
+
+    # ④ 走真实路径(只把模态对话框的 exec 换成"立刻关掉"): 「地图管理」关掉后重建侧栏
+    top0 = win.tree.topLevelItem(0)
+    top0.setExpanded(True)
     real_exec = rw.MapManagerDialog.exec
     rw.MapManagerDialog.exec = lambda self: None
     try:
         win._open_map_manager()
     finally:
         rw.MapManagerDialog.exec = real_exec
+    assert win.tree.topLevelItem(0).isExpanded(), "「地图管理」关掉后也要保持展开"
 
-    top0 = win.tree.topLevelItem(0)
-    assert not top0.isExpanded(), "重建后应仍折叠着"
-    assert not top0.child(0).isExpanded(), "模式层也应仍折叠着"
-    assert win.tree.topLevelItem(1).isExpanded(), "没折叠的分组仍应展开"
-    assert win.tree.topLevelItem(1).child(0).child(0).isExpanded()
-
-    # 再展开回去 → 重建后也应保持展开
-    top0.setExpanded(True)
-    win._reload_tree()
-    assert win.tree.topLevelItem(0).isExpanded()
+    # ⑤ 录完一条新轨迹 → 自动展开到它(否则会藏在折叠的分组里看不见)
+    for it in win._iter_route_items():          # 先把所有分组折起来
+        parent = it.parent()
+        while parent is not None:
+            parent.setExpanded(False)
+            parent = parent.parent()
+    rec2 = win.store.new_route("k1", "地图 1", "T-80B", 0.7, 0.7)
+    rec2.duration = 11.0
+    win.store.add(rec2)
+    win._on_recording_finished(rec2)
+    row = next(it for it in win._iter_route_items()
+               if it.data(0, rw._ROLE_ID) == rec2.route_id)
+    assert win.tree.visualItemRect(row).height() > 0, "刚录的这条应可见"
+    parent = row.parent()
+    while parent is not None:
+        assert parent.isExpanded(), "录完一条应自动展开到它"
+        parent = parent.parent()
     win.close()
-    results.append("侧栏重建后保持展开/折叠状态 OK")
+    results.append("启动默认折叠 + 侧栏重建保持展开/折叠 + 录完自动展开到新条目 OK")
 
 
 def test_window(tmpdir: str):
