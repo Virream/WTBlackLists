@@ -43,6 +43,8 @@ from .route_store import (
 )
 from .sound import play as play_sound
 from .sound import play_error as play_error_sound
+from .sound import settings as sound_settings
+from .sound_dialog import SoundSettingsDialog
 from .tree_view import RouteTreeWidget
 from .zones import layout_spread, ownership_text, zones_to_json
 
@@ -187,6 +189,16 @@ class RouteTesterWindow(QMainWindow):
         self.act_zones.toggled.connect(self._on_show_zones)
         setting.addAction(self.act_zones)
 
+        snd_menu = self.menuBar().addMenu("音效(&A)")
+        self.act_sound_on = QAction("启用提示音", self)
+        self.act_sound_on.setCheckable(True)
+        self.act_sound_on.setChecked(sound_settings().enabled)
+        self.act_sound_on.toggled.connect(self._on_sound_toggled)
+        snd_menu.addAction(self.act_sound_on)
+        act_sound_set = QAction("音效设置(音量 / 自定义音效文件)…", self)
+        act_sound_set.triggered.connect(self._open_sound_settings)
+        snd_menu.addAction(act_sound_set)
+
         help_menu = self.menuBar().addMenu("帮助(&H)")
         act_about = QAction("关于 / 功能说明(快捷键、界面用法)…", self)
         act_about.triggered.connect(self._show_about)
@@ -220,6 +232,21 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.set_show_zones(self._show_zones)
         self._set_status("已显示地图上的战区位置" if checked else "已隐藏地图上的战区位置",
                          sticky=2.0)
+
+    def _on_sound_toggled(self, on: bool) -> None:
+        """菜单开关: 提示音总开关(立即落盘)。"""
+        sound_settings().set_enabled(bool(on))
+        self._set_status("已启用提示音" if on else "已关闭提示音(所有音效都不再播放)",
+                         sticky=2.0)
+        if on:
+            play_sound("mark")          # 打开时响一声, 便于确认音量
+
+    def _open_sound_settings(self) -> None:
+        """菜单「音效 → 音效设置」: 音量 / 自定义音效文件(改动立即生效)。"""
+        dlg = SoundSettingsDialog(sound_settings(), self)
+        dlg.exec()
+        self.act_sound_on.setChecked(sound_settings().enabled)   # 对话框里可能改过开关
+        self._set_status("音效设置已更新", sticky=2.0)
 
     def _open_map_dir(self) -> None:
         try:
@@ -573,17 +600,17 @@ class RouteTesterWindow(QMainWindow):
 
         两层绘制:
         * 普通层 = `_visible_ids`(眼睛点亮) → 不透明灰色;
-        * **高亮层 = 侧栏当前选中的那几条** → 速度配色(与录制中一致), 可多条;
-          没选中时才退回“刚录制的那条”(保持原来的习惯)。
+        * **高亮层 = 侧栏当前选中的那几条里、眼睛也点亮了的** → 速度配色, 可多条;
+          没选中任何条目时才退回“刚录制的那条”。
 
-        高亮层的轨迹即使眼睛没点亮也会画出来 —— 你选了它, 就应该看得到它。
-        视图内部会对重复的记录去重(高亮那份优先)。
+        高亮层**不会**把眼睛没点亮的轨迹画出来: 点眼睛时该行会先被选中,
+        若高亮层又把它画回去, 就会看起来像“点了眼睛没反应”(2026-10-07 修的)。
         """
         recs = [r for rid in self._visible_route_ids()
                 if (r := self.store.get(rid)) is not None]
         picked = self._selection_tracks()
         if picked:
-            highlight = list(picked)
+            highlight = [r for r in picked if r.route_id in self._visible_ids]
         else:
             # 没选中时退回“刚录制的那条”(只在它还显示着的时候高亮)
             hl = self._last_record

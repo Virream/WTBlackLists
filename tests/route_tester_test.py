@@ -8,12 +8,13 @@ import hashlib
 import os
 import sys
 import tempfile
+import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPointF, Qt
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QPointF, Qt
 from PyQt6.QtGui import QColor, QIcon, QImage, QPixmap
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QAbstractItemView, QApplication
@@ -35,6 +36,7 @@ from wt81111g.zones import (
 
 # 测试时不播放系统提示音
 rw.play_sound = lambda action: None
+rw.play_error = lambda *a, **k: None
 
 results: list[str] = []
 
@@ -1027,6 +1029,95 @@ def test_playback_lock(tmpdir: str):
     results.append("回放锁定其余功能 + 结束播放解锁 OK")
 
 
+def test_sound(tmpdir: str):
+    """提示音: 默认用 Windows 自带音效, 音量靠重采样(不动系统音量), 设置可持久化。"""
+    from PyQt6.QtCore import QSettings
+
+    from wt81111g import sound as snd
+
+    # 默认文件: 开始/结束/标记 分别对应 Speech On / Speech Off / Windows Balloon
+    if sys.platform == "win32":
+        for action, name in (("start", "speech on.wav"), ("stop", "speech off.wav"),
+                             ("mark", "windows balloon.wav")):
+            path = snd.settings().path_for(action)
+            assert path and os.path.basename(path).lower() == name, \
+                f"{action} 默认音效应为 {name}, 实际 {path!r}"
+
+    src = snd.settings().path_for("start")
+    if src:
+        # 音量: 缩放成临时文件, 同一音量命中缓存(不重复算)
+        first = snd._scaled_wav(src, 30)
+        second = snd._scaled_wav(src, 30)
+        assert first and first == second, "音量缩放结果应缓存复用"
+        assert os.path.getsize(first) > 1000
+        other = snd._scaled_wav(src, 60)
+        assert other and other != first, "不同音量应是不同文件"
+        # 非 16 位 PCM(拿本文件冒充): 放弃缩放, 按原音量播
+        assert snd._scaled_wav(__file__, 30) == ""
+        # 音量为 0 = 静音不播(不阻塞)
+        t0 = time.perf_counter()
+        snd._play_blocking(src, 0)
+        assert time.perf_counter() - t0 < 0.05, "音量 0 应直接返回"
+
+    # 设置持久化(用临时 ini, 不污染用户注册表)
+    ini = os.path.join(tmpdir, "snd.ini")
+    conf = snd.SoundSettings(QSettings(ini, QSettings.Format.IniFormat))
+    assert conf.enabled is True and conf.volume == snd.DEFAULT_VOLUME
+    conf.set_enabled(False)
+    conf.set_volume(35)
+    conf.set_file("mark", os.path.abspath(__file__))     # 存在但非 wav: 只测存取
+    again = snd.SoundSettings(QSettings(ini, QSettings.Format.IniFormat))
+    assert again.enabled is False and again.volume == 35
+    assert "route_tester_test.py" in again.label_for("mark")
+    again.set_file("mark", "")
+    assert again.custom_file("mark") == ""
+    assert "默认" in again.label_for("mark")
+    # 自定义文件被删掉后自动回退到默认
+    conf.set_file("mark", os.path.join(tmpdir, "不存在.wav"))
+    assert conf.custom_file("mark") == "", "文件不存在应回退默认"
+    assert conf.volume == 35 and conf.enabled is False
+    results.append("提示音(默认音效/音量缩放/设置持久化) OK")
+
+
+def test_eye_click(tmpdir: str):
+    """点“展开/收起”列里的眼睛图标必须真能隐藏/显示轨迹。
+
+    回归: 点眼睛时该行会被选中, 而高亮层曾经把“选中的轨迹”画回地图 ——
+    于是看起来就像“点了眼睛没反应”。
+    """
+    win = make_window(tmpdir, "win_eyeclick.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.show()
+    app = QApplication.instance()
+    rec = win.store.new_route("k1", "地图 1", "T-72B", 0.2, 0.3)
+    rec.duration = 42.0
+    win.store.add(rec)
+    win._reload_tree()
+    row = list(win._iter_route_items())[0]
+    win._set_visible(row, True)
+    assert len(win.map_view.visible_tracks) == 1
+
+    def click_eye() -> None:
+        rect = win.tree.visualItemRect(row)
+        QTest.mouseClick(win.tree.viewport(), Qt.MouseButton.LeftButton,
+                         Qt.KeyboardModifier.NoModifier,
+                         QPoint(rect.left() + ICON_SIZE // 2, rect.center().y()))
+        app.processEvents()
+
+    click_eye()                                    # 隐藏
+    assert rec.route_id not in win._visible_ids, "点眼睛应熄灭"
+    assert all(r.route_id != rec.route_id for r in win.map_view.visible_tracks)
+    assert all(r.route_id != rec.route_id for r in win.map_view.highlight_records), \
+        "高亮层不应把眼睛已关闭的选中轨迹画回地图"
+
+    click_eye()                                    # 再点亮
+    assert rec.route_id in win._visible_ids, "再点一下应重新点亮"
+    assert [r.route_id for r in win.map_view.visible_tracks] == [rec.route_id]
+    win.close()
+    results.append("点眼睛图标能真隐藏/显示轨迹(选中时不复活) OK")
+
+
 def test_eye_icon_no_overlap(tmpdir: str):
     """眼睛图标必须完整落在自己的列里, 不能溢到名称列上压住文字。
 
@@ -1758,6 +1849,7 @@ def main() -> int:
     test_start_on_move(tmpdir)
     test_refresh_rate()
     test_global_hotkey()
+    test_sound(tmpdir)
     test_track_segments()
     test_point_at_and_split()
     test_playback()
@@ -1774,6 +1866,7 @@ def main() -> int:
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)
     test_eye_icon_no_overlap(tmpdir)
+    test_eye_click(tmpdir)
     test_window(tmpdir)
     for line in results:
         print("[OK]", line)
