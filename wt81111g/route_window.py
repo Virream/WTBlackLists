@@ -32,7 +32,7 @@ from PyQt6.QtWidgets import (
 
 from .global_hotkey import DEFAULT_BINDINGS, GlobalHotkeyWatcher, describe_binding
 from .help_text import about_html
-from .icons import ICON_SIZE, eye_icon, pin_icon
+from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
 from .route_map_view import RouteMapView
@@ -435,6 +435,12 @@ class RouteTesterWindow(QMainWindow):
         self.btn_start.clicked.connect(lambda: self._handle_action("start"))
         self.btn_stop.clicked.connect(lambda: self._handle_action("stop"))
         self.btn_mark.clicked.connect(lambda: self._handle_action("mark"))
+        # 图标 = 地图上对应的那个圈(绿色起点圈 / 红色终点圈 / 黄色标记圈),
+        # 颜色与相对大小都跟地图一致, 一眼能对上(见 icons.circle_icon)
+        for btn, kind in ((self.btn_start, "start"), (self.btn_stop, "stop"),
+                          (self.btn_mark, "mark")):
+            btn.setIcon(circle_icon(kind))
+            btn.setIconSize(QSize(ICON_SIZE, ICON_SIZE))
         for b in (self.btn_start, self.btn_stop, self.btn_mark):
             b.setMinimumHeight(34)
             btns.addWidget(b)

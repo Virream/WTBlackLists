@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import QAbstractItemView, QApplication
 
 import wt81111g.route_window as rw
 from wt81111g.map_cache import MapCache
-from wt81111g.icons import ICON_SIZE, eye_icon
+from wt81111g.icons import ICON_SIZE, circle_icon, eye_icon
 from wt81111g.route_map_view import RouteMapView, build_speed_segments
 from wt81111g.route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from wt81111g.route_recorder import RouteRecorder, _is_player_obj
@@ -570,6 +570,11 @@ def test_window(tmpdir: str):
     win._update_buttons(True)         # 按钮状态随录制切换
     assert not win.btn_start.isEnabled()
     assert win.btn_stop.isEnabled() and win.btn_mark.isEnabled()
+    # 三个录制按钮都带图标(绿圈/红圈/黄圈, 与地图上的标记同色)
+    for btn, kind in ((win.btn_start, "start"), (win.btn_stop, "stop"),
+                      (win.btn_mark, "mark")):
+        assert not btn.icon().isNull(), f"{btn.text()} 应有图标"
+        assert not circle_icon(kind).isNull()
     win._update_buttons(False)
     assert win.btn_start.isEnabled() and not win.btn_stop.isEnabled()
 
