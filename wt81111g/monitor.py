@@ -96,8 +96,7 @@ class MonitorWorker(QObject):
             self.connection_changed.emit(connected)
         if not connected:
             if self._in_battle:
-                self._in_battle = False
-                self.battle_ended.emit()
+                self._end_battle("8111 断开连接")
             self._garage_ticks = 0
             return
 
@@ -120,10 +119,7 @@ class MonitorWorker(QObject):
             # 图片一时拿不到(8111 偶发超时)不该立刻把叠加层撤掉。
             self._garage_ticks += 1
             if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
-                self._garage_ticks = 0
-                self._in_battle = False
-                log.info("battle ended (8111 没有地图图片 / 只给车库占位图)")
-                self.battle_ended.emit()
+                self._end_battle("8111 没有地图图片 / 只给车库占位图")
 
         # 击杀/发言收集。仅当“已在战斗中”或“本会话曾进入过战斗(光标已初始化)”
         # 时轮询, 以便在图片判定延迟时, 靠击杀/发言兜底确认进入战斗,
@@ -173,6 +169,7 @@ class MonitorWorker(QObject):
     def _start_battle(self) -> None:
         log.info("new battle detected")
         self._in_battle = True
+        self._garage_ticks = 0
         self._collected.clear()
         self._alerted.clear()
         self._found_nicks = []
@@ -180,6 +177,22 @@ class MonitorWorker(QObject):
         self.nicknames_updated.emit([])
         self.blacklist_found.emit([])
         self._start_prefetch()
+
+    def _end_battle(self, reason: str) -> None:
+        """离开对局(回到车库/断开连接): 清空当前对局的收集, 叠加层收起。
+
+        回到车库时列表里的昵称全是上一局的残留(实测退出对局后这些数据不会自动清),
+        所以一并清掉 —— 下一局开始时 `_start_battle` 再从头收集。
+        """
+        self._in_battle = False
+        self._garage_ticks = 0
+        self._collected.clear()
+        self._alerted.clear()
+        self._found_nicks = []
+        log.info("battle ended (%s)", reason)
+        self.battle_ended.emit()
+        self.nicknames_updated.emit([])
+        self.blacklist_found.emit([])
 
     def _cursors_init(self) -> bool:
         """本会话是否曾进入过战斗(击杀/发言游标已初始化)。"""

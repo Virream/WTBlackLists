@@ -227,6 +227,11 @@ def test_main_window_history_and_reminder() -> None:
     pid0 = dlg.table.item(0, 0).text()
     assert pid0 == "80931116", pid0
     assert "小时" in dlg.table.item(0, 2).text() or "分钟" in dlg.table.item(0, 2).text()
+
+    # 回车库 → 清空“当前对局已收集昵称”(上一局残留)
+    win.nick_list.addItem("StaleNick")
+    win._on_battle_ended()
+    assert win.nick_list.count() == 0, "回车库应清空昵称列表"
     results.append("main_window history + reminder + cache dialog OK")
 
     win.close()
@@ -240,9 +245,11 @@ class _FakeClient:
     情形, 连浏览器都加载不出来), 图片字节 = 拿到了(车库 “?” 占位图 / 真地图)。
     """
 
-    def __init__(self, missions, map_images):
+    def __init__(self, missions, map_images, chats=None):
         self.missions = missions
         self.map_images = map_images
+        self.chats = list(chats or [])   # 依次给出的发言昵称(验证收集/清空)
+        self._chat_id = 0
         self.i = 0
 
     def connected(self):
@@ -255,7 +262,10 @@ class _FakeClient:
         return self.map_images[min(self.i, len(self.map_images) - 1)]
 
     def gamechat(self, last_id):
-        return []
+        if not self.chats:
+            return []
+        self._chat_id += 1
+        return [{"id": self._chat_id, "sender": self.chats.pop(0), "msg": "hi"}]
 
     def hudmsg(self, a, b):
         return {}
@@ -299,6 +309,45 @@ def test_battle_detection_by_image() -> None:
     results.append("battle start/end by map image OK")
 
 
+def test_leaving_battle_clears_collected() -> None:
+    """回车库 → 清空“当前对局已收集昵称”(上一局残留); 进下一局再重新收集。"""
+    from garage_test import png_bytes
+
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    real = png_bytes(1024, 1024)
+    holder = png_bytes(128, 128)
+    w = MonitorWorker(store, nickname_cache=cache)
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
+                           [real, holder, holder, real],
+                           chats=["EnemyOne", "EnemyTwo"])
+    updates = []
+    ends = []
+    w.nicknames_updated.connect(lambda names: updates.append(list(names)),
+                                Qt.ConnectionType.DirectConnection)
+    w.battle_ended.connect(lambda: ends.append(1), Qt.ConnectionType.DirectConnection)
+
+    w.client.i = 0
+    w._tick()                       # 对局中: 从发言里收集
+    w._tick()
+    assert sorted(w._collected) == ["EnemyOne", "EnemyTwo"], w._collected
+    assert updates[-1] == ["EnemyOne", "EnemyTwo"], updates
+    w._found_nicks = [("EnemyOne", "开挂")]     # 模拟本局命中
+    w.client.i = 1
+    w._tick()                       # 刚回车库第 1 tick: 还在确认, 不该清
+    assert w._collected, "确认前不应该清空"
+    w._tick()                       # 连续确认 → 回到车库: 清空本局收集
+    assert len(ends) == 1 and not w._in_battle
+    assert w._collected == set(), w._collected
+    assert w._found_nicks == []
+    assert updates[-1] == [], updates
+    w.client.i = 3
+    w._tick()                       # 再进对局 → 从零重新收集
+    assert w._in_battle and w._collected == set()
+    results.append("leaving battle clears collected nicknames OK")
+
+
 def test_garage_never_starts_battle() -> None:
     """机库两种情形(拿不到图片 / 问号占位图)都不该开始对局 → 叠加层不出现。"""
     from garage_test import png_bytes
@@ -326,11 +375,12 @@ def main() -> int:
     test_cache_survives_entry_delete()
     test_wtlive_optimization()
     test_battle_detection_by_image()
+    test_leaving_battle_clears_collected()
     test_garage_never_starts_battle()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 8 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 9 else "FAILED")
     return 0
 
 

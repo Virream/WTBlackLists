@@ -1112,6 +1112,9 @@ class MainWindow(QMainWindow):
         self.battle_label.setText("对局状态: 对局结束/离开")
         self.battle_label.setStyleSheet("color:#7f8c8d;font-weight:bold;")
         self._overlay.set_battle(False)
+        # 回车库后列表里的昵称全是上一局的残留 → 清空(下一局重新收集)
+        self.nick_list.clear()
+        self.statusBar().showMessage("已离开对局, 已清空当前对局的昵称收集", 3000)
 
     @pyqtSlot(list)
     def _on_nicknames(self, names: list) -> None:
