@@ -173,6 +173,15 @@ class MonitorWorker(QObject):
             # 本会话第一次轮询: 8111 窗口里可能有上一局的旧消息, 这里只建立基线
             log.info("建立消息基线: 吸收窗口里的旧消息(本次 %d 条击杀/伤害)",
                      len(hud.get("damage") or []) if isinstance(hud, dict) else 0)
+        if absorbing and self._msg_primed and (new_msg or new_dmg):
+            # 必须有的兜底: 新对局开始时**地图图片要等加载画面结束才出现**
+            # (2026-10-10 实测: 地图图片比任务开始晚 ~25 秒), 而加载期已经在打靶车 ——
+            # 不判进局的话, 进局后打掉的第一辆永远报不出来(用户实测: IT-1/T-62/T-55A
+            # 都在地图出现前打掉, 只有地图出来之后的才报 = “进局后半分钟才检测到”)。
+            # 只认“游标之后的新消息”, 所以启动基线里的旧消息依然不参与判断。
+            log.info("battle confirmed by activity (kill/chat)")
+            self._start_battle()
+            absorbing = False
         before = len(self._collected)
         new_names: list[str] = []
         if not absorbing:

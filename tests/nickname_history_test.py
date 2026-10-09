@@ -434,6 +434,50 @@ def test_stale_hudmsg_window_not_collected() -> None:
     results.append("stale /hudmsg window not collected OK")
 
 
+def test_loading_screen_kill_starts_battle() -> None:
+    """加载画面里(地图图片还没出来)打掉的第一辆必须能报出来。
+
+    2026-10-10 实测: 进试车场后地图图片要等加载画面结束才出现(比任务开始晚 ~25 秒),
+    但加载期已经在打靶车 —— 只认地图的话这些击杀全被吸收, 直到地图出来后的那一辆才报
+    (用户反馈“进入对局后半分钟才检测到”)。只认“游标之后的新消息”, 所以启动基线里的
+    旧消息依然不会参与判断。
+    """
+    from garage_test import png_bytes
+
+    stale = "=AZUR2= OldGuy (T-55A) 击毁了 Whatever (M2A2)"   # 上一个对局留在窗口里的
+    fresh = "=AZUR2= 目击而道存矣 (豹 2PL) 击毁了 IT-1"          # 加载期打掉的第一辆
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="1", nickname="目击而道存矣", reason="测试"))
+    w = MonitorWorker(store, nickname_cache=cache)
+    w._profile_cache["1"] = ("目击而道存矣", time.time())   # 免预抓取
+    holder = png_bytes(128, 128)
+    real = png_bytes(1024, 1024)
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
+                           [holder, holder, holder, real],
+                           damage=[{"id": 300, "msg": stale}])
+    starts = []
+    found = []
+    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
+    w.blacklist_found.connect(lambda names: found.append(list(names)),
+                              Qt.ConnectionType.DirectConnection)
+
+    w._tick()                       # 车库建立基线: 窗口里那条旧消息只吸收
+    assert not starts and w._collected == set()
+    w.client.new_damage.append({"id": 301, "msg": fresh})
+    w._tick()                       # 加载期收到新击杀(地图还是占位图) → 立刻判进局 + 报警
+    assert starts == [1] and w._in_battle, (starts, w._in_battle)
+    assert w._collected == {"目击而道存矣"}, w._collected
+    assert found[-1] == [("目击而道存矣", "测试")], found
+    assert "OldGuy" not in w._collected, w._collected
+    w.client.i = 3
+    w._tick()                       # 地图图片终于出现 → 还是同一个对局, 不清空
+    assert len(starts) == 1 and w._collected == {"目击而道存矣"}, w._collected
+    w.stop()
+    results.append("loading-screen kill starts battle OK")
+
+
 def test_second_battle_ignores_previous_window() -> None:
     """上一局留在 8111 窗口里的消息, 在下一局不能算本局战果(出局清空 + 只认新 id)。"""
     from garage_test import png_bytes
@@ -593,6 +637,7 @@ def main() -> int:
     test_leaving_battle_clears_collected()
     test_garage_never_starts_battle()
     test_stale_hudmsg_window_not_collected()
+    test_loading_screen_kill_starts_battle()
     test_second_battle_ignores_previous_window()
     test_shared_table_avoids_wtlive()
     test_shared_table_fallback_on_fail()
@@ -600,7 +645,7 @@ def main() -> int:
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 14 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 15 else "FAILED")
     return 0
 
 
