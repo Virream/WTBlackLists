@@ -434,6 +434,48 @@ def test_stale_hudmsg_window_not_collected() -> None:
     results.append("stale /hudmsg window not collected OK")
 
 
+def test_early_kill_before_battle_is_recovered() -> None:
+    """进局前(加载期/软件刚启动就能收到的)击杀, 进对局时要回捞。
+
+    复现用户场景: 进试车场时第一辆靶车在地图图片出现前就被击毁 → 之前会漏报;
+    现在用 damage[].time(本局开始后秒数)识别换局, 进局时把“本局开头”的击杀回捞。
+    """
+    from garage_test import png_bytes
+
+    stale = "=AZUR2= StaleGuy (T-55A) 击毁了 Whatever (M2A2)"   # 上一局的(本局开头之外)
+    early = "=AZUR2= 目击而道存矣 (豹 2PL) 击毁了 IT-1"          # 新一局开头打掉的
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="1", nickname="目击而道存矣", reason="测试"))
+    w = MonitorWorker(store, nickname_cache=cache)
+    w._profile_cache["1"] = ("目击而道存矣", time.time())   # 免预抓取
+    holder = png_bytes(128, 128)
+    real = png_bytes(1024, 1024)
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
+                           [holder, holder, real, real],
+                           damage=[{"id": 100, "msg": stale, "time": 300},
+                                   {"id": 101, "msg": early, "time": 3}])
+    starts = []
+    found = []
+    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
+    w.blacklist_found.connect(lambda names: found.append(list(names)),
+                              Qt.ConnectionType.DirectConnection)
+
+    w._tick()                       # 车库建立基线: 两条都在窗口里(只吸收, 不收集)
+    assert not w._in_battle and w._collected == set()
+    w._tick()                       # 还是车库: 没有新消息 → 不触发兜底
+    assert not w._in_battle and w._collected == set(), w._collected
+    w.client.i = 2
+    w._tick()                       # 进对局(真地图) → 回捞本局开头那条 + 报警
+    assert len(starts) == 1 and w._in_battle
+    assert "目击而道存矣" in w._collected, w._collected
+    assert "StaleGuy" not in w._collected, w._collected
+    assert found[-1] == [("目击而道存矣", "测试")], found
+    w.stop()
+    results.append("early kill before battle recovered OK")
+
+
 def test_shared_table_avoids_wtlive() -> None:
     """自动刷新优先查 GitHub 共享表: 命中则免访问 WTLive/官网。"""
     tmpdir = tempfile.mkdtemp()
@@ -551,13 +593,14 @@ def main() -> int:
     test_leaving_battle_clears_collected()
     test_garage_never_starts_battle()
     test_stale_hudmsg_window_not_collected()
+    test_early_kill_before_battle_is_recovered()
     test_shared_table_avoids_wtlive()
     test_shared_table_fallback_on_fail()
     test_auto_upload_nicknames()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 13 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 14 else "FAILED")
     return 0
 
 
