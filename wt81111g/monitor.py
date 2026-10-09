@@ -24,6 +24,10 @@ from .warthunder import (
 
 log = logging.getLogger("monitor")
 
+# 刚收到击杀/发言后, 这么多秒内不把“没有真地图”当成“已回车库”:
+# 试车场等场景可能不给真地图图片, 但击杀消息说明人还在对局里, 不该清空本局收集。
+ACTIVITY_GRACE = 5.0
+
 
 class MonitorWorker(QObject):
     """后台线程轮询 8111 并维护“当前对局昵称”,与黑名单比对。"""
@@ -58,6 +62,8 @@ class MonitorWorker(QObject):
         self._connected = False
         self._in_battle = False
         self._garage_ticks = 0   # 连续多少个 tick 都没看到真地图
+        self._last_activity = 0.0  # 最近一次收到击杀/发言的时间
+        self._cmp_sig: tuple | None = None  # 上次比对的输入签名(避免重复算)
         self._battle_sig: str | None = None
         self._gamechat_cursor = -1
         self._evt_cursor = -1
@@ -108,6 +114,7 @@ class MonitorWorker(QObject):
         # 一会儿(实测 mission.objectives 会短暂保留上一局的内容), 叠加层就会在机库里
         # 多显示一段时间的“正在确认名单中…”。
         in_map = in_map_by_image(self.client.map_image(limit=PROBE_BYTES))
+        now = time.time()
         # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
         if in_map:
@@ -115,11 +122,16 @@ class MonitorWorker(QObject):
             if not self._in_battle:
                 self._start_battle()
         elif self._in_battle:
-            # 没有真地图: 连续 GARAGE_CONFIRM_TICKS 个 tick 才认定回到车库,
-            # 图片一时拿不到(8111 偶发超时)不该立刻把叠加层撤掉。
-            self._garage_ticks += 1
-            if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
-                self._end_battle("8111 没有地图图片 / 只给车库占位图")
+            if now - self._last_activity < ACTIVITY_GRACE:
+                # 刚刚还有击杀/发言 → 肯定还在对局里(地图图片一时拿不到, 或试车场
+                # 给的不是真地图): 先不判离开, 免得把本局收集清掉、叠加层闪一下。
+                self._garage_ticks = 0
+            else:
+                # 没有真地图: 连续 GARAGE_CONFIRM_TICKS 个 tick 才认定回到车库,
+                # 图片一时拿不到(8111 偶发超时)不该立刻把叠加层撤掉。
+                self._garage_ticks += 1
+                if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
+                    self._end_battle("8111 没有地图图片 / 只给车库占位图")
 
         # 击杀/发言收集。仅当“已在战斗中”或“本会话曾进入过战斗(光标已初始化)”
         # 时轮询, 以便在图片判定延迟时, 靠击杀/发言兜底确认进入战斗,
@@ -141,6 +153,7 @@ class MonitorWorker(QObject):
                 # 兜底: 有击杀/发言但进出场判定未命中 → 确认在地图中
                 log.info("battle confirmed by activity (kill/chat)")
                 self._start_battle()
+            before = len(self._collected)
             if msgs:
                 for m in msgs:
                     mid = int(m.get("id", -1))
@@ -161,6 +174,11 @@ class MonitorWorker(QObject):
                         self._dmg_cursor = did
                     for name in parse_hudmsg_names(dmg.get("msg", "")):
                         self._collected.add(name)
+            if new_msg or new_dmg:
+                self._last_activity = now
+                if len(self._collected) > before:
+                    log.info("收集到 %d 个新昵称(本局共 %d 个)",
+                             len(self._collected) - before, len(self._collected))
             if msgs or (isinstance(hud, dict) and hud):
                 self.nicknames_updated.emit(sorted(self._collected))
                 self._compare()
@@ -170,6 +188,8 @@ class MonitorWorker(QObject):
         log.info("new battle detected")
         self._in_battle = True
         self._garage_ticks = 0
+        self._last_activity = 0.0
+        self._cmp_sig = None
         self._collected.clear()
         self._alerted.clear()
         self._found_nicks = []
@@ -186,6 +206,8 @@ class MonitorWorker(QObject):
         """
         self._in_battle = False
         self._garage_ticks = 0
+        self._last_activity = 0.0
+        self._cmp_sig = None
         self._collected.clear()
         self._alerted.clear()
         self._found_nicks = []
@@ -378,11 +400,20 @@ class MonitorWorker(QObject):
         threading.Thread(target=work, daemon=True).start()
 
     def _compare(self) -> None:
-        """把当前对局已收集昵称与黑名单昵称做比对,命中则告警。"""
+        """把当前对局已收集昵称与黑名单昵称做比对,命中则告警。
+
+        性能: 先算一个轻量签名(本局收集数量 + 名单指纹), 没变化就直接返回。
+        """
         if not self._collected:
             return
+        entries = list(self.store.entries)
+        sig = (len(self._collected), len(entries),
+               sum(len(e.player_id or "") + len(e.nickname or "") for e in entries))
+        if sig == self._cmp_sig:
+            return
+        self._cmp_sig = sig
         lowered = {n.lower(): n for n in self._collected}
-        for e in list(self.store.entries):
+        for e in entries:
             pid = (e.player_id or "").strip()
             key = pid or (e.nickname or "").strip()
             if not key or key in self._alerted:

@@ -5,12 +5,24 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QCheckBox, QLineEdit
 
 from wt81111g.overlay import OverlayWindow
+from wt81111g.overlay_settings_dialog import OverlaySettingsDialog
 from wt81111g.settings import OverlaySettings
 
 results = []
+
+# pytest 会直接收集并执行 test_* 函数(跳过 main()), 因此构造 QWidget 前
+# 必须保证存在 QApplication。这里懒创建并持有引用, 使 `pytest tests` 与
+# `python tests/overlay_test.py` 两种方式都能运行。
+_APP: QApplication | None = None
+
+
+def _ensure_app() -> None:
+    global _APP
+    if _APP is None:
+        _APP = QApplication.instance() or QApplication([])
 
 
 def _plain(html: str) -> str:
@@ -19,6 +31,7 @@ def _plain(html: str) -> str:
 
 
 def test_defaults_and_multi_rotate() -> None:
+    _ensure_app()
     s = OverlaySettings()
     assert s.show_reason is True
     assert s.text_found == "发现肃反人员" and s.text_checking == "正在确认名单中..."
@@ -35,6 +48,7 @@ def test_defaults_and_multi_rotate() -> None:
 
 
 def test_single_no_rotate() -> None:
+    _ensure_app()
     s = OverlaySettings()
     ov = OverlayWindow(s)
     ov.set_battle(True)
@@ -44,6 +58,7 @@ def test_single_no_rotate() -> None:
 
 
 def test_hide_reason() -> None:
+    _ensure_app()
     s = OverlaySettings()
     s.show_reason = False
     ov = OverlayWindow(s)
@@ -55,6 +70,7 @@ def test_hide_reason() -> None:
 
 
 def test_custom_texts() -> None:
+    _ensure_app()
     s = OverlaySettings()
     s.text_found = "危险人物"
     s.text_checking = "正在扫描..."
@@ -68,6 +84,7 @@ def test_custom_texts() -> None:
 
 
 def test_str_compat() -> None:
+    _ensure_app()
     s = OverlaySettings()
     ov = OverlayWindow(s)
     ov.set_battle(True)
@@ -77,10 +94,7 @@ def test_str_compat() -> None:
 
 
 def test_dialog_widgets() -> None:
-    from PyQt6.QtWidgets import QCheckBox, QLineEdit
-
-    from wt81111g.overlay_settings_dialog import OverlaySettingsDialog
-
+    _ensure_app()
     s = OverlaySettings()
     dlg = OverlaySettingsDialog(s)
     assert isinstance(dlg.show_reason_check, QCheckBox)
@@ -92,6 +106,37 @@ def test_dialog_widgets() -> None:
     results.append("dialog widgets OK")
 
 
+def test_show_checking_toggle() -> None:
+    """“确认中文本”开关: 关闭时未命中不显示叠加层, 命中提示不受影响。"""
+    _ensure_app()
+    s = OverlaySettings()
+    assert s.show_checking is True, "默认应为勾选(启用)"
+    ov = OverlayWindow(s)
+    ov.set_battle(True)
+    assert ov.isVisible() and "正在确认名单中" in ov._label.text()
+    s.show_checking = False
+    ov.apply_settings()                       # 关闭 → 未命中就不显示
+    assert not ov.isVisible(), "关闭确认中文本后不应显示叠加层"
+    ov.set_found([("玩家甲", "TK(空对地)")])   # 命中仍照常提示
+    assert ov.isVisible() and "玩家甲" in ov._label.text()
+    ov.set_found([])
+    assert not ov.isVisible(), "清空命中后又应隐藏"
+    s.show_checking = True
+    ov.apply_settings()
+    assert ov.isVisible() and "正在确认名单中" in ov._label.text(), "勾选回来应恢复显示"
+    ov.set_battle(False)
+    # 设置对话框: 勾选框在“确认中文本”前面, 默认勾选, 取消后输入框置灰
+    dlg = OverlaySettingsDialog(OverlaySettings())
+    assert isinstance(dlg.show_checking_check, QCheckBox)
+    assert dlg.show_checking_check.isChecked(), "默认应勾选"
+    assert dlg.text_checking_edit.isEnabled()
+    dlg.show_checking_check.setChecked(False)
+    assert dlg.settings.show_checking is False
+    assert not dlg.text_checking_edit.isEnabled(), "取消勾选后文本框应置灰"
+    dlg.close()
+    results.append("show_checking toggle OK")
+
+
 def main() -> int:
     app = QApplication([])
     for fn in (
@@ -101,6 +146,7 @@ def main() -> int:
         test_custom_texts,
         test_str_compat,
         test_dialog_widgets,
+        test_show_checking_toggle,
     ):
         fn()
     for r in results:

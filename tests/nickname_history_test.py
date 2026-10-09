@@ -335,8 +335,12 @@ def test_leaving_battle_clears_collected() -> None:
     assert updates[-1] == ["EnemyOne", "EnemyTwo"], updates
     w._found_nicks = [("EnemyOne", "开挂")]     # 模拟本局命中
     w.client.i = 1
-    w._tick()                       # 刚回车库第 1 tick: 还在确认, 不该清
-    assert w._collected, "确认前不应该清空"
+    w._tick()                       # 刚有发言(ACTIVITY_GRACE 内) → 不判离开
+    w._tick()
+    assert not ends and w._collected, "刚有击杀/发言时不该判离开"
+    w._last_activity = 0.0          # 模拟“确实安静下来了”
+    w._tick()                       # 回车库第 1 tick: 还在连续确认
+    assert not ends and w._collected, "确认前不应该清空"
     w._tick()                       # 连续确认 → 回到车库: 清空本局收集
     assert len(ends) == 1 and not w._in_battle
     assert w._collected == set(), w._collected

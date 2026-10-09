@@ -5,7 +5,7 @@ import os
 import sys
 
 APP_NAME = "WTBlackList"
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 
 # 战争雷霆 8111 本地接口
 WT_BASE_URL = "http://localhost:8111"
