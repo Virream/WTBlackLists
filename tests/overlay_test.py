@@ -5,9 +5,10 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QCheckBox, QLineEdit
 
 from wt81111g.overlay import OverlayWindow
+from wt81111g.overlay_settings_dialog import OverlaySettingsDialog
 from wt81111g.settings import OverlaySettings
 
 results = []
@@ -94,10 +95,6 @@ def test_str_compat() -> None:
 
 def test_dialog_widgets() -> None:
     _ensure_app()
-    from PyQt6.QtWidgets import QCheckBox, QLineEdit
-
-    from wt81111g.overlay_settings_dialog import OverlaySettingsDialog
-
     s = OverlaySettings()
     dlg = OverlaySettingsDialog(s)
     assert isinstance(dlg.show_reason_check, QCheckBox)
@@ -109,6 +106,37 @@ def test_dialog_widgets() -> None:
     results.append("dialog widgets OK")
 
 
+def test_show_checking_toggle() -> None:
+    """“确认中文本”开关: 关闭时未命中不显示叠加层, 命中提示不受影响。"""
+    _ensure_app()
+    s = OverlaySettings()
+    assert s.show_checking is True, "默认应为勾选(启用)"
+    ov = OverlayWindow(s)
+    ov.set_battle(True)
+    assert ov.isVisible() and "正在确认名单中" in ov._label.text()
+    s.show_checking = False
+    ov.apply_settings()                       # 关闭 → 未命中就不显示
+    assert not ov.isVisible(), "关闭确认中文本后不应显示叠加层"
+    ov.set_found([("玩家甲", "TK(空对地)")])   # 命中仍照常提示
+    assert ov.isVisible() and "玩家甲" in ov._label.text()
+    ov.set_found([])
+    assert not ov.isVisible(), "清空命中后又应隐藏"
+    s.show_checking = True
+    ov.apply_settings()
+    assert ov.isVisible() and "正在确认名单中" in ov._label.text(), "勾选回来应恢复显示"
+    ov.set_battle(False)
+    # 设置对话框: 勾选框在“确认中文本”前面, 默认勾选, 取消后输入框置灰
+    dlg = OverlaySettingsDialog(OverlaySettings())
+    assert isinstance(dlg.show_checking_check, QCheckBox)
+    assert dlg.show_checking_check.isChecked(), "默认应勾选"
+    assert dlg.text_checking_edit.isEnabled()
+    dlg.show_checking_check.setChecked(False)
+    assert dlg.settings.show_checking is False
+    assert not dlg.text_checking_edit.isEnabled(), "取消勾选后文本框应置灰"
+    dlg.close()
+    results.append("show_checking toggle OK")
+
+
 def main() -> int:
     app = QApplication([])
     for fn in (
@@ -118,6 +146,7 @@ def main() -> int:
         test_custom_texts,
         test_str_compat,
         test_dialog_widgets,
+        test_show_checking_toggle,
     ):
         fn()
     for r in results:

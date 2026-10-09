@@ -93,9 +93,19 @@ class OverlaySettingsDialog(QDialog):
         self.show_reason_check.setChecked(settings.show_reason)
         form.addRow("显示原因", self.show_reason_check)
 
+        # “确认中文本”前面的勾选框: 勾选=未命中时也显示该文本; 取消=该文本功能关闭
+        checking_row = QHBoxLayout()
+        self.show_checking_check = QCheckBox()
+        self.show_checking_check.setChecked(settings.show_checking)
+        self.show_checking_check.setToolTip(
+            "勾选: 未命中黑名单时叠加层也显示下面的“确认中”文本(表示正在确认名单);\n"
+            "取消: 关闭该文本 —— 未命中时叠加层保持隐藏, 命中时照常弹提示"
+        )
         self.text_checking_edit = QLineEdit(settings.text_checking)
         self.text_checking_edit.setPlaceholderText("正在确认名单中...")
-        form.addRow("确认中文本", self.text_checking_edit)
+        checking_row.addWidget(self.show_checking_check)
+        checking_row.addWidget(self.text_checking_edit, 1)
+        form.addRow("确认中文本", checking_row)
 
         self.text_found_edit = QLineEdit(settings.text_found)
         self.text_found_edit.setPlaceholderText("发现肃反人员")
@@ -122,6 +132,7 @@ class OverlaySettingsDialog(QDialog):
         self.radius_spin.valueChanged.connect(self._on_change)
         self.lock_check.toggled.connect(self._on_change)
         self.show_reason_check.toggled.connect(self._on_change)
+        self.show_checking_check.toggled.connect(self._on_change)
         self.text_checking_edit.textChanged.connect(self._on_change)
         self.text_found_edit.textChanged.connect(self._on_change)
 
@@ -139,6 +150,7 @@ class OverlaySettingsDialog(QDialog):
         self.settings.corner_radius = int(self.radius_spin.value())
         self.settings.locked = self.lock_check.isChecked()
         self.settings.show_reason = self.show_reason_check.isChecked()
+        self.settings.show_checking = self.show_checking_check.isChecked()
         self.settings.text_checking = self.text_checking_edit.text().strip() or "正在确认名单中..."
         self.settings.text_found = self.text_found_edit.text().strip() or "发现肃反人员"
         self._update_lock_state()
@@ -148,6 +160,8 @@ class OverlaySettingsDialog(QDialog):
         locked = self.settings.locked
         self.x_spin.setEnabled(not locked)
         self.y_spin.setEnabled(not locked)
+        # 关闭“确认中文本”时把输入框置灰(设置值仍保留, 下次勾选回来即恢复)
+        self.text_checking_edit.setEnabled(self.show_checking_check.isChecked())
 
     def _pick_color(self) -> None:
         color = QColorDialog.getColor(
@@ -191,6 +205,7 @@ class OverlaySettingsDialog(QDialog):
         self.settings.font_color = d.font_color
         self.radius_spin.setValue(d.corner_radius)
         self.show_reason_check.setChecked(d.show_reason)
+        self.show_checking_check.setChecked(d.show_checking)
         self.text_checking_edit.setText(d.text_checking)
         self.text_found_edit.setText(d.text_found)
         self._update_color_btn()

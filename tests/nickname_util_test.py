@@ -9,8 +9,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from wt81111g.nickname_util import (
-    battle_nickname_variants, clean_battle_nickname, clean_wtlive_nickname,
-    matches,
+    BattleNickIndex, battle_nickname_variants, clean_battle_nickname,
+    clean_wtlive_nickname, matches,
 )
 
 results: list[str] = []
@@ -65,12 +65,31 @@ def test_matches() -> None:
     check("不相关不匹配", matches(["PlayerOne"], "AnotherPlayer") is None)
 
 
+def test_battle_nick_index() -> None:
+    """批量比对索引: 与 matches 同样规则, 但不逐条两两扫(性能)。"""
+    idx = BattleNickIndex(["⋇RUNASAPURIZUMU1", "=AZUR2= 目击而道存矣 (豹 2PL)",
+                           "SKW Uchpochmak1179", "ThyTree"])
+    check("索引: 精确", idx.match(["ThyTree"]) == "ThyTree")
+    check("索引: 忽略大小写", idx.match(["thytree"]) == "ThyTree")
+    check("索引: 去⋇后匹配", idx.match(["RUNASAPURIZUMU1"]) == "⋇RUNASAPURIZUMU1")
+    check("索引: 联队名前缀匹配", idx.match(["Uchpochmak1179"]) == "SKW Uchpochmak1179")
+    check("索引: 中文(带联队前缀)匹配",
+          idx.match(["目击而道存矣"]) == "=AZUR2= 目击而道存矣 (豹 2PL)")
+    check("索引: 子串命中", idx.match(["RUNASAPURIZU"]) == "⋇RUNASAPURIZUMU1")
+    check("索引: 太长不误报", idx.match(["RUNASAPURIZUMU1X"]) is None)
+    check("索引: 短候选不误报", idx.match(["ab"]) is None)
+    check("索引: 不相关不匹配", idx.match(["PlayerOne"]) is None)
+    check("索引: 不跨昵称误匹配", idx.match(["ThyTree\n=AZUR2="]) is None)
+    check("索引: 空候选", idx.match(["", None]) is None)
+
+
 def main() -> int:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")  # GBK 控制台兼容
     test_clean_wtlive()
     test_clean_battle()
     test_variants()
     test_matches()
+    test_battle_nick_index()
     print("\n".join(results))
     print("NICKNAME UTIL TEST PASSED")
     return 0

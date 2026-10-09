@@ -1,13 +1,33 @@
 """战争雷霆黑名单助手 —— 程序入口。"""
 import logging
+import os
 import sys
+from logging.handlers import RotatingFileHandler
 
 from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
-from wt81111g.config import APP_NAME, APP_VERSION
+from wt81111g.config import APP_NAME, APP_VERSION, data_dir
 from wt81111g.main_window import MainWindow
 from wt81111g.single_instance import ensure_single_instance
+
+
+def _setup_logging() -> None:
+    """日志同时进控制台与文件(打包成 --windowed 后控制台看不到, 排查问题要看文件)。"""
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    try:
+        handlers.append(RotatingFileHandler(
+            os.path.join(data_dir(), "WTBlackList.log"),
+            maxBytes=2 * 1024 * 1024, backupCount=2, encoding="utf-8",
+        ))
+    except OSError:
+        pass   # 目录不可写等 → 只用控制台
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        handlers=handlers,
+        force=True,
+    )
 
 
 def main() -> int:
@@ -17,10 +37,7 @@ def main() -> int:
         hidden = "--hidden" in sys.argv[4:]
         return child_main(sys.argv[2], sys.argv[3], hidden=hidden)
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    _setup_logging()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setApplicationDisplayName(f"{APP_NAME} v{APP_VERSION}")

@@ -56,6 +56,7 @@ class OverlayWindow(QWidget):
         self._found: list[tuple[str, str]] = []  # (昵称, 原因)
         self._rotate_index = 0
         self._click_hwnd: int | None = None  # 已设置点击穿透的窗口句柄(避免重复调用)
+        self._html = ""                       # 当前文本(内容没变就不再重排/重绘)
         self._rotate_timer = QTimer(self)
         self._rotate_timer.setInterval(3000)  # 多条命中时每 3 秒轮换
         self._rotate_timer.timeout.connect(self._rotate)
@@ -116,7 +117,7 @@ class OverlayWindow(QWidget):
     def _refresh(self) -> None:
         if not self._in_battle or not self._enabled:
             self._rotate_timer.stop()
-            self.hide()
+            self._hide_overlay()
             return
         if self._found:
             if len(self._found) > 1:
@@ -126,9 +127,17 @@ class OverlayWindow(QWidget):
             self._update_label()
         else:
             self._rotate_timer.stop()
+            if not self.settings.show_checking:
+                # “确认中文本”关掉: 未命中时叠加层保持隐藏(命中照常提示)
+                self._hide_overlay()
+                return
             color = self.settings.font_color
             text = self.settings.text_checking or "正在确认名单中..."
             self._show_html(f'<span style="color:{color};">{_esc(text)}</span>')
+
+    def _hide_overlay(self) -> None:
+        self.hide()
+        self._html = ""      # 下次显示时要重新走 show()
 
     def _update_label(self) -> None:
         if not self._found:
@@ -147,6 +156,9 @@ class OverlayWindow(QWidget):
             self._update_label()
 
     def _show_html(self, html: str) -> None:
+        if html == self._html and self.isVisible():
+            return          # 文本没变(例如 3 秒轮换到同一条) → 不重排、不重绘
+        self._html = html
         self._label.setText(html)
         self._apply_style()
         self._apply_position()

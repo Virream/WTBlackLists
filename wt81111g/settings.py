@@ -21,6 +21,7 @@ class OverlaySettings:
     font_color: str = "#e0e0e0"          # 字体颜色
     corner_radius: int = 12    # 背景圆角弧度 px
     show_reason: bool = True   # 命中提示是否显示原因
+    show_checking: bool = True  # 是否显示“确认中”文本(关闭后未命中时叠加层保持隐藏)
     text_checking: str = "正在确认名单中..."  # 未命中时提示文本
     text_found: str = "发现肃反人员"          # 命中时的标题文本
 
