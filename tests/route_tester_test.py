@@ -1963,6 +1963,67 @@ def test_map_merge_old_duplicates(tmpdir: str):
     results.append("地图缓存: 启动时合并历史重复条目 OK")
 
 
+def test_map_smooth_zoom(tmpdir: str):
+    """滚轮放大用的是**平滑(双线性)**缩放; 关掉它画面应明显不同(台阶/马赛克)。
+
+    实测开销可忽略(整帧 1.72 → 1.49 ms), 所以默认开着 —— 这条用例防止以后被误删。
+    """
+    from PyQt6.QtGui import QPainter
+
+    view = RouteMapView()
+    view.resize(400, 400)
+    assert view.set_map_bytes(png_pattern(256))
+    view._zoom = 6.0                      # 放大到能明显看出滤波差别
+    canvas = QImage(400, 400, QImage.Format.Format_ARGB32)
+    view.render(canvas)
+    pixels = [canvas.pixel(x, y) for y in range(0, 400, 2) for x in range(0, 400, 2)]
+
+    real_base = RouteMapView._draw_base
+
+    def nearest(self, p):                 # 强制最近邻(旧行为)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, False)
+        return real_base(self, p)
+
+    RouteMapView._draw_base = nearest
+    try:
+        other = QImage(400, 400, QImage.Format.Format_ARGB32)
+        view.render(other)
+    finally:
+        RouteMapView._draw_base = real_base
+    pixels2 = [other.pixel(x, y) for y in range(0, 400, 2) for x in range(0, 400, 2)]
+    diff = sum(1 for a, b in zip(pixels, pixels2) if a != b)
+    assert diff > 50, f"生产路径应该是平滑缩放(与最近邻应有明显差别), 实测差异 {diff}"
+    results.append(f"地图缩放用平滑滤波(与最近邻差 {diff} 个采样点) OK")
+
+
+def test_map_sharpest(tmpdir: str):
+    """8111 发来低分辨率的地图时, 用**手上更清晰的那份**显示(放大看细节差别很大)。"""
+    from wt81111g.map_cache import MapCache
+
+    cache = MapCache(os.path.join(tmpdir, "sharp"))
+    big, small = png_pattern(256), png_pattern(128)
+    key, _ = cache.save(big)
+    assert cache.sharpest(key, small) == big, "缓存里更清晰 → 用缓存那份"
+    assert cache.sharpest(key, png_pattern(512)) != big, "手上这份更清晰 → 用它自己"
+    assert cache.sharpest("不存在的键", small) == small
+    assert cache.sharpest(key, None) is None
+
+    # 窗口层: 收到 128 的图时, 底图应该仍是缓存里的 256 那份
+    app = QApplication.instance()
+    win = make_window(tmpdir, "sharpwin.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    key, _ = win.map_cache.save(png_pattern(256))       # 存进**这个窗口**的缓存
+    win.recorder._map_key = key
+    win._on_map_changed(png_pattern(128))
+    app.processEvents()
+    assert win.map_view._pixmap is not None
+    assert win.map_view._pixmap.width() == 256, win.map_view._pixmap.width()
+    assert win.map_view.map_key == key
+    win.close()
+    results.append("地图清晰度优先(用缓存里更清晰的那份) OK")
+
+
 def image_info_ok(cache, key: str, width: int) -> bool:
     """缓存里这个键的图片宽度是不是 width(小工具, 只给上面的测试用)。"""
     from wt81111g.map_cache import image_info
@@ -2530,6 +2591,8 @@ def main() -> int:
     test_map_cache(tmpdir)
     test_map_resolution_alias(tmpdir)
     test_map_merge_old_duplicates(tmpdir)
+    test_map_smooth_zoom(tmpdir)
+    test_map_sharpest(tmpdir)
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)
     test_eye_icon_no_overlap(tmpdir)

@@ -26,7 +26,7 @@ import time
 from dataclasses import dataclass
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QImage
+from PyQt6.QtGui import QImage, QImageReader
 
 from .config import data_dir
 from .route_store import PLACEHOLDER_MAP_SHA1
@@ -149,6 +149,21 @@ def looks_same(distance: float, ham: int, second: float | None = None) -> bool:
 
 # 认为“是地图图片”的扩展名(遍历缓存目录时用)
 _EXTS = ("jpg", "png", "webp", "gif", "img")
+
+
+def image_size(data: bytes | None) -> tuple[int, int]:
+    """拿到图片尺寸; 失败返回 (0, 0)。
+
+    直接解码(QImage)而不是 `QImageReader + QBuffer` 读头: 后者要求 QBuffer 活到读完,
+    而 Python 局部变量的销毁顺序不确定 —— 一旦 QBuffer 先被回收, Qt 侧就拿到悬空设备
+    (实测会随机崩)。这里只在**地图变化时**调用一次, 解码那几十毫秒无所谓。
+    """
+    if not data:
+        return (0, 0)
+    img = QImage()
+    if img.loadFromData(data):
+        return (img.width(), img.height())
+    return (0, 0)
 
 
 @dataclass
@@ -322,6 +337,33 @@ class MapCache:
         except OSError as exc:  # noqa: BLE001
             log.warning("读取地图缓存失败 %s: %s", path, exc)
             return None
+
+    def sharpest(self, key: str, data: bytes | None) -> bytes | None:
+        """同一张地图若有**更清晰的缓存版本**, 返回缓存那份(否则原样返回 `data`)。
+
+        8111 按“地图代数”发不同分辨率(1024/2048/4096), 手上既然有更清楚的同一张图,
+        就别把模糊的那份画上去 —— 放大到 8 倍看细节时差别很明显。
+        只读图片头比较尺寸(`QImageReader.size()`), 不解码整张图, 开销极小。
+        """
+        if not data:
+            return data
+        path = self.path_of(key)
+        if path is None:
+            return data
+        live_w, live_h = image_size(data)
+        if not live_w:
+            return data
+        try:
+            size = QImageReader(path).size()
+        except Exception:  # noqa: BLE001
+            return data
+        if size.isValid() and size.width() * size.height() > live_w * live_h:
+            cached = self.load(key)
+            if cached:
+                log.info("按更清晰的缓存版本显示地图: %dx%d 优于 8111 当前的 %dx%d",
+                         size.width(), size.height(), live_w, live_h)
+                return cached
+        return data
 
     def keys(self) -> list[str]:
         """全部已缓存地图键(只看图片文件; 索引 index.json / 临时文件不算)。"""

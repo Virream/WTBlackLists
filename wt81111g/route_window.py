@@ -1477,7 +1477,10 @@ class RouteTesterWindow(QMainWindow):
 
     def _on_map_changed(self, data: bytes) -> None:
         # 用录制线程已经解析好的地图身份(同一张地图的不同分辨率会归到同一个键)
-        changed = self.map_view.set_map_bytes(data, key=self.recorder.map_key)
+        key = self.recorder.map_key
+        # 8111 偶尔只发低分辨率的那份(1024²); 手上有更清晰的同一张图就用它显示
+        data = self.map_cache.sharpest(key, data)
+        changed = self.map_view.set_map_bytes(data, key=key)
         if not changed:
             return
         self._apply_zones()          # 换了地图 → 换用该地图的战区布局
