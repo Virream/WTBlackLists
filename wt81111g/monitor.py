@@ -41,6 +41,7 @@ ACTIVITY_GRACE = 5.0
 EARLY_KILL_SECS = 60     # 只认本局开头这么多秒内的击杀
 EARLY_KILL_MAX = 5       # 最多回捞几个昵称
 EARLY_KILL_TTL = 300.0   # 收到后这么多秒内没进对局就不再回捞
+EARLY_KILL_STALE_AFTER = 120   # 窗口里本局已推进超过这么多秒 → 那些“开头击杀”是陈旧的
 
 
 class MonitorWorker(QObject):
@@ -84,6 +85,7 @@ class MonitorWorker(QObject):
         self._prev_mission_time = -1   # 上一条击杀消息的 time(用来识别换局)
         self._pending_names: list[str] = []   # 进局前收到的“本局开头”击杀昵称
         self._pending_since = 0.0
+        self._pending_clock = -1     # 这些候选所属那一局已经推进到第几秒
         self._cmp_sig: tuple | None = None  # 上次比对的输入签名(避免重复算)        self._battle_sig: str | None = None
         self._gamechat_cursor = -1
         self._evt_cursor = -1
@@ -242,6 +244,10 @@ class MonitorWorker(QObject):
 
         用 `damage[].time`(“本局开始后秒数”)识别换局: 同一局内递增, 换局时往下跳 →
         跳点说明新的一局开始, 之前的候选全丢掉(避免把上一局的人带进新局)。
+
+        另外记 `_pending_clock`(本局已推进到第几秒): 8111 的窗口里可能还留着**上一局
+        开头**的击杀(那时 time 也很小), 若本局已经进行很久, 这些“开头击杀”显然是陈旧的
+        → 回捞时要丢掉(见 `_start_battle`)。
         """
         if not isinstance(hud, dict):
             return
@@ -255,7 +261,10 @@ class MonitorWorker(QObject):
             if self._prev_mission_time >= 0 and t < self._prev_mission_time:
                 self._pending_names.clear()      # time 往下跳 → 换了一局
                 self._pending_since = now
+                self._pending_clock = t
             self._prev_mission_time = t
+            if t > self._pending_clock:
+                self._pending_clock = t
             if t <= EARLY_KILL_SECS:
                 for name in parse_hudmsg_names(dmg.get("msg", "")):
                     if name not in self._pending_names and len(self._pending_names) < EARLY_KILL_MAX:
@@ -278,13 +287,18 @@ class MonitorWorker(QObject):
         self.blacklist_found.emit([])
         # 回捞: 进对局前收到的“本局开头”击杀(见 _remember_pending)
         if self._pending_names and (time.time() - self._pending_since) <= EARLY_KILL_TTL:
-            for name in self._pending_names:
-                self._collected.add(name)
-            log.info("进入对局: 回捞进局前收到的 %d 个昵称 %s",
-                     len(self._pending_names), self._pending_names)
-            self.nicknames_updated.emit(sorted(self._collected))
-            self._compare()
+            if self._pending_clock <= EARLY_KILL_STALE_AFTER:
+                for name in self._pending_names:
+                    self._collected.add(name)
+                log.info("进入对局: 回捞进局前收到的 %d 个昵称 %s",
+                         len(self._pending_names), self._pending_names)
+                self.nicknames_updated.emit(sorted(self._collected))
+                self._compare()
+            else:
+                log.info("进入对局: 丢弃陈旧的候选昵称 %d 个(那局已进行 %s 秒)",
+                         len(self._pending_names), self._pending_clock)
         self._pending_names.clear()
+        self._pending_clock = -1
         self._start_prefetch()
 
     def _end_battle(self, reason: str) -> None:
@@ -298,6 +312,7 @@ class MonitorWorker(QObject):
         self._last_activity = 0.0
         self._cmp_sig = None
         self._pending_names.clear()     # 上一局的候选不要带进下一局
+        self._pending_clock = -1
         self._collected.clear()
         self._alerted.clear()
         self._found_nicks = []
