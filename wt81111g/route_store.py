@@ -32,6 +32,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import threading
 import time
 import uuid
@@ -441,6 +442,65 @@ class RouteStore:
                 if r.map_key == map_key:
                     r.map_name = self.map_names[map_key]
         self.save()
+
+    def merge_map_keys(self, keep: str, drop: str) -> bool:
+        """把 `drop` 这张地图的全部数据并到 `keep` 上, 并删掉 `drop` 条目。
+
+        用在“同一张地图被 8111 以不同分辨率发过来”时(见 MapCache.save):
+        两个键其实是同一张图, 侧栏/地图管理里就应该只有一个地图。
+        会先把 routes.json 备份成 .bak —— 这是会改用户数据的操作。
+        """
+        if not keep or not drop or keep == drop:
+            return False
+        moved = [r for r in self.routes if r.map_key == drop]
+        has_data = bool(moved) or drop in self.known_maps or bool(self.name_of(drop)) \
+            or bool(self.map_zones.get(drop)) or bool(self.layout_names.get(drop))
+        if not has_data:
+            return False
+        try:
+            if os.path.exists(self.path):
+                shutil.copyfile(self.path, self.path + ".bak")
+        except OSError as exc:  # noqa: BLE001
+            log.warning("备份线路数据失败: %s", exc)
+        with self._lock:
+            keep_name = self.display_name(keep)      # drop 的轨迹改用 keep 的显示名
+            for rec in moved:
+                rec.map_key = keep
+                rec.map_name = keep_name
+            # 见过的地图: drop 的位置换成 keep(保持“首次见到”的顺序), 去掉重复
+            self.known_maps = [keep if k == drop else k for k in self.known_maps]
+            seen: set[str] = set()
+            self.known_maps = [k for k in self.known_maps
+                               if not (k in seen or seen.add(k))]
+            if keep not in self.known_maps:
+                self.known_maps.append(keep)
+            # 名字: keep 没名字就用 drop 的
+            if not self.name_of(keep) and self.name_of(drop):
+                self.map_names[keep] = self.map_names[drop]
+            self.map_names.pop(drop, None)
+            # 战区布局: 按指纹合并(同一布局只留一份, 取较新的 seen_at)
+            merged: dict[str, dict] = {}
+            for layout in (self.map_zones.get(keep) or []) + (self.map_zones.get(drop) or []):
+                sig = str(layout.get("sig") or "")
+                old = merged.get(sig)
+                if old is None or str(layout.get("seen_at") or "") > str(old.get("seen_at") or ""):
+                    merged[sig] = layout
+            if merged:
+                self.map_zones[keep] = sorted(
+                    merged.values(), key=lambda x: str(x.get("seen_at") or ""),
+                    reverse=True)[:12]
+            self.map_zones.pop(drop, None)
+            # 用户给“区域/点位”起的名字
+            names = self.layout_names.pop(drop, None)
+            if names:
+                tgt = self.layout_names.setdefault(keep, {})
+                for sig, name in names.items():
+                    tgt.setdefault(sig, name)
+            if not self.layout_names.get(keep):
+                self.layout_names.pop(keep, None)
+        self.save()
+        log.info("已合并地图条目: %s ← %s (%d 条轨迹)", keep, drop, len(moved))
+        return True
 
     def ordered_map_keys(self) -> list[str]:
         """按首次见到顺序返回全部地图键(轨迹里的 + 只缓存了图片的), 保证顺序稳定。"""

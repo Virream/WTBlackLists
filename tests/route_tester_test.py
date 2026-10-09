@@ -77,6 +77,27 @@ def png_solid(color: str, size: int = 64) -> bytes:
     return bytes(ba)
 
 
+def png_pattern(size: int = 256, shift: int = 0) -> bytes:
+    """内存画一张有内容的“地图”(8×8 色块棋盘放大), 用于测“同图不同分辨率”。
+
+    同一 `shift` 的 128/256/... 版本内容一致、字节不同 —— 正好复现 8111 的行为。
+    """
+    src = QImage(8, 8, QImage.Format.Format_RGB32)
+    for y in range(8):
+        for x in range(8):
+            src.setPixelColor(x, y, QColor((x * 32 + shift * 17) % 256,
+                                           (y * 32 + 40) % 256,
+                                           ((x + y) * 16 + shift * 60) % 256))
+    big = src.scaled(size, size, Qt.AspectRatioMode.IgnoreAspectRatio,
+                     Qt.TransformationMode.FastTransformation)
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    big.save(buf, "PNG")
+    buf.close()
+    return bytes(ba)
+
+
 def test_helpers():
     assert fmt_time(0) == "00:00"
     assert fmt_time(30.4) == "00:30"
@@ -1847,6 +1868,88 @@ def test_map_cache(tmpdir: str):
     results.append("地图图片缓存(去重/占位图不入缓存/删除) OK")
 
 
+def test_map_resolution_alias(tmpdir: str):
+    """8111 会把同一张地图发成不同分辨率: 不能当成两张地图(2026-10-09 修的 bug)。
+
+    实测: 同一张图的 1024²/2048² 两份, 缩到 64×64 灰度后的平均差只有 0.41,
+    而**最接近的两张不同地图**是 11.97 → 阈值取 4 有足够余量。
+    """
+    from wt81111g.map_cache import SAME_IMAGE_TOL, MapCache, gray_distance, image_info, map_key
+
+    cache = MapCache(os.path.join(tmpdir, "alias"))
+    big, small = png_pattern(256), png_pattern(128)
+    other = png_pattern(256, shift=3)
+    assert map_key(big) != map_key(small), "分辨率不同 → 字节哈希必然不同"
+
+    info_big, info_small, info_other = image_info(big), image_info(small), image_info(other)
+    assert (info_big.width, info_small.width) == (256, 128)
+    d_same = gray_distance(info_big.gray, info_small.gray)
+    d_other = gray_distance(info_big.gray, info_other.gray)
+    assert d_same < SAME_IMAGE_TOL < d_other, (d_same, d_other)
+
+    # 同一张图的另一种分辨率 → 归到已有键, 不新建地图
+    key_big, created = cache.save(big)
+    assert created is True and key_big == map_key(big)
+    key_small, created2 = cache.save(small)
+    assert created2 is False and key_small == key_big
+    assert cache.keys() == [key_big], cache.keys()
+
+    # 反过来(先小后大): 同样归到一个键, 但缓存图升级为更清晰的那份
+    cache2 = MapCache(os.path.join(tmpdir, "alias2"))
+    k_small, _ = cache2.save(small)
+    cache2.save(big)
+    assert cache2.keys() == [k_small], cache2.keys()
+    kept = image_info(cache2.load(k_small))
+    assert kept is not None and kept.width == 256, "应保留分辨率更高的那份"
+
+    # 真正不同的地图 → 仍然各占一个键
+    key_other, created3 = cache2.save(other)
+    assert created3 is True and key_other not in (k_small,) and len(cache2.keys()) == 2
+    results.append("地图缓存: 同图不同分辨率归并到同一个键 OK")
+
+
+def test_map_merge_old_duplicates(tmpdir: str):
+    """老版本留下的“同图两个键”在启动时合并: 轨迹/名字/底图都并到保留的那个键。"""
+    from wt81111g.map_cache import MapCache, map_key
+
+    cache = MapCache(os.path.join(tmpdir, "merge"))
+    big, small = png_pattern(256), png_pattern(128)
+    key_big, key_small = map_key(big), map_key(small)
+    for key, blob in ((key_big, big), (key_small, small)):      # 老版本写下的两份
+        with open(os.path.join(cache.dir, f"{key}.png"), "wb") as fh:
+            fh.write(blob)
+
+    store = RouteStore(os.path.join(tmpdir, "merged.json"))
+    rec1 = store.new_route(key_big, "地图 A", "T-72B", 0.2, 0.2)
+    rec1.duration = 5.0
+    rec2 = store.new_route(key_small, "地图 A", "T-72B", 0.3, 0.3)
+    rec2.duration = 6.0
+    store.add(rec1)
+    store.add(rec2)
+    store.rename_map(key_big, "货运港口")          # 名字在“大图”那个键上
+    assert len(store.grouped()) == 2, "合并前是两张地图"
+
+    merged = cache.merge_duplicates(store)
+    assert merged == [(key_small, key_big)], merged  # 有名字/有记录的那个留下
+    assert {r.map_key for r in store.routes} == {key_big}, "轨迹应并到保留的键上"
+    assert store.display_name(key_big) == "货运港口"
+    assert len(store.grouped()) == 1, "合并后侧栏只剩一张地图"
+    assert cache.has(key_big) and not cache.has(key_small), "多余的那份图片应删掉"
+    assert image_info_ok(cache, key_big, 256), "保留的应是更清晰的那份"
+    assert os.path.exists(store.path + ".bak"), "改用户数据前应留一份备份"
+    # 再跑一次: 已经没有重复了
+    assert cache.merge_duplicates(store) == []
+    results.append("地图缓存: 启动时合并历史重复条目 OK")
+
+
+def image_info_ok(cache, key: str, width: int) -> bool:
+    """缓存里这个键的图片宽度是不是 width(小工具, 只给上面的测试用)。"""
+    from wt81111g.map_cache import image_info
+    blob = cache.load(key)
+    info = image_info(blob) if blob else None
+    return info is not None and info.width == width
+
+
 def test_cached_map_switch(tmpdir: str):
     """关掉游戏也能看回放: 显示/回放时把地图切成对应缓存图; 且不能跨地图混用。"""
     from wt81111g.map_cache import map_key
@@ -2404,6 +2507,8 @@ def main() -> int:
     test_recording_end_eye(tmpdir)
     test_playback_source_selection(tmpdir)
     test_map_cache(tmpdir)
+    test_map_resolution_alias(tmpdir)
+    test_map_merge_old_duplicates(tmpdir)
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)
     test_eye_icon_no_overlap(tmpdir)

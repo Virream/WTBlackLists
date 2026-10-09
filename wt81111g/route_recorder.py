@@ -165,14 +165,17 @@ class RouteRecorder(QObject):
                 digest = hashlib.sha1(data).hexdigest()
                 if digest != self._map_digest:
                     self._map_digest = digest
-                    self._map_key = digest[:12]
                     try:
+                        # 注意: 用缓存返回的键, 而不是字节哈希 —— 同一张地图的
+                        # 不同分辨率会归到同一个键上(见 MapCache.save)
                         key, created = self.map_cache.save(data)
+                        self._map_key = key
                         if key != PLACEHOLDER_MAP_KEY:
                             self.store.remember_map(key)
                         self.map_cached.emit(key, created)
                     except Exception as exc:  # noqa: BLE001 - 缓存失败不应影响显示
                         log.warning("缓存地图图片失败: %s", exc)
+                        self._map_key = digest[:12]
                     self.map_changed.emit(data)
                     log.info("地图已更新 (key=%s)", self._map_key)
             self._stop.wait(self.map_interval)

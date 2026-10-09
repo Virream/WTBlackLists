@@ -93,6 +93,9 @@ class RouteTesterWindow(QMainWindow):
         # (map_cache / start_recorder 可注入: 测试里指向临时目录且不启动真实 8111 轮询)
         # 必须在 _reload_tree() 之前赋值 —— 侧栏会用它判断“哪些地图只有缓存图片”
         self.map_cache = map_cache if map_cache is not None else MapCache()
+        # 同一张地图可能被 8111 以不同分辨率发过来(1024²/2048²/4096²) —— 老版本会按
+        # 字节哈希把它们当成两张地图。启动时把这类重复条目合并掉(见 _merge_duplicate_maps)
+        self._merged_maps = self._merge_duplicate_maps()
         self._last_duration = 0.0
         self._last_text_at = 0.0
         self._last_map_try = 0.0      # 上次尝试用缓存底图的时间(节流)
@@ -146,6 +149,15 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
         self._reload_tree()
+        if self._merged_maps:
+            names = []
+            for _drop, keep in self._merged_maps:
+                name = self.store.display_name(keep)
+                if name not in names:
+                    names.append(name)
+            self._set_status(
+                f"已把同一张地图的重复条目(不同分辨率)合并为: {'、'.join(names)}"
+                f"(原数据已备份为 routes.json.bak)", sticky=10.0)
         # 后台轮询 8111
         self.recorder = RouteRecorder(self.store, parent=self, map_cache=self.map_cache)
         self.recorder.tick.connect(self._on_tick)
@@ -729,6 +741,23 @@ class RouteTesterWindow(QMainWindow):
         """按侧栏顺序列出眼睛点亮的轨迹 id。"""
         return [it.data(0, _ROLE_ID) for it in self._iter_route_items()
                 if it.data(0, _ROLE_ID) in self._visible_ids]
+
+    def _merge_duplicate_maps(self) -> list[tuple[str, str]]:
+        """把“同一张地图被发成不同分辨率”的重复条目合并成一张地图。
+
+        8111 同一张地图会以 1024²/2048²/4096² 不同分辨率发出(实测), 老版本按字节
+        哈希当地图身份 → 同一张图被当成两张(2026-10-09 用户反馈)。
+        `MapCache.merge_duplicates` 会按“缩到 64×64 灰度后的平均差”认出来,
+        并把轨迹/名字/战区布局并到保留的那个键上(会先备份 routes.json)。
+        """
+        try:
+            merged = self.map_cache.merge_duplicates(self.store)
+        except Exception:  # noqa: BLE001 - 合并失败不应该影响启动
+            log.exception("合并重复地图失败")
+            return []
+        if merged:
+            log.info("启动时合并了 %d 个重复地图条目", len(merged))
+        return merged
 
     def _refresh_map_tracks(self) -> None:
         """把“眼睛点亮的轨迹”交给地图显示, 并把**选中的那几条**标为高亮。
@@ -1447,7 +1476,8 @@ class RouteTesterWindow(QMainWindow):
         self.map_view.update()
 
     def _on_map_changed(self, data: bytes) -> None:
-        changed = self.map_view.set_map_bytes(data)
+        # 用录制线程已经解析好的地图身份(同一张地图的不同分辨率会归到同一个键)
+        changed = self.map_view.set_map_bytes(data, key=self.recorder.map_key)
         if not changed:
             return
         self._apply_zones()          # 换了地图 → 换用该地图的战区布局
@@ -1486,7 +1516,7 @@ class RouteTesterWindow(QMainWindow):
         data = self.map_cache.load(key)
         if data is None:
             return False
-        return bool(self.map_view.set_map_bytes(data))
+        return bool(self.map_view.set_map_bytes(data, key=key))
 
     def _ensure_map_for(self, recs: list[RouteRecord]) -> None:
         """让地图改成这批轨迹所属的那张图(游戏没开时就靠本地缓存)。"""

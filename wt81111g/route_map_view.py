@@ -18,8 +18,8 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QWidget
 
 from .route_store import (
-    PLACEHOLDER_MAP_SHA1, RoutePoint, RouteRecord, fmt_speed, fmt_time, fmt_time_ms,
-    point_at, split_points,
+    PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, RoutePoint, RouteRecord, fmt_speed,
+    fmt_time, fmt_time_ms, point_at, split_points,
 )
 from .zones import BLINK_PERIODS
 
@@ -132,6 +132,9 @@ class RouteMapView(QWidget):
 
         self._pixmap: QPixmap | None = None
         self._map_digest: str | None = None
+        # 地图**身份**(可能由缓存层归并过: 同一张地图的不同分辨率共用一个键),
+        # 与字节指纹 _map_digest 分开 —— 后者只用来判断“图变了没有”
+        self._map_key: str | None = None
         self._live: RouteRecord | None = None
         # 侧栏里“眼睛点亮的”历史轨迹(可多条): 全部以不透明灰色轨迹画在地图上
         self._visible: list[RouteRecord] = []
@@ -258,12 +261,15 @@ class RouteMapView(QWidget):
         return list(self._spawns)
 
     # ------------------------------------------------------------------ 数据
-    def set_map_bytes(self, data: bytes | None) -> bool:
+    def set_map_bytes(self, data: bytes | None, key: str | None = None) -> bool:
         """更新地图图片; 返回地图是否发生变化(用于判断是否切换了地图)。
 
         战局外 8111 返回的是固定的 “?” 占位图(见 PLACEHOLDER_MAP_SHA1),
         它不被当作地图绘制, 只显示提示文字; 但同样返回 True(相当于“地图没了/换了”),
         以便上层清理不属于当前地图的轨迹。
+
+        `key` 是**地图身份**: 同一张地图的 1080/2048 分辨率字节不同, 但身份应该一样,
+        由缓存层归并后传进来(见 MapCache.save); 不传则用字节哈希。
         """
         if not data:
             if self._pixmap is None:
@@ -273,9 +279,11 @@ class RouteMapView(QWidget):
         if digest == self._map_digest:
             return False
         self._map_digest = digest
+        self._map_key = key or digest[:12]
         if digest == PLACEHOLDER_MAP_SHA1:
             # 战局外的 “?” 占位图: 不是地图, 不绘制
             self._pixmap = None
+            self._map_key = PLACEHOLDER_MAP_KEY
             self._status = "尚未进入对局/试车场(8111 当前只提供占位图)"
             self.reset_view()
             self.update()
@@ -297,8 +305,8 @@ class RouteMapView(QWidget):
 
     @property
     def map_key(self) -> str | None:
-        """当前地图的键(图片 sha1 前 12 位, 与 routes.json 的 map_key 一致)。"""
-        return self._map_digest[:12] if self._map_digest else None
+        """当前地图的身份键(与 routes.json 的 map_key / 缓存文件名一致)。"""
+        return self._map_key
 
     @property
     def live_record(self) -> RouteRecord | None:
