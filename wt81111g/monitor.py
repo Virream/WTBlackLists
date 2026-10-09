@@ -432,7 +432,9 @@ class MonitorWorker(QObject):
         if sig == self._cmp_sig:
             return
         self._cmp_sig = sig
-        lowered = {n.lower(): n for n in self._collected}
+        # 区分大小写: 游戏里同一串字母大小写不同就是不同的玩家 ID(不能按小写比较)
+        exact = {n: n for n in self._collected}
+        lowered = {n.lower(): n for n in self._collected}   # 仅用于“只差大小写”的提示
         for e in entries:
             pid = (e.player_id or "").strip()
             key = pid or (e.nickname or "").strip()
@@ -446,7 +448,13 @@ class MonitorWorker(QObject):
             if manual:
                 candidates.append(manual)
             for cand in candidates:
-                hit = lowered.get(cand.lower())
+                hit = exact.get(cand)
+                if hit is None:
+                    alt = lowered.get(cand.lower())
+                    if alt:
+                        # 只有大小写不同 → 不同玩家, 不算命中; 记一笔便于核对名单
+                        log.info("昵称仅大小写不同, 按不同玩家处理: 名单候选 %s vs 对局 %s",
+                                 cand, alt)
                 if hit:
                     self._alerted.add(key)
                     reason = e.reason or "其他原因"
