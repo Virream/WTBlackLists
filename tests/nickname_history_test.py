@@ -429,78 +429,46 @@ def test_stale_hudmsg_window_not_collected() -> None:
     results.append("stale /hudmsg window not collected OK")
 
 
-def test_early_kill_before_battle_is_recovered() -> None:
-    """进局前(加载期/软件刚启动就能收到的)击杀, 进对局时要回捞并报警。"""
+def test_second_battle_ignores_previous_window() -> None:
+    """上一局留在 8111 窗口里的消息, 在下一局不能算本局战果(出局清空 + 只认新 id)。"""
     from garage_test import png_bytes
 
-    stale = "=AZUR2= StaleGuy (T-55A) 击毁了 Whatever (M2A2)"   # 上一局的(本局开头之外)
-    early = "=AZUR2= 目击而道存矣 (豹 2PL) 击毁了 IT-1"          # 新一局开头打掉的
-    tmpdir = tempfile.mkdtemp()
-    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
-    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
-    store.add(BlacklistEntry(player_id="1", nickname="目击而道存矣", reason="测试"))
-    w = MonitorWorker(store, nickname_cache=cache)
-    w._profile_cache["1"] = ("目击而道存矣", time.time())   # 免预抓取
-    holder = png_bytes(128, 128)
-    real = png_bytes(1024, 1024)
-    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
-                           [holder, holder, real, real],
-                           damage=[{"id": 100, "msg": stale, "time": 300},
-                                   {"id": 101, "msg": early, "time": 3}])
-    starts = []
-    found = []
-    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
-    w.blacklist_found.connect(lambda names: found.append(list(names)),
-                              Qt.ConnectionType.DirectConnection)
-
-    w._tick()                       # 车库建立基线: 两条都在窗口里(只吸收, 不收集)
-    assert not w._in_battle and w._collected == set()
-    w._tick()                       # 还是车库
-    assert not w._in_battle and w._collected == set(), w._collected
-    w.client.i = 2
-    w._tick()                       # 进对局(真地图) → 回捞本局开头那条 + 报警
-    assert len(starts) == 1 and w._in_battle
-    assert "目击而道存矣" in w._collected, w._collected
-    assert "StaleGuy" not in w._collected, w._collected
-    assert found[-1] == [("目击而道存矣", "测试")], found
-    w.stop()
-    results.append("early kill before battle recovered OK")
-
-
-def test_old_mission_early_kills_not_replayed() -> None:
-    """窗口里**上一局开头**的击杀(那时 time 也很小)不能被回捞当成本局战果。"""
-    from garage_test import png_bytes
-
-    old_early = "=AZUR2= OldGuy (T-55A) 击毁了 Whatever (M2A2)"   # 上一局开头(time=3)
-    old_late = "=AZUR2= LateGuy (T-55A) 击毁了 TargetDummy (T-72)"  # 上一局结尾(time=311)
+    old = "=AZUR2= OldGuy (T-55A) 击毁了 Whatever (M2A2)"        # 上一局的击杀
+    fresh = "=AZUR2= NewGuy (豹 2PL) 击毁了 TargetDummy (T-72)"   # 本局新打掉的
     tmpdir = tempfile.mkdtemp()
     store = BlacklistStore(os.path.join(tmpdir, "b.json"))
     cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
     store.add(BlacklistEntry(player_id="1", nickname="OldGuy", reason="测试"))
+    store.add(BlacklistEntry(player_id="2", nickname="NewGuy", reason="测试"))
     w = MonitorWorker(store, nickname_cache=cache)
-    w._profile_cache["1"] = ("OldGuy", time.time())
+    w._profile_cache["1"] = ("OldGuy", time.time())   # 免预抓取
+    w._profile_cache["2"] = ("NewGuy", time.time())
     holder = png_bytes(128, 128)
     real = png_bytes(1024, 1024)
-    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
-                           [holder, holder, real, real],
-                           damage=[{"id": 200, "msg": old_early, "time": 3},
-                                   {"id": 320, "msg": old_late, "time": 311}])
-    starts = []
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 5,
+                           [real, holder, holder, real, real],
+                           damage=[{"id": 100, "msg": old, "time": 300}])
     found = []
-    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
     w.blacklist_found.connect(lambda names: found.append(list(names)),
                               Qt.ConnectionType.DirectConnection)
 
-    w._tick()
-    w._tick()
-    assert not starts and w._collected == set()
-    w.client.i = 2
-    w._tick()
-    assert len(starts) == 1 and w._in_battle
-    assert w._collected == set(), w._collected
+    w._tick()                       # 第 1 局开始(窗口里那条旧消息被基线吸收)
+    w._last_activity = 0.0
+    w.client.i = 1
+    w._tick()                       # 占位图第 1 tick
+    w._tick()                       # 连续确认 → 回车库: 清空本局收集
+    assert not w._in_battle and w._collected == set()
+    w.client.i = 3
+    w._tick()                       # 进第 2 局: 窗口里还是上一局那条 → 不能算本局
+    assert w._in_battle and w._collected == set(), w._collected
     assert not found or found[-1] == [], found
+    w.client.new_damage.append({"id": 101, "msg": fresh, "time": 12})
+    w._tick()                       # 新打掉一辆 → 这时才算
+    assert "NewGuy" in w._collected, w._collected
+    assert "OldGuy" not in w._collected, w._collected
+    assert found[-1] == [("NewGuy", "测试")], found
     w.stop()
-    results.append("old mission early kills not replayed OK")
+    results.append("second battle ignores previous window OK")
 
 
 def main() -> int:
@@ -512,12 +480,11 @@ def main() -> int:
     test_leaving_battle_clears_collected()
     test_garage_never_starts_battle()
     test_stale_hudmsg_window_not_collected()
-    test_early_kill_before_battle_is_recovered()
-    test_old_mission_early_kills_not_replayed()
+    test_second_battle_ignores_previous_window()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 12 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 11 else "FAILED")
     return 0
 
 

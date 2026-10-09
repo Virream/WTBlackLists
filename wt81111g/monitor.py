@@ -25,16 +25,8 @@ from .warthunder import (
 log = logging.getLogger("monitor")
 
 # 刚收到击杀/发言后, 这么多秒内不把“没有真地图”当成“已回车库”:
-# 试车场等场景可能不给真地图图片, 但击杀消息说明人还在对局里, 不该清空本局收集。
+# 击杀消息说明人还在对局里, 不该清空本局收集(8111 偶发拿不到图片)。
 ACTIVITY_GRACE = 5.0
-
-# 进入新对局时“回捞”进局前收到的击杀(实测: 进试车场的加载期/软件刚启动时
-# 就已经击毁第一辆靶车) —— 用 damage[].time(“本局开始后秒数”)区分是哪一局:
-# 同一局内 time 递增, 换局时会往下跳; 只回捞“新局开头 EARLY_KILL_SECS 秒内”的击杀。
-EARLY_KILL_SECS = 60     # 只认本局开头这么多秒内的击杀
-EARLY_KILL_MAX = 5       # 最多回捞几个昵称
-EARLY_KILL_TTL = 300.0   # 收到后这么多秒内没进对局就不再回捞
-EARLY_KILL_STALE_AFTER = 120   # 窗口里本局已推进超过这么多秒 → 那些“开头击杀”是陈旧的
 
 
 class MonitorWorker(QObject):
@@ -72,10 +64,6 @@ class MonitorWorker(QObject):
         self._garage_ticks = 0   # 连续多少个 tick 都没看到真地图
         self._last_activity = 0.0  # 最近一次收到击杀/发言的时间
         self._msg_primed = False   # 是否已建立过消息基线(用来“吸收”上一局的旧消息)
-        self._prev_mission_time = -1   # 上一条击杀消息的 time(用来识别换局)
-        self._pending_names: list[str] = []   # 进局前收到的“本局开头”击杀昵称
-        self._pending_since = 0.0
-        self._pending_clock = -1     # 这些候选所属那一局已经推进到第几秒
         self._cmp_sig: tuple | None = None  # 上次比对的输入签名(避免重复算)
         self._battle_sig: str | None = None
         self._gamechat_cursor = -1
@@ -147,11 +135,10 @@ class MonitorWorker(QObject):
                     self._end_battle("8111 没有地图图片 / 只给车库占位图")
 
         # 击杀/发言收集。
-        # ⚠️ 不在对局(或本会话第一次轮询)时要“**吸收**”消息: 只推进游标、不收集。
-        # 原因: 8111 的 /hudmsg 是个**滚动窗口**, 刚进新对局(尤其是试车场)时里面还留着
-        # 上一局的击杀消息 —— 不吸收的话, 一进新对局就会把上一局的人算进“本局已收集”,
-        # 表现为“刚进试车场就检测到某某”。吸收之后, 只有**新**消息(进入后的击杀/发言)
-        # 才会被收集, 所以必须自己打掉一辆才有提示。
+        # ⚠️ 不在对局(或本会话第一次轮询)时只“**吸收**”消息: 推进游标、不收集、不匹配。
+        # 原因: 8111 的 /hudmsg 是**滚动窗口**, 刚进新对局时里面还留着上一局的消息;
+        # 消息 id 跨局只增不重置, 所以只能用“游标之后的新 id”判定“本局新增的”。
+        # 这样: 软件启动前就在窗口里的 ID、以及出局期间收到的消息, 都不可能参与本局判断。
         msgs = self.client.gamechat(self._gamechat_cursor)
         hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
         new_msg = bool(msgs)
@@ -166,11 +153,6 @@ class MonitorWorker(QObject):
             # 本会话第一次轮询: 8111 窗口里可能有上一局的旧消息, 这里只建立基线
             log.info("建立消息基线: 吸收窗口里的旧消息(本次 %d 条击杀/伤害)",
                      len(hud.get("damage") or []) if isinstance(hud, dict) else 0)
-        if absorbing and self._msg_primed and (new_msg or new_dmg):
-            # 兜底: 战局外却冒出新消息 → 其实已经在对局里(图片判定没命中)
-            log.info("battle confirmed by activity (kill/chat)")
-            self._start_battle()
-            absorbing = False
         before = len(self._collected)
         new_names: list[str] = []
         if not absorbing:
@@ -213,38 +195,7 @@ class MonitorWorker(QObject):
             if msgs or (isinstance(hud, dict) and hud):
                 self.nicknames_updated.emit(sorted(self._collected))
                 self._compare()
-        else:
-            self._remember_pending(hud, now)
         self._msg_primed = True
-
-    def _remember_pending(self, hud, now: float) -> None:
-        """不在对局时收到的击杀: 记下“本局开头那几秒”的昵称, 进对局时回捞。
-
-        用 `damage[].time`(“本局开始后秒数”)识别换局: 同一局内递增, 换局时往下跳 →
-        跳点说明新的一局开始, 之前的候选全丢掉(避免把上一局的人带进新局)。
-        """
-        if not isinstance(hud, dict):
-            return
-        for dmg in hud.get("damage", []) or []:
-            try:
-                t = int(dmg.get("time", -1))
-            except (TypeError, ValueError):
-                continue
-            if t < 0:
-                continue
-            if self._prev_mission_time >= 0 and t < self._prev_mission_time:
-                self._pending_names.clear()      # time 往下跳 → 换了一局
-                self._pending_since = now
-                self._pending_clock = t
-            self._prev_mission_time = t
-            if t > self._pending_clock:
-                self._pending_clock = t
-            if t <= EARLY_KILL_SECS:
-                for name in parse_hudmsg_names(dmg.get("msg", "")):
-                    if name not in self._pending_names and len(self._pending_names) < EARLY_KILL_MAX:
-                        self._pending_names.append(name)
-        if self._pending_names and not self._pending_since:
-            self._pending_since = now
 
     # ------------------------------------------------------------------
     def _start_battle(self) -> None:
@@ -259,20 +210,8 @@ class MonitorWorker(QObject):
         self.new_battle.emit()
         self.nicknames_updated.emit([])
         self.blacklist_found.emit([])
-        # 回捞: 进对局前收到的“本局开头”击杀(见 _remember_pending)
-        if self._pending_names and (time.time() - self._pending_since) <= EARLY_KILL_TTL:
-            if self._pending_clock <= EARLY_KILL_STALE_AFTER:
-                for name in self._pending_names:
-                    self._collected.add(name)
-                log.info("进入对局: 回捞进局前收到的 %d 个昵称 %s",
-                         len(self._pending_names), self._pending_names)
-                self.nicknames_updated.emit(sorted(self._collected))
-                self._compare()
-            else:
-                log.info("进入对局: 丢弃陈旧的候选昵称 %d 个(那局已进行 %s 秒)",
-                         len(self._pending_names), self._pending_clock)
-        self._pending_names.clear()
-        self._pending_clock = -1
+        # 本局只认“进局之后新收到的消息”(id > 游标): 进局前/上一局留在 8111 窗口里的
+        # 消息已经在游标之前了, 不会参与本局判断 —— 不做任何“回捞”猜测。
         self._start_prefetch()
 
     def _end_battle(self, reason: str) -> None:
@@ -285,8 +224,6 @@ class MonitorWorker(QObject):
         self._garage_ticks = 0
         self._last_activity = 0.0
         self._cmp_sig = None
-        self._pending_names.clear()     # 上一局的候选不要带进下一局
-        self._pending_clock = -1
         self._collected.clear()
         self._alerted.clear()
         self._found_nicks = []
