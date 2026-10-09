@@ -467,6 +467,42 @@ def test_early_kill_before_battle_is_recovered() -> None:
     results.append("early kill before battle recovered OK")
 
 
+def test_old_mission_early_kills_not_replayed() -> None:
+    """窗口里**上一局开头**的击杀(那时 time 也很小)不能被回捞当成本局战果。"""
+    from garage_test import png_bytes
+
+    old_early = "=AZUR2= OldGuy (T-55A) 击毁了 Whatever (M2A2)"   # 上一局开头(time=3)
+    old_late = "=AZUR2= LateGuy (T-55A) 击毁了 TargetDummy (T-72)"  # 上一局结尾(time=311)
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="1", nickname="OldGuy", reason="测试"))
+    w = MonitorWorker(store, nickname_cache=cache)
+    w._profile_cache["1"] = ("OldGuy", time.time())
+    holder = png_bytes(128, 128)
+    real = png_bytes(1024, 1024)
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
+                           [holder, holder, real, real],
+                           damage=[{"id": 200, "msg": old_early, "time": 3},
+                                   {"id": 320, "msg": old_late, "time": 311}])
+    starts = []
+    found = []
+    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
+    w.blacklist_found.connect(lambda names: found.append(list(names)),
+                              Qt.ConnectionType.DirectConnection)
+
+    w._tick()
+    w._tick()
+    assert not starts and w._collected == set()
+    w.client.i = 2
+    w._tick()
+    assert len(starts) == 1 and w._in_battle
+    assert w._collected == set(), w._collected
+    assert not found or found[-1] == [], found
+    w.stop()
+    results.append("old mission early kills not replayed OK")
+
+
 def main() -> int:
     test_blacklist_history()
     test_monitor_fresh_only()
@@ -477,10 +513,11 @@ def main() -> int:
     test_garage_never_starts_battle()
     test_stale_hudmsg_window_not_collected()
     test_early_kill_before_battle_is_recovered()
+    test_old_mission_early_kills_not_replayed()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 11 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 12 else "FAILED")
     return 0
 
 
