@@ -69,37 +69,53 @@ def battle_nickname_variants(nick: str) -> list[str]:
 class BattleNickIndex:
     """对局昵称索引: 建一次, 之后用候选昵称快速查命中。
 
-    匹配规则与 `matches` 一致: 完全相同(忽略大小写) > 子串包含(候选至少 3 字符)。
+    匹配规则(**区分大小写**, 与游戏一致): 完全相同 > 子串包含(候选至少 3 字符)。
+    为什么区分大小写: WT 里同一串字母大小写不同就是**不同的玩家 ID**(2026-10-10 用户确认),
+    按小写比较会把名单里的 `abc` 错报成对局里的 `ABC`(误报)。
     为什么要建索引: 黑名单比对时对局昵称有几百个、名单也有几百条, 逐条两两比对
     光字符串处理就要 100ms(实测 300 条 x 201 昵称), 会把界面卡住。
     这里把“变体 → 昵称”查表做好, 再把所有变体拼成一个大字符串做子串匹配(一次 C 层查找),
-    同样的量降到约 2ms。
+    同样的量降到约 1ms。
     """
 
     def __init__(self, nicknames: list[str]) -> None:
         self._owner: dict[str, str] = {}
         for nick in nicknames:
             for v in battle_nickname_variants(nick):
-                v = v.lower()
                 if v:
                     self._owner.setdefault(v, nick)
         # \n 分隔, 防止子串匹配跨昵称误命中
         self._joined = "\n" + "\n".join(self._owner) + "\n"
+        # 仅用于“只差大小写”时的提示, **不参与命中判定**
+        self._lower_owner: dict[str, str] = {
+            v.lower(): nick for nick in nicknames
+            for v in battle_nickname_variants(nick) if v
+        }
 
     def match(self, candidates: list[str]) -> str | None:
-        """返回命中的对局昵称(原样), 未命中返回 None。"""
+        """返回命中的对局昵称(原样), 未命中返回 None。**区分大小写**。"""
         for cand in candidates:
-            c = (cand or "").strip().lower()
+            c = (cand or "").strip()
             if not c:
                 continue
-            hit = self._owner.get(c)          # 完全相同(忽略大小写)
+            hit = self._owner.get(c)              # 完全相同(区分大小写)
             if hit is not None:
                 return hit
-            if len(c) >= 3 and c in self._joined:
+            if len(c) >= 3 and c in self._joined:  # 子串命中(同样区分大小写)
                 # 子串命中(候选是昵称的一部分): 很少见, 这时才回头找是哪条
                 for v, owner in self._owner.items():
                     if c in v:
                         return owner
+        return None
+
+    def match_ignoring_case(self, candidates: list[str]) -> str | None:
+        """仅供提示: 若忽略大小写会命中谁(命中判定仍按“不同玩家”处理)。"""
+        for cand in candidates:
+            c = (cand or "").strip().lower()
+            if c:
+                hit = self._lower_owner.get(c)
+                if hit is not None:
+                    return hit
         return None
 
 
@@ -107,24 +123,19 @@ def matches(nick_candidates: list[str], battle_nick: str) -> str | None:
     """把黑名单候选昵称(清洗后)与单个游戏内昵称做匹配。
 
     返回命中的游戏内昵称(原样), 未命中返回 None。
-    匹配优先级: 完全相等 > 忽略大小写相等 > 子串包含。
+    匹配优先级: 完全相等 > 子串包含(候选至少 3 字符); **区分大小写**。
     """
     battle = battle_nick.strip()
     if not battle:
         return None
-    battle_lower = battle.lower()
     for cand in nick_candidates:
         c = (cand or "").strip()
         if not c:
             continue
         if c == battle:
             return battle
-        cl = c.lower()
-        if cl == battle_lower:
-            return battle
         # 子串匹配: 候选昵称是游戏内昵称的子串(处理"联队名+平台标识+昵称"混排)
         # 要求候选至少 3 字符, 避免单字符误报
-        if len(cl) >= 3 and cl in battle_lower:
-            # 排除: 候选只是联队名等短前缀的一部分
+        if len(c) >= 3 and c in battle:
             return battle
     return None

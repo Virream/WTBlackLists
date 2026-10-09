@@ -58,7 +58,8 @@ def test_matches() -> None:
     cand_cn = ["目击而道存矣"]
     check("中文精确", matches(cand_cn, "目击而道存矣") == "目击而道存矣")
     # 大小写不敏感
-    check("大小写", matches(["abcDEF"], "ABCDEF") is not None)
+    check("区分大小写(大小写不同=不同玩家)", matches(["abcDEF"], "ABCDEF") is None)
+    check("大小写一致才命中", matches(["abcDEF"], "abcDEF") == "abcDEF")
     # 防误报: 候选太短不子串匹配
     check("短昵称不误报", matches(["ab"], "labc") is None)
     # 完全不相关
@@ -70,7 +71,8 @@ def test_battle_nick_index() -> None:
     idx = BattleNickIndex(["⋇RUNASAPURIZUMU1", "=AZUR2= 目击而道存矣 (豹 2PL)",
                            "SKW Uchpochmak1179", "ThyTree"])
     check("索引: 精确", idx.match(["ThyTree"]) == "ThyTree")
-    check("索引: 忽略大小写", idx.match(["thytree"]) == "ThyTree")
+    check("索引: 区分大小写", idx.match(["thytree"]) is None)
+    check("索引: 只差大小写时可提示", idx.match_ignoring_case(["thytree"]) == "ThyTree")
     check("索引: 去⋇后匹配", idx.match(["RUNASAPURIZUMU1"]) == "⋇RUNASAPURIZUMU1")
     check("索引: 联队名前缀匹配", idx.match(["Uchpochmak1179"]) == "SKW Uchpochmak1179")
     check("索引: 中文(带联队前缀)匹配",

@@ -535,6 +535,12 @@ class MonitorWorker(QObject):
             if manual:
                 cands.append(clean_wtlive_nickname(manual))
             hit = index.match(cands)
+            if hit is None:
+                alt = index.match_ignoring_case(cands)
+                if alt:
+                    # 只有大小写不同 → 游戏里是不同玩家, 不算命中; 记一笔便于核对名单
+                    log.info("昵称仅大小写不同, 按不同玩家处理: 名单候选 %s vs 对局 %s",
+                             cands, alt)
             if hit:
                 self._alerted.add(key)
                 reason = e.reason or "其他原因"
