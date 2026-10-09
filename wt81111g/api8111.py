@@ -65,3 +65,33 @@ class WT8111:
             return data if isinstance(data, dict) else {}
         except requests.RequestException:
             return {}
+
+    def map_image(self, limit: int | None = None) -> bytes | None:
+        """地图图片原始字节(PNG/JPEG); 请求失败或返回的不是图片 → None。
+
+        机库里有两种情形: 一是**拿不到地图图片**(连浏览器也加载不出来), 二是进过对局
+        退回机库后拿到固定的 “?” 占位图; 进对局/试车场则换成真地图(≥1024²)。
+        所以“能否拿到地图图片”本身就是判定“在不在车库”的依据(见 `garage.py`)。
+
+        `limit` 只读取前若干字节: 占位图只有 1.5KB 能完整拿到, 真地图几百 KB~几 MB,
+        取满即断开连接, 省掉整张地图的下载。
+        """
+        try:
+            resp = self.session.get(self.base + "/map.img", timeout=self.timeout,
+                                    stream=bool(limit))
+            resp.raise_for_status()
+            if limit:
+                buf = bytearray()
+                for chunk in resp.iter_content(limit):
+                    buf += chunk
+                    if len(buf) >= limit:
+                        break
+                resp.close()
+                data = bytes(buf)
+            else:
+                data = resp.content or b""
+        except requests.RequestException:
+            return None
+        if data.startswith(b"\x89PNG") or data.startswith(b"\xff\xd8\xff"):
+            return data
+        return None

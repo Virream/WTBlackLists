@@ -234,21 +234,25 @@ def test_main_window_history_and_reminder() -> None:
 
 
 class _FakeClient:
-    """模拟 8111 客户端: 按序列返回 mission/map_info, gamechat/hudmsg 恒空。"""
+    """模拟 8111 客户端: 按序列返回 mission 与地图图片, gamechat/hudmsg 恒空。
 
-    def __init__(self, missions, map_infos=None):
+    `map_images` 的元素就是 `/map.img` 的返回: `None` = 拿不到图片(实测机库里有这种
+    情形, 连浏览器都加载不出来), 图片字节 = 拿到了(车库 “?” 占位图 / 真地图)。
+    """
+
+    def __init__(self, missions, map_images):
         self.missions = missions
-        self.map_infos = map_infos or [{}] * len(missions)
+        self.map_images = map_images
         self.i = 0
 
     def connected(self):
         return True
 
-    def mission(self):
+    def mission(self, raise_on_error: bool = False):
         return self.missions[min(self.i, len(self.missions) - 1)]
 
-    def map_info(self):
-        return self.map_infos[min(self.i, len(self.map_infos) - 1)]
+    def map_image(self, limit: int | None = None):
+        return self.map_images[min(self.i, len(self.map_images) - 1)]
 
     def gamechat(self, last_id):
         return []
@@ -257,70 +261,63 @@ class _FakeClient:
         return {}
 
 
-def test_battle_end_detection() -> None:
-    """对局进出: 以 map_info 是否有地图数据为主信号; 退出后 map_info 失效 → 结束。"""
+def test_battle_detection_by_image() -> None:
+    """进出对局以 8111 的地图图片为准: 真地图 → 开始; 占位图/没图片 → 结束。
+
+    mission 一路都是 “running + 有目标”(实测回机库后会残留一会儿) —— 必须不干扰判定。
+    """
+    from garage_test import png_bytes
+
     tmpdir = tempfile.mkdtemp()
     store = BlacklistStore(os.path.join(tmpdir, "b.json"))
     cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
-    missions = [
-        {"status": "running", "objectives": [{"id": 1}]},   # 对局中
-        {"status": "running", "objectives": None},          # 退出后(status 残留 running!)
-        {"status": "running", "objectives": [{"id": 2}]},   # 再开一局
-    ]
-    map_infos = [
-        {"grid_size": [1600.0, 1600.0], "map_max": [4096.0, 4096.0], "map_min": [0.0, 0.0],
-         "grid_zero": [0.0, 0.0], "hud_type": 1, "valid": True},   # 地图中
-        {"valid": False},                                              # 退出后
-        {"grid_size": [1600.0, 1600.0], "map_max": [4096.0, 4096.0], "map_min": [0.0, 0.0],
-         "grid_zero": [0.0, 0.0], "hud_type": 1, "valid": True},   # 再开一局
-    ]
+    running = [{"status": "running", "objectives": [{"id": 1}]}] * 6
+    real = png_bytes(1024, 1024)
+    holder = png_bytes(128, 128)          # “?” 占位图(真图: 1519 字节 PNG, 128×128)
     w = MonitorWorker(store, nickname_cache=cache)
-    w.client = _FakeClient(missions, map_infos)
+    w.client = _FakeClient(running, [real, holder, holder, real, None, None])
     starts = []
     ends = []
     w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
     w.battle_ended.connect(lambda: ends.append(1), Qt.ConnectionType.DirectConnection)
 
     w.client.i = 0
-    w._tick()                       # 地图中 → 开始
+    w._tick()                       # 真地图 → 对局开始
     assert len(starts) == 1 and w._in_battle
     w.client.i = 1
-    w._tick()                       # map_info 失效(即使 status 残留 running) → 结束
+    w._tick()                       # 第 1 tick 只见占位图 → 还差一次连续确认
+    assert not ends and w._in_battle
+    w._tick()                       # 连续第 2 tick → 认定回到车库(叠加层隐藏)
     assert len(ends) == 1 and not w._in_battle
-    w.client.i = 2
-    w._tick()                       # 再开一局 → 重新开始
+    w.client.i = 3
+    w._tick()                       # 又拿到真地图 → 重新开始
     assert len(starts) == 2 and w._in_battle
-    results.append("battle start/end via map_info OK")
+    w.client.i = 4
+    w._tick()                       # 拿不到图片(机库里的另一种情形)
+    w._tick()                       # 连续确认后 → 同样算回到车库
+    assert len(ends) == 2 and not w._in_battle
+    results.append("battle start/end by map image OK")
 
 
-def test_testflight_detection() -> None:
-    """试车场: mission.status=running 但 objectives=null, 靠 map_info 判断在场/离场。"""
-    tmpdir = tempfile.mkdtemp()
-    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
-    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
-    missions = [
-        {"status": "running", "objectives": None},   # 试车场中
-        {"status": "running", "objectives": None},   # 退出试车场后(status 残留!)
-    ]
-    map_infos = [
-        {"grid_size": [1600.0, 1600.0], "grid_zero": [1519.4, 2497.2], "map_max": [4096.0, 4096.0],
-         "map_min": [0.0, 0.0], "hud_type": 1, "map_generation": 2, "valid": True},
-        {"valid": False},
-    ]
-    w = MonitorWorker(store, nickname_cache=cache)
-    w.client = _FakeClient(missions, map_infos)
-    starts = []
-    ends = []
-    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
-    w.battle_ended.connect(lambda: ends.append(1), Qt.ConnectionType.DirectConnection)
+def test_garage_never_starts_battle() -> None:
+    """机库两种情形(拿不到图片 / 问号占位图)都不该开始对局 → 叠加层不出现。"""
+    from garage_test import png_bytes
 
-    w.client.i = 0
-    w._tick()                       # 试车场中 → 开始(叠加层应显示)
-    assert len(starts) == 1 and w._in_battle
-    w.client.i = 1
-    w._tick()                       # 退出试车场(map_info 失效) → 结束(叠加层隐藏)
-    assert len(ends) == 1 and not w._in_battle
-    results.append("test-flight enter/exit via map_info OK")
+    running = [{"status": "running", "objectives": [{"id": 1}]}]
+    for label, image in (("拿不到图片", None), ("问号占位图", png_bytes(128, 128))):
+        tmpdir = tempfile.mkdtemp()
+        store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+        cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+        w = MonitorWorker(store, nickname_cache=cache)
+        w.client = _FakeClient(running, [image])
+        starts = []
+        w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
+        for _ in range(3):
+            w._tick()
+        assert not starts and not w._in_battle, label
+        assert w._garage_ticks == 0, label
+        w.stop()
+    results.append("garage (no image / placeholder) never starts battle OK")
 
 
 def main() -> int:
@@ -328,8 +325,8 @@ def main() -> int:
     test_monitor_fresh_only()
     test_cache_survives_entry_delete()
     test_wtlive_optimization()
-    test_battle_end_detection()
-    test_testflight_detection()
+    test_battle_detection_by_image()
+    test_garage_never_starts_battle()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
