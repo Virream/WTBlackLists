@@ -15,6 +15,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .api8111 import WT8111
 from .blacklist import BlacklistStore
 from .config import WT_BASE_URL
+from .garage import GARAGE_CONFIRM_TICKS, PROBE_BYTES, in_map_by_image
 from .nickname_cache import NicknameCache
 from .nickname_collector import parse_hudmsg_names
 from .nickname_sync import fetch_shared_table
@@ -67,6 +68,7 @@ class MonitorWorker(QObject):
         self._stop = threading.Event()
         self._connected = False
         self._in_battle = False
+        self._garage_ticks = 0   # 连续多少个 tick 只看到车库占位图
         self._battle_sig: str | None = None
         self._gamechat_cursor = -1
         self._evt_cursor = -1
@@ -109,10 +111,8 @@ class MonitorWorker(QObject):
             mission = self.client.mission(raise_on_error=True)
             connected = True
         except requests.RequestException:
-            mission, map_info = {}, {}
+            mission = {}
             connected = False
-        if connected:
-            map_info = self.client.map_info()
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
@@ -120,35 +120,35 @@ class MonitorWorker(QObject):
             if self._in_battle:
                 self._in_battle = False
                 self.battle_ended.emit()
+            self._garage_ticks = 0
             return
 
-        # 是否"在地图中(对局/试车场)":
-        # 实测 map_info.json 在地图中返回完整地图几何数据(grid_size/map_max/
-        # grid_zero/hud_type/map_generation 等, valid=true);
-        # 退出对局/试车场回机库后变为 {"valid": false}。这是最可靠的进出场信号。
-        in_map = (
-            isinstance(map_info, dict)
-            and map_info.get("valid") is not False
-            and any(map_info.get(k) for k in (
-                "grid_size", "grid_steps", "grid_zero", "map_max", "map_min",
-                "hud_type", "map_generation",
-            ))
-        )
-        # 兜底: 对局加载早期等场景 mission status=running 且 objectives 非空
-        mission_running = mission.get("status") == "running" and bool(mission.get("objectives"))
-        is_running = in_map or mission_running
-        # 状态驱动进出场: 直接以 is_running 为准, 不再依赖 sig 变化,
+        # 是否"在地图里(对局/试车场)" —— 完全以 8111 的地图图片为准(见 garage.py):
+        #   ① 拿不到地图图片(请求失败/不是图片) → 在车库
+        #   ② 图片是固定的 “?” 占位图(128×128, 1519 字节 PNG) → 在车库
+        #   ③ 其它(真地图, ≥1024²) → 在地图里
+        # 为什么不看 map_info/mission: 那两个是**状态**字段, 退出对局回机库后会残留
+        # 一会儿(实测 mission.objectives 会短暂保留上一局的内容), 叠加层就会在机库里
+        # 多显示一段时间的“正在确认名单中…”。
+        in_map = in_map_by_image(self.client.map_image(limit=PROBE_BYTES))
+        # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
-        if is_running:
+        if in_map:
+            self._garage_ticks = 0
             if not self._in_battle:
                 self._start_battle()
         elif self._in_battle:
-            self._in_battle = False
-            log.info("battle ended")
-            self.battle_ended.emit()
+            # 没有真地图: 连续 GARAGE_CONFIRM_TICKS 个 tick 才认定回到车库,
+            # 图片一时拿不到(8111 偶发超时)不该立刻把叠加层撤掉。
+            self._garage_ticks += 1
+            if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
+                self._garage_ticks = 0
+                self._in_battle = False
+                log.info("battle ended (8111 没有地图图片 / 只给车库占位图)")
+                self.battle_ended.emit()
 
         # 击杀/发言收集。仅当“已在战斗中”或“本会话曾进入过战斗(光标已初始化)”
-        # 时轮询, 以便在 map_info 进出场判定延迟时, 靠击杀/发言兜底确认进入战斗,
+        # 时轮询, 以便在图片判定延迟时, 靠击杀/发言兜底确认进入战斗,
         # 保证叠加层最迟在第一次击杀/发言时可靠弹出并立即比对。
         if self._in_battle or self._cursors_init():
             msgs = self.client.gamechat(self._gamechat_cursor)

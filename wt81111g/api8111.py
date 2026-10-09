@@ -91,16 +91,30 @@ class WT8111:
         except requests.RequestException:
             return []
 
-    def map_image(self) -> bytes | None:
+    def map_image(self, limit: int | None = None) -> bytes | None:
         """地图卫星图原始字节(PNG/JPEG, 由 GUI 侧解码为 QPixmap)。
 
-        仅在地图内(对局/试车场)可用; 机库等场景可能返回错误页,
-        这里用图片魔数校验, 非图片一律返回 None。
+        仅在地图内(对局/试车场)可用; 机库等场景返回固定的 “?” 占位图,
+        这里用图片魔数校验, 非图片(如错误页)一律返回 None。
+
+        `limit` 只读取前若干字节, 给“在不在车库”的判定用(见 `garage.py`):
+        车库占位图只有 1.5KB, 能完整拿到; 真地图几百 KB~几 MB, 取满即断开连接,
+        省掉整张地图的下载。
         """
         try:
-            resp = self.session.get(self.base + "/map.img", timeout=self.timeout)
+            resp = self.session.get(self.base + "/map.img", timeout=self.timeout,
+                                    stream=bool(limit))
             resp.raise_for_status()
-            data = resp.content or b""
+            if limit:
+                buf = bytearray()
+                for chunk in resp.iter_content(limit):
+                    buf += chunk
+                    if len(buf) >= limit:
+                        break
+                resp.close()
+                data = bytes(buf)
+            else:
+                data = resp.content or b""
         except requests.RequestException:
             return None
         if data.startswith(b"\x89PNG") or data.startswith(b"\xff\xd8\xff"):

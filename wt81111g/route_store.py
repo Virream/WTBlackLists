@@ -39,6 +39,7 @@ import uuid
 from dataclasses import asdict, dataclass, field
 
 from .config import data_dir
+from .garage import GARAGE_MAP_SHA1
 from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
@@ -60,7 +61,8 @@ def map_fingerprint(image_bytes: bytes | None) -> str:
 #   Content-Type: image/png, 1519 字节, SHA1 = ab516d02191d001d809253c346e8e3f93e13f136
 # 采样得到 6 种颜色, 均为灰度(64/68/72/109/115/128), 中心像素 (128,128,128)。
 # 用途: 把它当作“当前没有真实地图”的信号, 不要当地图绘制, 也不要当成一次换图。
-PLACEHOLDER_MAP_SHA1 = "ab516d02191d001d809253c346e8e3f93e13f136"
+# 常量统一放在 `garage.py`(黑名单助手判“在不在车库”也用同一份实测值)。
+PLACEHOLDER_MAP_SHA1 = GARAGE_MAP_SHA1
 PLACEHOLDER_MAP_KEY = PLACEHOLDER_MAP_SHA1[:12]
 
 

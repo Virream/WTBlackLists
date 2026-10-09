@@ -72,17 +72,31 @@ flowchart TB
 
 | 端点 | 用途 |
 |---|---|
-| `/mission` | 当前任务状态(是否运行中) |
-| `/map_info` | 地图数据(是否在地图中) |
+| `/mission` | 连通性探测(请求成败)+ 当前任务状态 |
+| `/map.img` | **进出场判定**: 拿不到图片 / 拿到 “?” 占位图 = 在车库 |
 | `/gamechat` | 游戏内聊天消息 |
 | `/hudmsg` | HUD 击杀/伤害消息 |
 
+> `/map_info`(地图数据)早期用于进出场判定, 2026-10-09 起不再参与 —— 它是**状态**字段,
+> 退出对局回机库后会残留一会儿(详见 §3.2)。
+
 ### 3.2 进出对局判定(实现逻辑)
 
-- 唯一可靠信号:**`map_info` 含完整地图数据**(`valid` 且含 grid/map 字段)= 在战场/试车场;`mission.status` 恒为 `running`,不可用。
-- 试车场: `mission.objectives = null`,仍靠 `map_info` 判定在场/离场。
-- 兜底: 若 `map_info` 判定延迟,只要出现**新的击杀/发言**(`gamechat`/`hudmsg` 游标推进)且本会话曾初始化过游标,则强制判定进入对局。
-- 状态驱动: 每 tick 以 `is_running` 为准,不做信号抖动检测(实测无抖动)。
+- **以 `/map.img` 为准**(实现: `wt81111g/garage.py` 的 `in_map_by_image`)。实测机库里
+  有**两种**情形, 都是“不在对局”→ 叠加层隐藏:
+  1. 这一局还没进过对局: `/map.img` **拿不到图片**(请求失败或返回的不是图片, 连浏览器里也加载不出来);
+  2. 进过对局又退回机库: `/map.img` 是固定的 **“?” 占位图**(1519 字节 PNG, 128×128,
+     sha1 `ab516d02…f136`; 仓库里有存档样本 `docs/assets/8111_map_placeholder.png`)。
+  进对局/试车场 → 换成真地图(≥1024², 几百 KB~几 MB)。
+- 判定只读图片前 **16KB**: 占位图 1.5KB 能完整拿到(逐字节比 sha1); 真地图取满即断开连接
+  (不下载整张图)。兜底规则: 短边 ≤256 的一律不当地图。
+- 为什么要换: `map_info`/`mission` 都可能残留(实测退出对局后 `mission.objectives`
+  还会保留上一局的内容), 叠加层就会在机库里多显示一段时间的“正在确认名单中…”。
+- 连续 **2** 个 tick 都看不到真地图才收工(`GARAGE_CONFIRM_TICKS`): 图片一时拿不到
+  (8111 偶发超时)不会立刻把叠加层撤掉。
+- 兜底: 只要出现**新的击杀/发言**(`gamechat`/`hudmsg` 游标推进)且本会话曾初始化过游标,
+  则强制判定进入对局。
+- 状态驱动: 每 tick 以判定结果为准, 不做信号抖动检测(实测无抖动)。
 
 ### 3.3 昵称收集与黑名单比对
 
@@ -323,10 +337,14 @@ dist/WTBlackList_source_<版本>.zip
 
 ## 16. 测试与质量
 
-- `pytest tests` 全量回归(当前 42 passed,含单元/集成/离屏 UI 测试)。
+- `pytest tests --ignore=tests/route_tester_test.py` 全量回归(**45 passed**,含单元/集成/离屏 UI 测试)。
+- `tests/route_tester_test.py` 是**另一个程序**(跑图线路测试器)的测试, 单独跑:
+  `python tests/route_tester_test.py` —— 它和黑名单的离屏 UI 测试混在同一个 pytest 进程里会原生崩溃
+  (QApplication/平台插件预置冲突, 与业务代码无关)。
 - 测试要点:
   - 离屏模式 `QT_QPA_PLATFORM=offscreen`;
-  - 单进程单 `QApplication` 实例复用;
+  - 单进程单 `QApplication` 实例复用;**不要在单元测试里用 QImage/Qt 造数据**
+    (提前创建 QApplication 会弄崩同进程内的 UI 测试; 例: `tests/garage_test.py` 全部纯字节);
   - 主窗口后台网络线程在测试环境全局禁用,避免原生崩溃;
   - `_*.py` 为独立验证脚本,由 `conftest.py` 排除出 pytest 收集。
 
