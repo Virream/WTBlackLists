@@ -35,10 +35,15 @@ log = logging.getLogger("map_cache")
 
 # 内容指纹的网格边长(缩到这么大再比)
 CONTENT_GRID = 64
-# “同一张地图”的判定: 两张 64×64 灰度指纹的平均差(0~255)。
-# 实测(2026-10-09, 10 张真实地图): 同一张图的 1024²/2048² 两份 = **0.41**,
-# 而**最接近的两张不同地图** = **11.97** → 取 4 做阈值(两边都有 ~10 倍余量)。
-SAME_IMAGE_TOL = 4.0
+# “同一张地图”的三道闸 —— 数字全部来自 tools/map_similarity.py 的实测(可随时重跑):
+#   ① 64×64 灰度平均差: 同图(0.25~1.0 倍率 × JPEG q60~95, 共 135 份) 最大 **0.60**;
+#      不同图最小 **11.97**(9 张真实地图 36 对) / **2.91**(同一张大地图的不同区域裁切)
+SAME_IMAGE_TOL = 1.2
+#   ② 结构哈希(dHash)汉明距离(共 4032 位): 同图最大 **372**, 不同图最小 **1776**
+#      —— 这是**主力判据**(尤其对“同一张图的不同区域”那种灰度很像但纹理不同的一对)
+SAME_IMAGE_HAMMING = 800
+#   ③ 最近邻余量: 次近的那张必须至少是 这个倍数×阈值(否则说明有两张都很像 → 不认)
+SAME_IMAGE_MARGIN = 2.0
 
 # 图片格式判定(按文件头魔数), 决定缓存文件扩展名
 _MAGIC = (
@@ -101,6 +106,45 @@ def gray_distance(a: bytes, b: bytes) -> float:
     if not a or not b or len(a) != len(b):
         return 255.0
     return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
+# 结构哈希的位数: 64×64 灰度里“每个像素与右边邻居比大小” → 64×63 位
+PHASH_BITS = CONTENT_GRID * (CONTENT_GRID - 1)
+
+
+def phash(gray: bytes) -> int:
+    """结构哈希(dHash): “某像素是否比右边邻居亮”的位图。
+
+    与亮度无关, 只看**纹理/边界在哪儿** —— 是灰度平均差之外的**第二道闸**:
+    两张不同地图即使整体亮度接近, 纹理位置也不会一样。
+    """
+    bits = 0
+    idx = 0
+    for y in range(CONTENT_GRID):
+        row = y * CONTENT_GRID
+        for x in range(CONTENT_GRID - 1):
+            if gray[row + x] > gray[row + x + 1]:
+                bits |= 1 << idx
+            idx += 1
+    return bits
+
+
+def hamming(a: int, b: int) -> int:
+    """两个结构哈希有多少位不同(0 ~ PHASH_BITS)。"""
+    return ((a ^ b) & ((1 << PHASH_BITS) - 1)).bit_count()
+
+
+def looks_same(distance: float, ham: int, second: float | None = None) -> bool:
+    """三道闸都过才算“同一张地图”。
+
+    * `distance` / `ham`: 与**最像的那张**地图的灰度平均差 / 结构哈希汉明距离;
+    * `second`: 与**次像的那张**的距离(None = 缓存里只有这一张)。
+      它必须至少是 `SAME_IMAGE_MARGIN × SAME_IMAGE_TOL` —— 也就是“很像很像、
+      而且明显比其它任何一张都像”, 避免在两张都模棱两可时乱认。
+    """
+    if distance > SAME_IMAGE_TOL or ham > SAME_IMAGE_HAMMING:
+        return False
+    return second is None or second >= SAME_IMAGE_TOL * SAME_IMAGE_MARGIN
 
 
 # 认为“是地图图片”的扩展名(遍历缓存目录时用)
@@ -217,18 +261,41 @@ class MapCache:
         return added
 
     def similar_key(self, info: MapImageInfo | None) -> str | None:
-        """在已缓存的地图里找**同一张图**(不同分辨率): 返回它的地图键, 没有则 None。"""
-        if info is None:
+        """在已缓存的地图里找**同一张图**(不同分辨率): 返回它的地图键, 没有则 None。
+
+        三道闸见 `looks_same`: 灰度平均差 + 结构哈希 + 最近邻余量。
+        任何一道不过就当“不是同一张”, 宁可不认也不乱合。
+        """
+        scores = self.similarity_scores(info)
+        if not scores:
             return None
-        best: tuple[float, str] | None = None
+        d, ham, key = scores[0]
+        second = scores[1][0] if len(scores) > 1 else None
+        if looks_same(d, ham, second):
+            return key
+        if d <= SAME_IMAGE_TOL * 3 or ham <= SAME_IMAGE_HAMMING * 3:
+            # 看着有点像但没过闸: 记一行日志, 方便事后核对(不会合并)
+            log.info("有地图长得像但没过三道闸, 不合并: 最近 %s (距离 %.2f, 汉明 %d, 次近 %s)",
+                     key, d, ham, f"{second:.2f}" if second is not None else "无")
+        return None
+
+    def similarity_scores(self, info: MapImageInfo | None) -> list[tuple[float, int, str]]:
+        """与每张已缓存地图的 (灰度平均差, 结构哈希汉明, 地图键), 按差距升序。"""
+        if info is None:
+            return []
+        mine_hash = phash(info.gray)
+        out: list[tuple[float, int, str]] = []
         with self._lock:
             for key, entry in self._index.items():
                 if self.path_of(key) is None:
                     continue
-                d = gray_distance(info.gray, self._gray_of(entry))
-                if d <= SAME_IMAGE_TOL and (best is None or d < best[0]):
-                    best = (d, key)
-        return best[1] if best else None
+                gray = self._gray_of(entry)
+                if len(gray) != len(info.gray):
+                    continue
+                out.append((gray_distance(info.gray, gray),
+                            hamming(mine_hash, phash(gray)), key))
+        out.sort(key=lambda row: (row[0], row[1]))
+        return out
 
     # ------------------------------------------------------------------ 查询
     def path_of(self, key: str) -> str | None:
@@ -357,22 +424,32 @@ class MapCache:
 
     # ------------------------------------------------------------------ 归并
     def duplicate_groups(self) -> list[list[str]]:
-        """分组: 内容相同(只是分辨率/编码不同)的地图键归一到一个组里。"""
+        """分组: 内容相同(只是分辨率/编码不同)的地图键归一到一个组里。
+
+        用的是与 `similar_key` 同一套闸(灰度 + 结构哈希), 只是不做最近邻余量 ——
+        组内成对比较, 两两都说“像”才归到一起。
+        """
         self.refresh_index()
         with self._lock:
             keys = [k for k in self._index if self.path_of(k) is not None]
         groups: list[list[str]] = []
         for key in keys:
-            entry = self._index.get(key) or {}
-            gray = self._gray_of(entry)
             for group in groups:
-                head = self._gray_of(self._index.get(group[0]) or {})
-                if gray_distance(gray, head) <= SAME_IMAGE_TOL:
+                if self._pair_same(key, group[0]):
                     group.append(key)
                     break
             else:
                 groups.append([key])
         return [g for g in groups if len(g) > 1]
+
+    def _pair_same(self, a: str, b: str) -> bool:
+        """两张已缓存地图算不算同一张(灰度 + 结构哈希两道闸)。"""
+        ea = self._index.get(a) or {}
+        eb = self._index.get(b) or {}
+        ga, gb = self._gray_of(ea), self._gray_of(eb)
+        if not ga or len(ga) != len(gb):
+            return False
+        return looks_same(gray_distance(ga, gb), hamming(phash(ga), phash(gb)))
 
     def merge_duplicates(self, store) -> list[tuple[str, str]]:
         """把“同一张地图的不同分辨率”合并成一张地图(启动时跑一次)。

@@ -1874,12 +1874,28 @@ def test_map_resolution_alias(tmpdir: str):
     实测: 同一张图的 1024²/2048² 两份, 缩到 64×64 灰度后的平均差只有 0.41,
     而**最接近的两张不同地图**是 11.97 → 阈值取 4 有足够余量。
     """
-    from wt81111g.map_cache import SAME_IMAGE_TOL, MapCache, gray_distance, image_info, map_key
+    from wt81111g.map_cache import (
+        SAME_IMAGE_HAMMING, SAME_IMAGE_TOL, MapCache, gray_distance, image_info,
+        looks_same, map_key,
+    )
 
     cache = MapCache(os.path.join(tmpdir, "alias"))
     big, small = png_pattern(256), png_pattern(128)
     other = png_pattern(256, shift=3)
     assert map_key(big) != map_key(small), "分辨率不同 → 字节哈希必然不同"
+
+    # 三道闸的判定(纯函数, 不用图片就能精确测)。实测数字:
+    # 同图(0.25~1.0 倍率 × JPEG q60~95, 135 份) 灰度 ≤0.60 / 汉明 ≤372;
+    # 不同图 灰度 ≥11.97(整图) / ≥2.91(同一张大地图的不同区域), 汉明 ≥1776
+    assert looks_same(0.4, 241) is True                 # 典型同图(缓存里只有这一张)
+    assert looks_same(0.4, 241, 2.4) is True            # 次近的刚好压线(2×阈值)
+    assert looks_same(0.4, 241, 2.3) is False, "两张都很像 → 宁可不认"
+    assert looks_same(SAME_IMAGE_TOL + 0.1, 10) is False
+    assert looks_same(0.4, SAME_IMAGE_HAMMING + 1) is False
+    # 最危险的一种: 同一张大地图的两个不同区域(灰度很像, 纹理不同) → 必须被汉明闸拦下
+    assert looks_same(0.8, 1700) is False, "灰度再像, 结构不一样也不能认"
+    assert looks_same(2.91, 1776) is False
+    assert looks_same(11.97, 1813) is False, "实测最像的两张不同地图不能被认成同一张"
 
     info_big, info_small, info_other = image_info(big), image_info(small), image_info(other)
     assert (info_big.width, info_small.width) == (256, 128)
@@ -1927,6 +1943,10 @@ def test_map_merge_old_duplicates(tmpdir: str):
     store.add(rec1)
     store.add(rec2)
     store.rename_map(key_big, "货运港口")          # 名字在“大图”那个键上
+    # 再放一张**长得有点像但确实是另一张**的图: 不该被并进来
+    near = png_pattern(256, shift=1)
+    key_near, _ = cache.save(near)
+    assert key_near not in (key_big, key_small), "相近但不同的图应另占一个键"
     assert len(store.grouped()) == 2, "合并前是两张地图"
 
     merged = cache.merge_duplicates(store)
@@ -1935,6 +1955,7 @@ def test_map_merge_old_duplicates(tmpdir: str):
     assert store.display_name(key_big) == "货运港口"
     assert len(store.grouped()) == 1, "合并后侧栏只剩一张地图"
     assert cache.has(key_big) and not cache.has(key_small), "多余的那份图片应删掉"
+    assert cache.has(key_near), "相近但不同的图不能被删"
     assert image_info_ok(cache, key_big, 256), "保留的应是更清晰的那份"
     assert os.path.exists(store.path + ".bak"), "改用户数据前应留一份备份"
     # 再跑一次: 已经没有重复了
