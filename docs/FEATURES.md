@@ -101,6 +101,9 @@ flowchart TB
 ### 3.3 昵称收集与黑名单比对
 
 - 解析 `hudmsg` 击杀消息与 `gamechat.sender`,用 `parse_hudmsg_names` 提取候选昵称(过滤系统消息、主机 `⋇` 标记等)。
+- **离开对局(回到车库)时清空本局收集**: 那列表里的昵称全是上一局的残留 → 一起清掉
+  (`_end_battle` 清 `_collected`/`_alerted`/`_found_nicks` 并广播空列表, 界面上的
+  「当前对局已收集昵称」也随之清空), 下一局开始时重新收集。
 - `_compare` 将收集到的昵称与黑名单候选昵称(`WTLive 抓取 + 手动填写`)做模糊匹配(`nickname_util.matches`),命中则:
   - 发出 `blacklist_alert` 通知;
   - 更新叠加层 `blacklist_found` 列表。
