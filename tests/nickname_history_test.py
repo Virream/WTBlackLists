@@ -260,7 +260,8 @@ class _FakeClient:
     def mission(self, raise_on_error: bool = False):
         return self.missions[min(self.i, len(self.missions) - 1)]
 
-    def map_image(self, limit: int | None = None):
+    def map_image(self, limit: int | None = None, timeout: float | None = None,
+                  raise_on_error: bool = False):
         return self.map_images[min(self.i, len(self.map_images) - 1)]
 
     def gamechat(self, last_id):

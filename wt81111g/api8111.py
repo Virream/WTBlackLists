@@ -66,7 +66,8 @@ class WT8111:
         except requests.RequestException:
             return {}
 
-    def map_image(self, limit: int | None = None) -> bytes | None:
+    def map_image(self, limit: int | None = None, timeout: float | None = None,
+                  raise_on_error: bool = False) -> bytes | None:
         """地图图片原始字节(PNG/JPEG); 请求失败或返回的不是图片 → None。
 
         机库里有两种情形: 一是**拿不到地图图片**(连浏览器也加载不出来), 二是进过对局
@@ -75,9 +76,13 @@ class WT8111:
 
         `limit` 只读取前若干字节: 占位图只有 1.5KB 能完整拿到, 真地图几百 KB~几 MB,
         取满即断开连接, 省掉整张地图的下载。
+
+        `raise_on_error=True` 时请求失败(超时/连接错)不吞掉而是抛 `RequestException`
+        —— 调用方需要区分“**没有回答**”和“回答了一个非图片”: 实测进对局初期
+        `/map.img` 可能要好几秒才回应, 把它当成“不在地图里”会误判回车库。
         """
         try:
-            resp = self.session.get(self.base + "/map.img", timeout=self.timeout,
+            resp = self.session.get(self.base + "/map.img", timeout=timeout or self.timeout,
                                     stream=bool(limit))
             resp.raise_for_status()
             if limit:
@@ -91,6 +96,8 @@ class WT8111:
             else:
                 data = resp.content or b""
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return None
         if data.startswith(b"\x89PNG") or data.startswith(b"\xff\xd8\xff"):
             return data
