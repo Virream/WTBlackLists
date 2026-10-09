@@ -170,21 +170,29 @@ class MonitorWorker(QObject):
         )
         # 本会话还没建立过基线, 或当前不在对局 → 只吸收
         absorbing = (not self._in_battle) or (not self._msg_primed)
+        if absorbing and not self._msg_primed:
+            # 本会话第一次轮询: 8111 窗口里可能有上一局的旧消息, 这里只建立基线
+            log.info("建立消息基线: 吸收窗口里的旧消息(本次 %d 条击杀/伤害)",
+                     len(hud.get("damage") or []) if isinstance(hud, dict) else 0)
         if absorbing and self._msg_primed and (new_msg or new_dmg):
             # 兜底: 战局外却冒出新消息 → 其实已经在对局里(图片判定没命中)
             log.info("battle confirmed by activity (kill/chat)")
             self._start_battle()
             absorbing = False
         before = len(self._collected)
+        new_names: list[str] = []
         if not absorbing:
             if msgs:
                 for m in msgs:
                     sender = (m.get("sender") or "").strip()
-                    if sender:
+                    if sender and sender not in self._collected:
+                        new_names.append(sender)
                         self._collected.add(sender)
             if isinstance(hud, dict):
                 for dmg in hud.get("damage", []) or []:
                     for name in parse_hudmsg_names(dmg.get("msg", "")):
+                        if name not in self._collected:
+                            new_names.append(name)
                         self._collected.add(name)
         # 推进游标(吸收模式下也推进: 这样旧消息不会在下一局被当成新的)
         if msgs:
@@ -207,9 +215,10 @@ class MonitorWorker(QObject):
         if not absorbing:
             if new_msg or new_dmg:
                 self._last_activity = now
-                if len(self._collected) > before:
-                    log.info("收集到 %d 个新昵称(本局共 %d 个)",
-                             len(self._collected) - before, len(self._collected))
+                # 排查用: 记下这次到底收到多少条/解析出谁(游标值一并记, 便于定位漏检)
+                n_dmg = len(hud.get("damage") or []) if isinstance(hud, dict) else 0
+                log.info("hudmsg: 游标 lastDmg=%s, 返回 %d 条, 解析出 %d 个新昵称 %s",
+                         self._dmg_cursor, n_dmg, len(new_names), new_names[:20] or "-")
             if msgs or (isinstance(hud, dict) and hud):
                 self.nicknames_updated.emit(sorted(self._collected))
                 self._compare()
