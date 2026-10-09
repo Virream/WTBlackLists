@@ -5,7 +5,7 @@ import os
 import sys
 
 APP_NAME = "WTBlackList"
-APP_VERSION = "2.0.3"
+APP_VERSION = "2.0.4"
 
 # 战争雷霆 8111 本地接口
 # 用 127.0.0.1 而非 localhost: Windows 上 localhost 可能先解析到 IPv6(::1)再回退 IPv4,

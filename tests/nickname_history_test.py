@@ -250,10 +250,12 @@ class _FakeClient:
     情形, 连浏览器都加载不出来), 图片字节 = 拿到了(车库 “?” 占位图 / 真地图)。
     """
 
-    def __init__(self, missions, map_images, chats=None):
+    def __init__(self, missions, map_images, chats=None, damage=None):
         self.missions = missions
         self.map_images = map_images
         self.chats = list(chats or [])   # 依次给出的发言昵称(验证收集/清空)
+        self.damage = list(damage or [])  # /hudmsg 滚动窗口(旧消息)
+        self.new_damage: list[dict] = []  # 后续新增(模拟“刚打掉一辆”)
         self._chat_id = 0
         self.i = 0
 
@@ -273,7 +275,10 @@ class _FakeClient:
         return [{"id": self._chat_id, "sender": self.chats.pop(0), "msg": "hi"}]
 
     def hudmsg(self, a, b):
-        return {}
+        if not self.damage and not self.new_damage:
+            return {}
+        win = self.damage + self.new_damage
+        return {"events": [], "damage": [d for d in win if int(d.get("id", -1)) > b]}
 
 
 def test_battle_detection_by_image() -> None:
@@ -326,7 +331,7 @@ def test_leaving_battle_clears_collected() -> None:
     w = MonitorWorker(store, nickname_cache=cache)
     w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
                            [real, holder, holder, real],
-                           chats=["EnemyOne", "EnemyTwo"])
+                           chats=["Primer", "EnemyOne", "EnemyTwo"])
     updates = []
     ends = []
     w.nicknames_updated.connect(lambda names: updates.append(list(names)),
@@ -334,7 +339,8 @@ def test_leaving_battle_clears_collected() -> None:
     w.battle_ended.connect(lambda: ends.append(1), Qt.ConnectionType.DirectConnection)
 
     w.client.i = 0
-    w._tick()                       # 对局中: 从发言里收集
+    w._tick()                       # 进对局第 1 个 tick: 只“吸收”旧消息(游标基线)
+    w._tick()                       # 之后开始收集
     w._tick()
     assert sorted(w._collected) == ["EnemyOne", "EnemyTwo"], w._collected
     assert updates[-1] == ["EnemyOne", "EnemyTwo"], updates
@@ -376,6 +382,56 @@ def test_garage_never_starts_battle() -> None:
         assert w._garage_ticks == 0, label
         w.stop()
     results.append("garage (no image / placeholder) never starts battle OK")
+
+
+def test_stale_hudmsg_window_not_collected() -> None:
+    """刚进新对局时, /hudmsg 里上一局的击杀不能被当成本局收集。
+
+    复现用户场景: 在车库打开软件(游标为空) → 进试车场(8111 窗口里还是上一局的击杀)
+    → 不能一进去就报上局的人, 必须等**新的**击杀(打掉一辆靶车)才算检测到。
+    """
+    from garage_test import png_bytes
+
+    mine = "=AZUR2= 目击而道存矣 (豹 2PL) 击毁了 T-55A"      # 上一局里自己的击杀
+    tmpdir = tempfile.mkdtemp()
+    store = BlacklistStore(os.path.join(tmpdir, "b.json"))
+    cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
+    store.add(BlacklistEntry(player_id="1", nickname="目击而道存矣", reason="测试"))
+    holder = png_bytes(128, 128)
+    real = png_bytes(1024, 1024)
+    w = MonitorWorker(store, nickname_cache=cache)
+    # 预热昵称缓存: 避免进入对局时触发 WTLive 预抓取(后台线程会干扰后面的用例)
+    w._profile_cache["1"] = ("目击而道存矣", time.time())
+    w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 5,
+                           [holder, holder, real, real, real],
+                           damage=[{"id": 300, "msg": mine}])
+    starts = []
+    found = []
+    w.new_battle.connect(lambda: starts.append(1), Qt.ConnectionType.DirectConnection)
+    w.blacklist_found.connect(lambda names: found.append(list(names)),
+                              Qt.ConnectionType.DirectConnection)
+
+    w._tick()                       # 车库: 吸收(只推进游标) —— 不收集、不开始对局
+    assert not w._in_battle and w._collected == set(), (w._in_battle, w._collected)
+    assert not starts
+    w._tick()                       # 还是车库
+    assert not starts and w._collected == set()
+    w.client.i = 2
+    w._tick()                       # 进试车场(真地图) → 开始新对局
+    assert len(starts) == 1 and w._in_battle
+    w.client.i = 3
+    w._tick()                       # 窗口里那条旧击杀不能被收集/报警
+    assert w._collected == set(), w._collected
+    assert found and found[-1] == [], found
+    # 打掉一辆靶车(新 id) → 这时才检测到
+    w.client.new_damage.append(
+        {"id": 301, "msg": "=AZUR2= 目击而道存矣 (豹 2PL) 击毁了 TargetDummy (T-72)"})
+    w.client.i = 4
+    w._tick()
+    assert "目击而道存矣" in w._collected, w._collected
+    assert found[-1] == [("目击而道存矣", "测试")], found
+    w.stop()
+    results.append("stale /hudmsg window not collected OK")
 
 
 def test_shared_table_avoids_wtlive() -> None:
@@ -494,13 +550,14 @@ def main() -> int:
     test_battle_detection_by_image()
     test_leaving_battle_clears_collected()
     test_garage_never_starts_battle()
+    test_stale_hudmsg_window_not_collected()
     test_shared_table_avoids_wtlive()
     test_shared_table_fallback_on_fail()
     test_auto_upload_nicknames()
     test_main_window_history_and_reminder()
     for r in results:
         print("OK:", r)
-    print("NICKNAME HISTORY TEST PASSED" if len(results) == 12 else "FAILED")
+    print("NICKNAME HISTORY TEST PASSED" if len(results) == 13 else "FAILED")
     return 0
 
 

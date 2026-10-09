@@ -73,6 +73,7 @@ class MonitorWorker(QObject):
         self._connected = False
         self._in_battle = False
         self._garage_ticks = 0   # 连续多少个 tick 只看到车库占位图        self._last_activity = 0.0  # 最近一次收到击杀/发言的时间
+        self._msg_primed = False   # 是否已建立过消息基线(用来“吸收”上一局的旧消息)
         self._cmp_sig: tuple | None = None  # 上次比对的输入签名(避免重复算)        self._battle_sig: str | None = None
         self._gamechat_cursor = -1
         self._evt_cursor = -1
@@ -153,49 +154,57 @@ class MonitorWorker(QObject):
                 if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
                     self._end_battle("8111 没有地图图片 / 只给车库占位图")
 
-        # 击杀/发言收集。仅当“已在战斗中”或“本会话曾进入过战斗(光标已初始化)”
-        # 时轮询, 以便在图片判定延迟时, 靠击杀/发言兜底确认进入战斗,
-        # 保证叠加层最迟在第一次击杀/发言时可靠弹出并立即比对。
-        if self._in_battle or self._cursors_init():
-            msgs = self.client.gamechat(self._gamechat_cursor)
-            if msgs:
-                max_id = max(int(m.get("id", -1)) for m in msgs)
-                if max_id < self._gamechat_cursor:
-                    # 游戏/服务器重启, ID 归零 → 从新会话起点收集(不用 -1 哨兵,
-                    # 避免重复收集与 _cursors_init 短暂失效)
-                    self._gamechat_cursor = max_id
-            hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
-            new_msg = bool(msgs)
-            new_dmg = (
-                isinstance(hud, dict)
-                and any(int(d.get("id", -1)) > self._dmg_cursor
-                        for d in (hud.get("damage", []) or []))
-            )
-            if (new_msg or new_dmg) and not self._in_battle:
-                # 兜底: 有击杀/发言但进出场判定未命中 → 确认在地图中
-                log.info("battle confirmed by activity (kill/chat)")
-                self._start_battle()
-            before = len(self._collected)
+        # 击杀/发言收集。
+        # ⚠️ 不在对局(或本会话第一次轮询)时要“**吸收**”消息: 只推进游标、不收集。
+        # 原因: 8111 的 /hudmsg 是个**滚动窗口**, 刚进新对局(尤其是试车场)时里面还留着
+        # 上一局的击杀消息 —— 不吸收的话, 一进新对局就会把上一局的人算进“本局已收集”,
+        # 表现为“刚进试车场就检测到某某”。吸收之后, 只有**新**消息(进入后的击杀/发言)
+        # 才会被收集, 所以必须自己打掉一辆才有提示。
+        msgs = self.client.gamechat(self._gamechat_cursor)
+        hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
+        new_msg = bool(msgs)
+        new_dmg = (
+            isinstance(hud, dict)
+            and any(int(d.get("id", -1)) > self._dmg_cursor
+                    for d in (hud.get("damage", []) or []))
+        )
+        # 本会话还没建立过基线, 或当前不在对局 → 只吸收
+        absorbing = (not self._in_battle) or (not self._msg_primed)
+        if absorbing and self._msg_primed and (new_msg or new_dmg):
+            # 兜底: 战局外却冒出新消息 → 其实已经在对局里(图片判定没命中)
+            log.info("battle confirmed by activity (kill/chat)")
+            self._start_battle()
+            absorbing = False
+        before = len(self._collected)
+        if not absorbing:
             if msgs:
                 for m in msgs:
-                    mid = int(m.get("id", -1))
                     sender = (m.get("sender") or "").strip()
                     if sender:
                         self._collected.add(sender)
-                    if mid > self._gamechat_cursor:
-                        self._gamechat_cursor = mid
             if isinstance(hud, dict):
-                # 推进事件游标, 避免每次以 lastEvt=-1 全量拉取历史 events
-                for ev in hud.get("events", []) or []:
-                    eid = int(ev.get("id", -1))
-                    if eid > self._evt_cursor:
-                        self._evt_cursor = eid
                 for dmg in hud.get("damage", []) or []:
-                    did = int(dmg.get("id", -1))
-                    if did > self._dmg_cursor:
-                        self._dmg_cursor = did
                     for name in parse_hudmsg_names(dmg.get("msg", "")):
                         self._collected.add(name)
+        # 推进游标(吸收模式下也推进: 这样旧消息不会在下一局被当成新的)
+        if msgs:
+            max_id = max(int(m.get("id", -1)) for m in msgs)
+            if max_id < self._gamechat_cursor:
+                # 游戏/服务器重启, ID 归零 → 以新会话为准
+                self._gamechat_cursor = max_id
+            else:
+                self._gamechat_cursor = max(self._gamechat_cursor, max_id)
+        if isinstance(hud, dict):
+            # 推进事件游标, 避免每次以 lastEvt=-1 全量拉取历史 events
+            for ev in hud.get("events", []) or []:
+                eid = int(ev.get("id", -1))
+                if eid > self._evt_cursor:
+                    self._evt_cursor = eid
+            for dmg in hud.get("damage", []) or []:
+                did = int(dmg.get("id", -1))
+                if did > self._dmg_cursor:
+                    self._dmg_cursor = did
+        if not absorbing:
             if new_msg or new_dmg:
                 self._last_activity = now
                 if len(self._collected) > before:
@@ -204,6 +213,7 @@ class MonitorWorker(QObject):
             if msgs or (isinstance(hud, dict) and hud):
                 self.nicknames_updated.emit(sorted(self._collected))
                 self._compare()
+        self._msg_primed = True
 
     # ------------------------------------------------------------------
     def _start_battle(self) -> None:
