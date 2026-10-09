@@ -35,6 +35,10 @@ log = logging.getLogger("monitor")
 # 击杀消息说明人还在对局里, 不该清空本局收集(8111 偶发拿不到图片)。
 ACTIVITY_GRACE = 5.0
 
+# 探测 /map.img 的超时: 进对局初期这张图可能要好几秒才回应(几百 KB~几 MB),
+# 超时短了会被误判成“不在对局”。
+MAP_PROBE_TIMEOUT = 2.0
+
 
 class MonitorWorker(QObject):
     """后台线程轮询 8111 并维护“当前对局昵称”,与黑名单比对。"""
@@ -128,14 +132,33 @@ class MonitorWorker(QObject):
             self._garage_ticks = 0
             return
 
-        # 是否"在地图里(对局/试车场)" —— 完全以 8111 的地图图片为准(见 garage.py):
-        #   ① 拿不到地图图片(请求失败/不是图片) → 在车库
-        #   ② 图片是固定的 “?” 占位图(128×128, 1519 字节 PNG) → 在车库
-        #   ③ 其它(真地图, ≥1024²) → 在地图里
+        # 击杀/发言收集(先取消息, 再探地图): 地图图片在刚进对局时可能要好几秒才回应,
+        # 放在前面会拖慢击杀消息的上报。
+        # ⚠️ 不在对局(或本会话第一次轮询)时只“**吸收**”消息: 推进游标、不收集、不匹配。
+        # 原因: 8111 的 /hudmsg 是**滚动窗口**, 刚进新对局时里面还留着上一局的消息;
+        # 消息 id 跨局只增不重置, 所以只能用“游标之后的新 id”判定“本局新增的”。
+        # 这样: 软件启动前就在窗口里的 ID、以及出局期间收到的消息, 都不可能参与本局判断。
+        msgs = self.client.gamechat(self._gamechat_cursor)
+        hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
+        new_msg = bool(msgs)
+
+        # 是否“在地图里(对局/试车场)” —— 以 8111 的地图图片为准(见 garage.py):
+        #   ① 固定的 “?” 占位图(128×128, 1519 字节 PNG) / 不是图片 → 在车库
+        #   ② 真地图(≥1024²) → 在地图里
+        #   ③ **没有回答**(超时/连接错) → 状态未知 → 沿用上一次判定, 不当成“回车库”
+        #      (实测: 进对局初期 /map.img 要好几秒才回应, 当成“不在对局”就会在已经开打
+        #       的头几十秒里一直不判进局 —— 用户反馈“打死 3 辆靶车才检测到”)
         # 为什么不看 map_info/mission: 那两个是**状态**字段, 退出对局回机库后会残留
         # 一会儿(实测 mission.objectives 会短暂保留上一局的内容), 叠加层就会在机库里
         # 多显示一段时间的“正在确认名单中…”。
-        in_map = in_map_by_image(self.client.map_image(limit=PROBE_BYTES))
+        try:
+            probe = self.client.map_image(limit=PROBE_BYTES, timeout=MAP_PROBE_TIMEOUT,
+                                          raise_on_error=True)
+            in_map = in_map_by_image(probe)
+        except requests.RequestException as exc:
+            in_map = self._in_battle       # 未知 → 沿用上一次状态
+            log.info("map.img 没有回答(%s) → 沿用上一次判定 in_map=%s",
+                     type(exc).__name__, in_map)
         now = time.time()
         # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
@@ -154,15 +177,6 @@ class MonitorWorker(QObject):
                 self._garage_ticks += 1
                 if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
                     self._end_battle("8111 没有地图图片 / 只给车库占位图")
-
-        # 击杀/发言收集。
-        # ⚠️ 不在对局(或本会话第一次轮询)时只“**吸收**”消息: 推进游标、不收集、不匹配。
-        # 原因: 8111 的 /hudmsg 是**滚动窗口**, 刚进新对局时里面还留着上一局的消息;
-        # 消息 id 跨局只增不重置, 所以只能用“游标之后的新 id”判定“本局新增的”。
-        # 这样: 软件启动前就在窗口里的 ID、以及出局期间收到的消息, 都不可能参与本局判断。
-        msgs = self.client.gamechat(self._gamechat_cursor)
-        hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
-        new_msg = bool(msgs)
         new_dmg = (
             isinstance(hud, dict)
             and any(int(d.get("id", -1)) > self._dmg_cursor
