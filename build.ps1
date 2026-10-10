@@ -1,4 +1,4 @@
-# 一键打包脚本: 应用(onedir 启动更快) + ZIP 版 + 自解压安装版 + 源码版
+# 一键打包脚本: 应用(onedir 启动更快) + ZIP 版 + 自解压安装版(内含 LICENSE / NOTICE)
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $py = Join-Path $root ".venv\Scripts\python.exe"
@@ -9,10 +9,10 @@ $version = & $py -c "import re,io,sys; t=io.open('wt81111g/config.py',encoding='
 if (-not $version) { $version = "0.0.0" }
 Write-Host "当前版本: $version"
 
-Write-Host "== 1/5 生成图标(app.ico) =="
+Write-Host "== 1/7 生成图标(app.ico) =="
 & $py "tools\png_to_ico.py"
 
-Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
+Write-Host "== 2/7 打包应用 (onedir, 启动更快) =="
 # 方案: 真人浏览器兜底(启动系统真实 Edge/Chrome 并读取 DOM) + 应用内
 # WebView2 浏览器(pywebview/pythonnet, 子进程抓取, 通常自动过验证)。
 & $py -m PyInstaller `
@@ -31,16 +31,20 @@ Write-Host "== 2/5 打包应用 (onedir, 启动更快) =="
     --version-file version_info.txt `
     main.py
 
-Write-Host "== 2.5/5 精简 Qt 体积(删除用不到的 Qt6 DLL/翻译/图片插件) =="
+Write-Host "== 3/7 精简 Qt 体积(删除用不到的 Qt6 DLL/翻译/图片插件) =="
 & $py "tools\trim_qt.py"
 
-Write-Host "== 3/5 生成应用载荷 zip =="
+Write-Host "== 4/7 放入开源许可文件(LICENSE / NOTICE) =="
+# 许可文件随程序一起分发(绿色版 zip 与安装版都取自 dist\WTBlackList)
+Copy-Item "LICENSE", "NOTICE" "dist\WTBlackList\" -Force
+
+Write-Host "== 5/7 生成应用载荷 zip =="
 & $py "tools\make_payload.py"
 
-Write-Host "== 4/5 生成 ZIP 版 =="
+Write-Host "== 6/7 生成 ZIP 版 =="
 Copy-Item "build_assets\app_payload.zip" "dist\WTBlackList_${version}.zip" -Force
 
-Write-Host "== 5/5 打包自解压安装程序 =="
+Write-Host "== 7/7 打包自解压安装程序 =="
 & $py -m PyInstaller `
     --noconfirm `
     --onefile `
@@ -56,13 +60,8 @@ Write-Host "== 5/5 打包自解压安装程序 =="
 Remove-Item "dist\WTBlackList_Setup_${version}.exe" -Force -ErrorAction SilentlyContinue
 Rename-Item "dist\WTBlackList_Setup.exe" "WTBlackList_Setup_${version}.exe"
 
-Write-Host "== 6/6 生成源码 zip(放入 dist) =="
-& $py "tools\make_source_zip.py"
-Copy-Item "WTBlackList_source.zip" "dist\WTBlackList_source_${version}.zip" -Force
-Remove-Item "WTBlackList_source.zip" -Force -ErrorAction SilentlyContinue
-
 Write-Host "== 完成 =="
 Write-Host "  应用目录: dist\WTBlackList\WTBlackList.exe"
 Write-Host "  ZIP 版:   dist\WTBlackList_${version}.zip"
 Write-Host "  安装版:   dist\WTBlackList_Setup_${version}.exe"
-Write-Host "  源码版:   dist\WTBlackList_source_${version}.zip"
+Write-Host "  源码见:   https://github.com/Virream/WTBlackLists"

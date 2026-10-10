@@ -1,9 +1,11 @@
 """发布 Release 到 GitHub(Virream/WTBlackLists)。
 
 从 git credential 读取 GitHub 凭据(不打印 token), 创建/重建 release 并上传:
-  - dist/WTBlackList.zip         (ZIP 绿色版)
-  - dist/WTBlackList_Setup.exe   (自解压安装版)
-  - dist/WTBlackList_source.zip  (源码版)
+  - dist/WTBlackList_{ver}.zip       (ZIP 绿色版, 内含 LICENSE / NOTICE)
+  - dist/WTBlackList_Setup_{ver}.exe (自解压安装版, 内含 LICENSE / NOTICE)
+
+源码不再打包上传 —— 仓库里就是源码, 没必要再挂一份 zip
+(而且构建期打源码包容易把未跟踪的本地文件一起打进去, 已在 2026-10-10 移除该步骤)。
 
 用法:
   .venv\\Scripts\\python.exe tools\\publish_release.py <tag> [<title>] [<notes_file>]
@@ -40,25 +42,19 @@ def _read_version(base: str) -> str:
 
 
 def _asset_files(base: str, ver: str) -> list[tuple[str, str, str]]:
-    """(相对路径, content_type, 上传文件名): 带版本文件名优先, 缺则回退旧名。"""
+    """(相对路径, content_type, 上传文件名): 带版本文件名优先, 缺则回退旧名, 都没有就跳过。"""
     cands = [
-        (f"dist/WTBlackList_{ver}.zip", "application/zip", f"WTBlackList_{ver}.zip"),
-        (f"dist/WTBlackList_Setup_{ver}.exe", "application/octet-stream",
-         f"WTBlackList_Setup_{ver}.exe"),
-        (f"dist/WTBlackList_source_{ver}.zip", "application/zip",
-         f"WTBlackList_source_{ver}.zip"),
-    ]
-    legacy = [
-        ("dist/WTBlackList.zip", "application/zip", "WTBlackList.zip"),
-        ("dist/WTBlackList_Setup.exe", "application/octet-stream", "WTBlackList_Setup.exe"),
-        ("dist/WTBlackList_source.zip", "application/zip", "WTBlackList_source.zip"),
+        ((f"dist/WTBlackList_{ver}.zip", "dist/WTBlackList.zip"),
+         "application/zip", f"WTBlackList_{ver}.zip"),
+        ((f"dist/WTBlackList_Setup_{ver}.exe", "dist/WTBlackList_Setup.exe"),
+         "application/octet-stream", f"WTBlackList_Setup_{ver}.exe"),
     ]
     out = []
-    for cand, leg in zip(cands, legacy):
-        if os.path.isfile(os.path.join(base, cand[0])):
-            out.append(cand)
-        else:
-            out.append(leg)
+    for names, ctype, fname in cands:
+        for rel in names:
+            if os.path.isfile(os.path.join(base, rel)):
+                out.append((rel, ctype, fname))
+                break
     return out
 
 
