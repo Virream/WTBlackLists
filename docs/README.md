@@ -36,12 +36,17 @@ docs/
 ## 关键字段速查(与项目相关)
 
 ### 对局状态判定(monitor.py)
+- **本项目只用 `/map.img`(小地图图片)判定**: 真实地图(约 1024×1024 PNG)= 在对局;
+  占位图(128×128 的 `?`, 固定 1519 字节)= 在机库; 拿不到 / 不是图片 = 未知(不改变状态)
 - `/mission.json`:`status` 可取 `"running"` / `"fail"`;`objectives` 为任务数组(每项含 `primary` / `status` / `text`)
-- `/state`:`valid` 布尔字段(是否处于对局/载具状态)
-- 本项目判定: `mission.valid is True` **或** `(mission.status == "running" and objectives 非空)`;退出对局(回机库)后连续 3 秒确认才触发 `battle_ended`
+  —— 但这些字段**退出对局后仍保留上一局内容**, 不能作判定依据
+- `/state`:`valid` 布尔字段 —— 实测即使在战斗中也可能为 `false`, 同样不能作判定依据
+- 加载期(地图图片尚未出现)的新击杀/发言会按"活动"判定进局, 避免漏掉第一辆靶车
 
 ### 玩家昵称收集(monitor.py / nickname_collector.py)
 - `/hudmsg`(击杀列表)与 `/gamechat`(发言记录)用于逐步收集对局玩家昵称
+- **每 3 秒**轮询一次(1 秒级轮询会让游戏偶尔漏发 HUD 消息);`id` 跨局只增不重置, 只处理"新增 id"
+- `/hudmsg` 的 `time` 字段不可靠, 不要用它做时间判断
 - 主机玩家昵称前的 `⋇` 标记在解析时去除
 
 ### 注意
