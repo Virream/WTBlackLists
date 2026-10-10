@@ -1740,6 +1740,10 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _on_nicknames(self, names: list) -> None:
+        # 排查用: 只在列表真的变化时记一笔(定位“检测到了但界面/叠加层没跟上”)
+        if getattr(self, "_shown_nicks", None) != list(names):
+            self._shown_nicks = list(names)
+            log.info("UI: 昵称列表更新 %d 条 %s", len(names), list(names)[:20])
         self.nick_list.clear()
         self.nick_list.addItems(names)
         self.statusBar().showMessage(f"当前对局已记录 {len(names)} 个昵称", 3000)
@@ -2024,6 +2028,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list)
     def _on_blacklist_found(self, names: list) -> None:
+        log.info("UI: 叠加层命中列表 %s", list(names)[:10])
         self._overlay.set_found(list(names))
 
     @pyqtSlot(str, str)
