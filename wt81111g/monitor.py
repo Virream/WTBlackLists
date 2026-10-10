@@ -121,10 +121,11 @@ class MonitorWorker(QObject):
             connected = True
         else:
             self._conn_fails += 1
-            connected = self._connected
-            if self._conn_fails < CONNECT_FAIL_TICKS:
-                log.info("8111 探测没有回答(连续第 %d 次) → 本轮跳过, 不改状态", self._conn_fails)
-                return
+            connected = (self._connected if self._conn_fails < CONNECT_FAIL_TICKS
+                         else False)
+            # ⚠️ 只是这一次没答上来 → **继续本轮**: 消息/地图都要照常处理。
+            log.info("8111 探测没有回答(连续第 %d 次) → %s", self._conn_fails,
+                     "继续本轮" if connected else "按断线处理")
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
