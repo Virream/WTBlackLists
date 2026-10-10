@@ -269,13 +269,13 @@ class _FakeClient:
                   raise_on_error: bool = False):
         return self.map_images[min(self.i, len(self.map_images) - 1)]
 
-    def gamechat(self, last_id):
+    def gamechat(self, last_id, raise_on_error: bool = False):
         if not self.chats:
             return []
         self._chat_id += 1
         return [{"id": self._chat_id, "sender": self.chats.pop(0), "msg": "hi"}]
 
-    def hudmsg(self, a, b):
+    def hudmsg(self, a, b, raise_on_error: bool = False):
         if not self.damage and not self.new_damage:
             return {}
         win = self.damage + self.new_damage

@@ -7,7 +7,10 @@ import requests
 
 from .config import WT_BASE_URL
 
-_TIMEOUT = 1.0
+# 请求超时: 8111 平时 rtt 才 ~10ms, 但在**换局/换地图那几十秒里游戏会很忙**
+# (实测: 刚离开对局时 /map.img、/hudmsg 可能一两秒才回应), 1 秒会把正常答案
+# 误判成“没回答”。
+_TIMEOUT = 2.0
 
 
 class WT8111:
@@ -33,23 +36,27 @@ class WT8111:
     def connected(self) -> bool:
         """轻量探测 8111 是否可达。"""
         try:
-            resp = self.session.get(self.base + "/state", timeout=0.8)
+            resp = self.session.get(self.base + "/state", timeout=self.timeout)
             return resp.status_code == 200
         except requests.RequestException:
             return False
 
-    def gamechat(self, last_id: int) -> list:
+    def gamechat(self, last_id: int, raise_on_error: bool = False) -> list:
         try:
             data = self.get("/gamechat", {"lastId": last_id})
             return data if isinstance(data, list) else []
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return []
 
-    def hudmsg(self, last_evt: int, last_dmg: int) -> dict:
+    def hudmsg(self, last_evt: int, last_dmg: int, raise_on_error: bool = False) -> dict:
         try:
             data = self.get("/hudmsg", {"lastEvt": last_evt, "lastDmg": last_dmg})
             return data if isinstance(data, dict) else {}
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return {}
 
     def mission(self, raise_on_error: bool = False) -> dict:
