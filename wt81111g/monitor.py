@@ -33,6 +33,9 @@ ACTIVITY_GRACE = 5.0
 # 超时短了会被误判成“不在对局”。
 MAP_PROBE_TIMEOUT = 2.0
 
+# 连续多少次请求都失败才认定“8111 断开连接”: 换局那几十秒游戏很忙, 单次超时不算断开。
+CONNECT_FAIL_TICKS = 3
+
 
 class MonitorWorker(QObject):
     """后台线程轮询 8111 并维护“当前对局昵称”,与黑名单比对。"""
@@ -65,6 +68,8 @@ class MonitorWorker(QObject):
 
         self._stop = threading.Event()
         self._connected = False
+        self._conn_fails = 0      # 连通性探测连续失败次数(单次超时不算断开)
+        self._msg_fails = 0       # hudmsg/gamechat 连续失败次数(失败不算“没有新消息”)
         self._in_battle = False
         self._garage_ticks = 0   # 连续多少个 tick 都没看到真地图
         self._last_activity = 0.0  # 最近一次收到击杀/发言的时间
@@ -102,7 +107,17 @@ class MonitorWorker(QObject):
 
     # ------------------------------------------------------------------
     def _tick(self) -> None:
-        connected = self.client.connected()
+        # ⚠️ 单次探测失败**不算**断开(实测换局那几十秒 8111 很忙, /state 也可能超时):
+        # 连续 CONNECT_FAIL_TICKS 次都失败才认定断开, 否则只跳过本轮、不动任何状态。
+        if self.client.connected():
+            self._conn_fails = 0
+            connected = True
+        else:
+            self._conn_fails += 1
+            connected = self._connected
+            if self._conn_fails < CONNECT_FAIL_TICKS:
+                log.info("8111 探测没有回答(连续第 %d 次) → 本轮跳过, 不改状态", self._conn_fails)
+                return
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
@@ -118,8 +133,18 @@ class MonitorWorker(QObject):
         # 原因: 8111 的 /hudmsg 是**滚动窗口**, 刚进新对局时里面还留着上一局的消息;
         # 消息 id 跨局只增不重置, 所以只能用“游标之后的新 id”判定“本局新增的”。
         # 这样: 软件启动前就在窗口里的 ID、以及出局期间收到的消息, 都不可能参与本局判断。
-        msgs = self.client.gamechat(self._gamechat_cursor)
-        hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor)
+        msgs: list = []
+        hud: dict = {}
+        try:
+            msgs = self.client.gamechat(self._gamechat_cursor, raise_on_error=True)
+            hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor, raise_on_error=True)
+            self._msg_fails = 0
+        except requests.RequestException as exc:
+            # 请求没成功 ≠ 没有新消息: 消息还在 8111 的窗口里, 保留游标下次再取
+            self._msg_fails += 1
+            log.info("hudmsg/gamechat 没有回答(%s, 连续第 %d 次) → 本轮不收集, 保留游标",
+                     type(exc).__name__, self._msg_fails)
+            return
         new_msg = bool(msgs)
 
         # 是否“在地图里(对局/试车场)” —— 以 8111 的地图图片为准(见 garage.py):

@@ -33,23 +33,27 @@ class WT8111:
     def connected(self) -> bool:
         """轻量探测 8111 是否可达。"""
         try:
-            resp = self.session.get(self.base + "/state", timeout=0.8)
+            resp = self.session.get(self.base + "/state", timeout=self.timeout)
             return resp.status_code == 200
         except requests.RequestException:
             return False
 
-    def gamechat(self, last_id: int) -> list:
+    def gamechat(self, last_id: int, raise_on_error: bool = False) -> list:
         try:
             data = self.get("/gamechat", {"lastId": last_id})
             return data if isinstance(data, list) else []
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return []
 
-    def hudmsg(self, last_evt: int, last_dmg: int) -> dict:
+    def hudmsg(self, last_evt: int, last_dmg: int, raise_on_error: bool = False) -> dict:
         try:
             data = self.get("/hudmsg", {"lastEvt": last_evt, "lastDmg": last_dmg})
             return data if isinstance(data, dict) else {}
         except requests.RequestException:
+            if raise_on_error:
+                raise
             return {}
 
     def mission(self) -> dict:
