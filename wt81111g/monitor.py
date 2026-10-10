@@ -36,9 +36,9 @@ MAP_PROBE_TIMEOUT = 2.0
 # 连续多少次请求都失败才认定“8111 断开连接”: 换局那几十秒游戏很忙, 单次超时不算断开。
 CONNECT_FAIL_TICKS = 3
 
-# 已经在对局里时, 每多少个 tick 才去探一次 /map.img: 真地图几百 KB~几 MB,
-# 每秒完整取一遍既费带宽又让游戏的 8111 变忙。出局时仍然每 tick 都探。
-MAP_PROBE_EVERY = 2
+# 探 /map.img 的频率: 只读前 PROBE_BYTES(16KB)就断开, 很轻 —— 设 1 = 每个 tick 都探,
+# 这样一回到车库就能立刻发现(回库后命中信息 1 秒内消失)。
+MAP_PROBE_EVERY = 1
 
 
 class MonitorWorker(QObject):
@@ -171,18 +171,19 @@ class MonitorWorker(QObject):
         #      (实测: 进对局初期 /map.img 要好几秒才回应, 当成“不在对局”就会在已经开打
         #       的头几十秒里一直不判进局 —— 用户反馈“打死 3 辆靶车才检测到”)
         # 为什么不看 map_info/mission: 那两个是**状态**字段, 退出对局回机库后会残留。
-        # 探地图图片: 出局时每 tick 都探; 已经在局内时每 MAP_PROBE_EVERY 个 tick 探一次。
-        # 完整取图而不是“读满 16KB 就断”: 中途断开会把连接弄脏, 后续请求会卡到超时。
-        # 没探的那一轮(in_map=None)什么样都不改 —— 特别是不能把“回车库”计数清零。
+        # 探地图图片: 每个 tick 都探(只读前 PROBE_BYTES, 很轻); 8111 明确回答“不是真地图”
+        # 就立刻收工(回库后命中信息 1 秒内消失); 没有回答时保守处理, 不改状态。
         self._tick_no += 1
         in_map: bool | None
+        certain = False      # 8111 是否**明确**回答了(非真图 = 肯定在车库; 真图 = 肯定在对局)
         probe_ms = -1.0
         if (not self._in_battle) or (self._tick_no % MAP_PROBE_EVERY == 0):
             _t0 = time.perf_counter()
             try:
-                probe = self.client.map_image(timeout=MAP_PROBE_TIMEOUT,
+                probe = self.client.map_image(limit=PROBE_BYTES, timeout=MAP_PROBE_TIMEOUT,
                                               raise_on_error=True)
                 in_map = in_map_by_image(probe)
+                certain = True
             except requests.RequestException as exc:
                 in_map = None                  # 未知 → 不改状态
                 log.info("map.img 没有回答(%s) → 沿用上一次判定", type(exc).__name__)
@@ -191,12 +192,16 @@ class MonitorWorker(QObject):
             in_map = None                      # 本轮不探, 不改状态
         # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
-        if in_map is None:
-            pass
-        elif in_map:
+        if in_map:
             self._garage_ticks = 0
             if not self._in_battle:
                 self._start_battle()
+        elif in_map is False and certain:
+            # 8111 明确回答“不是真地图”(占位图 / 不是图片) ⇒ 肯定在车库:
+            # 立刻收工 —— 不等活动宽限、不等第二次确认, 回库后命中信息 1 秒内消失。
+            self._garage_ticks = 0
+            if self._in_battle:
+                self._end_battle("8111 只给车库占位图/不是图片")
         elif self._in_battle:
             if now - self._last_activity < ACTIVITY_GRACE:
                 # 刚刚还有击杀/发言 → 肯定还在对局里(地图图片一时拿不到): 先不判离开。
