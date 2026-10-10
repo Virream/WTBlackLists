@@ -61,11 +61,17 @@ class MonitorWorker(QObject):
     def __init__(self, store: BlacklistStore,
                  nickname_cache: NicknameCache | None = None,
                  base_url: str = WT_BASE_URL,
-                 poll_interval: float = 1.0):
+                 poll_interval: float = 1.0,
+                 msg_interval: float = 3.0):
         super().__init__()
         self.store = store
         self.nickname_cache = nickname_cache or NicknameCache()
         self.poll_interval = poll_interval
+        # /hudmsg + /gamechat 的最小请求间隔(秒): 实测“软件一开就偶尔漏一条 HUD 消息”
+        # (id 连续无缺口 = 游戏没生成它), 怀疑就是这两个每秒轮询在打扰游戏。降低频率后
+        # 消息仍留在 8111 的滚动窗口里(游标不推进即可), 不会丢。
+        self.msg_interval = msg_interval
+        self._last_msg_poll = 0.0
         self.client = WT8111(base_url)
         self.manual_requested.connect(self._on_manual_check)
         self.feed_requested.connect(self._on_feed_check)
@@ -114,6 +120,7 @@ class MonitorWorker(QObject):
     def _tick(self) -> None:
         # 排查用: 记下各阶段耗时(取消息 / 探地图), 慢的时候直接写进日志
         t_tick = time.perf_counter()
+        now = time.time()
         # ⚠️ 单次探测失败**不算**断开(实测换局那几十秒 8111 很忙, /state 也可能超时):
         # 连续 CONNECT_FAIL_TICKS 次都失败才认定断开, 否则只跳过本轮、不动任何状态。
         if self.client.connected():
@@ -143,16 +150,17 @@ class MonitorWorker(QObject):
         # 这样: 软件启动前就在窗口里的 ID、以及出局期间收到的消息, 都不可能参与本局判断。
         msgs: list = []
         hud: dict = {}
-        try:
-            msgs = self.client.gamechat(self._gamechat_cursor, raise_on_error=True)
-            hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor, raise_on_error=True)
-            self._msg_fails = 0
-        except requests.RequestException as exc:
-            # 请求没成功 ≠ 没有新消息: 消息还在 8111 的窗口里, 保留游标下次再取
-            self._msg_fails += 1
-            log.info("hudmsg/gamechat 没有回答(%s, 连续第 %d 次) → 本轮不收集, 保留游标",
-                     type(exc).__name__, self._msg_fails)
-            return
+        if (now - self._last_msg_poll) >= self.msg_interval:
+            self._last_msg_poll = now
+            try:
+                msgs = self.client.gamechat(self._gamechat_cursor, raise_on_error=True)
+                hud = self.client.hudmsg(self._evt_cursor, self._dmg_cursor, raise_on_error=True)
+                self._msg_fails = 0
+            except requests.RequestException as exc:
+                self._msg_fails += 1
+                log.info("hudmsg/gamechat 没有回答(%s, 连续第 %d 次) → 本轮不收集, 保留游标",
+                         type(exc).__name__, self._msg_fails)
+                return
         new_msg = bool(msgs)
         t_msg = time.perf_counter()
 
@@ -181,7 +189,6 @@ class MonitorWorker(QObject):
             probe_ms = (time.perf_counter() - _t0) * 1000
         else:
             in_map = None                      # 本轮不探, 不改状态
-        now = time.time()
         # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
         if in_map is None:
