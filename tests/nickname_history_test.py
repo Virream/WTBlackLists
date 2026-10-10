@@ -332,6 +332,7 @@ def test_leaving_battle_clears_collected() -> None:
     real = png_bytes(1024, 1024)
     holder = png_bytes(128, 128)
     w = MonitorWorker(store, nickname_cache=cache)
+    w.msg_interval = 0.0       # 测试里每个 tick 都要取到消息
     w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 4,
                            [real, holder, holder, real],
                            chats=["Primer", "EnemyOne", "EnemyTwo"])
@@ -404,6 +405,7 @@ def test_stale_hudmsg_window_not_collected() -> None:
     holder = png_bytes(128, 128)
     real = png_bytes(1024, 1024)
     w = MonitorWorker(store, nickname_cache=cache)
+    w.msg_interval = 0.0       # 测试里每个 tick 都要取到消息
     # 预热昵称缓存: 避免进入对局时触发 WTLive 预抓取(后台线程会干扰后面的用例)
     w._profile_cache["1"] = ("目击而道存矣", time.time())
     w.client = _FakeClient([{"status": "running", "objectives": [{"id": 1}]}] * 5,
@@ -455,6 +457,7 @@ def test_loading_screen_kill_starts_battle() -> None:
     cache = NicknameCache(os.path.join(tmpdir, "nc.json"))
     store.add(BlacklistEntry(player_id="1", nickname="目击而道存矣", reason="测试"))
     w = MonitorWorker(store, nickname_cache=cache)
+    w.msg_interval = 0.0       # 测试里每个 tick 都要取到消息
     w._profile_cache["1"] = ("目击而道存矣", time.time())   # 免预抓取
     holder = png_bytes(128, 128)
     real = png_bytes(1024, 1024)
@@ -494,6 +497,7 @@ def test_second_battle_ignores_previous_window() -> None:
     store.add(BlacklistEntry(player_id="1", nickname="OldGuy", reason="测试"))
     store.add(BlacklistEntry(player_id="2", nickname="NewGuy", reason="测试"))
     w = MonitorWorker(store, nickname_cache=cache)
+    w.msg_interval = 0.0       # 测试里每个 tick 都要取到消息
     w._profile_cache["1"] = ("OldGuy", time.time())   # 免预抓取
     w._profile_cache["2"] = ("NewGuy", time.time())
     holder = png_bytes(128, 128)
