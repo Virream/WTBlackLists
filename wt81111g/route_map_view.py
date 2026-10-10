@@ -29,6 +29,15 @@ log = logging.getLogger("route_map_view")
 COLOR_START = QColor("#22c55e")   # 绿
 COLOR_MARK = QColor("#facc15")    # 黄
 COLOR_STOP = QColor("#ef4444")    # 红
+
+# 玩家标记(像素, 不随缩放变): 位置空心圆圈 + 圆心实心点 + 表示车头朝向的 ^
+PLAYER_RING_R = 12.0          # 位置空心圆圈半径
+PLAYER_DOT_R = 4.0            # 圆心实心点半径
+# ^ 用「前进量 + 横向半宽 + 高度」描述(不是两个半径) —— 调 BACK 就是把整个 ^
+# 沿车头方向平移, 调 W 就是把两只脚岔开, 与肉眼看到的效果一一对应。
+PLAYER_DIR_BACK = 4.0         # 两只脚相对圆心的前进量(越小越贴近圆心)
+PLAYER_DIR_W = 7.5            # 两只脚相对中轴的横向半宽(越大越岔开)
+PLAYER_DIR_H = 4.5            # 尖点比两只脚连线再往前多少
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
 # 回放时**尚未播放**的轨迹段: 半透明淡色 —— 半透明只用在这里
@@ -99,6 +108,23 @@ def bucket_index(speed: float, vmax: float) -> int:
         return 0
     ratio = max(0.0, min(1.0, speed / vmax))
     return min(_SPEED_BUCKETS - 1, int(ratio * _SPEED_BUCKETS))
+
+
+def player_dir_points(center: QPointF, ang: float) -> tuple[QPointF, QPointF, QPointF]:
+    """^ 的三个点(尖点, 脚 1, 脚 2); center = 玩家位置, ang = 车头方向(弧度)。
+
+    用「前进量 + 横向半宽 + 高度」描述(见 PLAYER_DIR_* 常量)而不是两个半径 ——
+    这样"把整个 ^ 沿车头方向平移"就是改 BACK, "把两只脚岔开"就是改 W,
+    和眼睛看到的效果一一对应。测试也直接用它取点, 不必重复算几何。
+    """
+    ca, sa = math.cos(ang), math.sin(ang)
+
+    def pt(fwd: float, lat: float) -> QPointF:
+        return QPointF(center.x() + fwd * ca - lat * sa,
+                       center.y() + fwd * sa + lat * ca)
+
+    tip = pt(PLAYER_DIR_BACK + PLAYER_DIR_H, 0.0)
+    return (tip, pt(PLAYER_DIR_BACK, -PLAYER_DIR_W), pt(PLAYER_DIR_BACK, PLAYER_DIR_W))
 
 
 def build_speed_segments(points: list[RoutePoint], vmax: float,
@@ -1037,19 +1063,20 @@ class RouteMapView(QWidget):
         c = self._to_px(*self._player)
         p.setPen(QPen(QColor(56, 189, 248, 90), 1))
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawEllipse(c, 12, 12)
+        p.drawEllipse(c, PLAYER_RING_R, PLAYER_RING_R)
         p.setPen(QPen(COLOR_PLAYER, 2))
         p.setBrush(QBrush(COLOR_PLAYER))
-        p.drawEllipse(c, 4, 4)
+        p.drawEllipse(c, PLAYER_DOT_R, PLAYER_DOT_R)
         if self._player_dir is not None:
             self._draw_player_dir(p, c, *self._player_dir)
 
     def _draw_player_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
-        """在玩家圆圈**前方**画一个 ^ 表示车头朝向(与本体解算的朝向一致)。
+        """在玩家标记上画一个 ^ 表示车头朝向(与本体解算的朝向一致)。
 
         dx/dy 是 map_obj.json 给的**归一化单位方向向量**(与 /map.img 同坐标系)——
         地图显示尺寸可能不是正方形(等比缩放后的 w/h 不等), 所以按 w/h 换算成像素
         方向再求角, 否则朝向会被拉歪。
+        形状/位置见 PLAYER_DIR_* 常量(BACK = 整体沿车头方向平移, W = 两只脚岔开)。
         """
         w, h = self._map_size()
         if w <= 0.0 or h <= 0.0:
@@ -1057,22 +1084,14 @@ class RouteMapView(QWidget):
         if dx == 0.0 and dy == 0.0:
             return                            # 全零 = 无有效朝向(录制线程已过滤, 这里再兜一层)
         ang = math.atan2(dy * h, dx * w)
-        r_circle = 12.0                       # 与上面那个圈的半径一致
-        r_base = r_circle + 1.5               # 两翼起点(贴着圆外沿)
-        r_tip = r_circle + 10.0               # 尖点
-        spread = math.radians(32.0)
-        tip = QPointF(c.x() + r_tip * math.cos(ang), c.y() + r_tip * math.sin(ang))
-        wing1 = QPointF(c.x() + r_base * math.cos(ang - spread),
-                        c.y() + r_base * math.sin(ang - spread))
-        wing2 = QPointF(c.x() + r_base * math.cos(ang + spread),
-                        c.y() + r_base * math.sin(ang + spread))
+        tip, foot1, foot2 = player_dir_points(c, ang)
         # 先描深色底再画亮色: 深/浅底图上都看得清(与 _draw_hover_mark 同一套办法)
         for color, width in ((QColor(15, 23, 42, 220), 4.0), (COLOR_PLAYER, 2.0)):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(color, width, Qt.PenStyle.SolidLine,
                           Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.drawLine(tip, wing1)
-            p.drawLine(tip, wing2)
+            p.drawLine(tip, foot1)
+            p.drawLine(tip, foot2)
 
     def _draw_hover_mark(self, p: QPainter) -> None:
         """在命中的那个轨迹点上画一圈白环。

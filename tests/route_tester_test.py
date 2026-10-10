@@ -23,7 +23,9 @@ from PyQt6.QtWidgets import QAbstractItemView, QApplication
 import wt81111g.route_window as rw
 from wt81111g.map_cache import MapCache
 from wt81111g.icons import ICON_SIZE, circle_icon, eye_icon
-from wt81111g.route_map_view import RouteMapView, build_speed_segments
+from wt81111g.route_map_view import (
+    PLAYER_DIR_H, PLAYER_DIR_W, RouteMapView, build_speed_segments, player_dir_points,
+)
 from wt81111g.route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from wt81111g.route_recorder import RouteRecorder, _is_player_obj
 from wt81111g.route_store import (
@@ -414,27 +416,31 @@ def test_map_render():
 
 
 def test_player_heading():
-    """玩家圈前的 ^ 要跟着 dx/dy 转(渲染级: 不真画一遍看不出来)。
+    """玩家标记上的 ^ 要跟着 dx/dy 转(渲染级: 不真画一遍看不出来)。
 
-    做法: 纯色底图 + 数“以玩家点为圆心、某方向扇形环里的亮像素” ——
-    ^ 画在哪一侧, 哪一侧就该亮。
+    做法: 纯色底图 + **沿 ^ 的两条边逐点取样**数亮像素 —— 箭头画在哪一侧、
+    转到哪个角度, 就只该在那一侧取到亮点(比数扇形环更精确, 也不会把
+    实心点和空心圆的像素算进来)。
     """
     view = RouteMapView()
     view.resize(800, 600)
     assert view.set_map_bytes(png_solid("#334455", 64)) is True, "地图图片应加载成功"
     pos = (0.42, 0.41)
+    # 几何自检: 两条边够长取样才有意义
+    assert PLAYER_DIR_H > 2.0 and PLAYER_DIR_W > 2.0, "^ 太小了, 看不出朝向"
 
-    def bright(angle_deg: float, r0: float = 15.0, r1: float = 23.0,
-               half: float = 20.0) -> int:
-        """扇形环里的亮像素数(底色 #334455 三通道和 204, 朝向符号是亮蓝 493)。"""
+    def bright(angle_deg: float) -> int:
+        """沿 ^ 的两条边取样, 数亮像素(底色 #334455 三通道和 204, 箭头是亮蓝 493)。"""
         img = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img)
         c = view.map_pos(*pos)
+        tip, foot1, foot2 = player_dir_points(c, math.radians(angle_deg))
         n = 0
-        for i in range(41):
-            a = math.radians(angle_deg - half + 2.0 * half * i / 40.0)
-            for r in range(int(r0), int(r1) + 1):
-                x, y = int(c.x() + r * math.cos(a)), int(c.y() + r * math.sin(a))
+        for a, b in ((tip, foot1), (tip, foot2)):
+            for i in range(16):
+                t = (i + 0.5) / 16.0          # 跳过两个端点(端点跟圆/点的边缘挨得近)
+                x = int(round(a.x() + (b.x() - a.x()) * t))
+                y = int(round(a.y() + (b.y() - a.y()) * t))
                 if 0 <= x < 800 and 0 <= y < 600:
                     col = img.pixelColor(x, y)
                     if col.red() + col.green() + col.blue() > 380:
@@ -448,18 +454,18 @@ def test_player_heading():
     # 像素坐标 y 向下 → dx=1,dy=0 在右边(0°), dx=0,dy=1 在下边(90°)
     view.set_player(pos, (1.0, 0.0))
     right, left = bright(0.0), bright(180.0)
-    assert right > 4 and left == 0, f"朝右时应只在右侧画 ^ (右 {right} / 左 {left})"
+    assert right > 20 and left == 0, f"朝右时应只在右侧画 ^ (右 {right} / 左 {left})"
 
     view.set_player(pos, (0.0, 1.0))
     down, up = bright(90.0), bright(-90.0)
-    assert down > 4 and up == 0, f"朝下时应只在下侧画 ^ (下 {down} / 上 {up})"
+    assert down > 20 and up == 0, f"朝下时应只在下侧画 ^ (下 {down} / 上 {up})"
 
     view.set_player(pos, (-1.0, 0.0))
-    assert bright(180.0) > 4 and bright(0.0) == 0, "反向时应画在左侧"
+    assert bright(180.0) > 20 and bright(0.0) == 0, "反向时应画在左侧"
 
     # 斜向也要落在正确的象限里(dx=-0.67, dy=0.74 是实测样本 → 左下 132°)
     view.set_player(pos, (-0.67, 0.74))
-    assert bright(132.0) > 4, "斜向朝向应落在左下方向"
+    assert bright(132.0) > 20, "斜向朝向应落在左下方向"
     assert bright(-48.0) == 0, "反方向不该有 ^"
 
     view.set_player(pos, (0.0, 0.0))           # 全零向量 = 无有效朝向
