@@ -112,6 +112,8 @@ class MonitorWorker(QObject):
 
     # ------------------------------------------------------------------
     def _tick(self) -> None:
+        # 排查用: 记下各阶段耗时(取消息 / 探地图), 慢的时候直接写进日志
+        t_tick = time.perf_counter()
         # ⚠️ 单次探测失败**不算**断开(实测换局那几十秒 8111 很忙, /state 也可能超时):
         # 连续 CONNECT_FAIL_TICKS 次都失败才认定断开, 否则只跳过本轮、不动任何状态。
         if self.client.connected():
@@ -151,6 +153,7 @@ class MonitorWorker(QObject):
                      type(exc).__name__, self._msg_fails)
             return
         new_msg = bool(msgs)
+        t_msg = time.perf_counter()
 
         # 是否“在地图里(对局/试车场)” —— 以 8111 的地图图片为准(见 garage.py):
         #   ① 固定的 “?” 占位图(128×128, 1519 字节 PNG) / 不是图片 → 在车库
@@ -164,7 +167,9 @@ class MonitorWorker(QObject):
         # 没探的那一轮(in_map=None)什么样都不改 —— 特别是不能把“回车库”计数清零。
         self._tick_no += 1
         in_map: bool | None
+        probe_ms = -1.0
         if (not self._in_battle) or (self._tick_no % MAP_PROBE_EVERY == 0):
+            _t0 = time.perf_counter()
             try:
                 probe = self.client.map_image(timeout=MAP_PROBE_TIMEOUT,
                                               raise_on_error=True)
@@ -172,6 +177,7 @@ class MonitorWorker(QObject):
             except requests.RequestException as exc:
                 in_map = None                  # 未知 → 不改状态
                 log.info("map.img 没有回答(%s) → 沿用上一次判定", type(exc).__name__)
+            probe_ms = (time.perf_counter() - _t0) * 1000
         else:
             in_map = None                      # 本轮不探, 不改状态
         now = time.time()
@@ -193,6 +199,8 @@ class MonitorWorker(QObject):
                 self._garage_ticks += 1
                 if self._garage_ticks >= GARAGE_CONFIRM_TICKS:
                     self._end_battle("8111 没有地图图片 / 只给车库占位图")
+        if probe_ms > 300:
+            log.info("map.img 探测用了 %.0f ms → in_map=%s", probe_ms, in_map)
         new_dmg = (
             isinstance(hud, dict)
             and any(int(d.get("id", -1)) > self._dmg_cursor
@@ -250,12 +258,19 @@ class MonitorWorker(QObject):
                 self._last_activity = now
                 # 排查用: 记下这次到底收到多少条/解析出谁(游标值一并记, 便于定位漏检)
                 n_dmg = len(hud.get("damage") or []) if isinstance(hud, dict) else 0
-                log.info("hudmsg: 游标 lastDmg=%s, 返回 %d 条, 解析出 %d 个新昵称 %s",
-                         self._dmg_cursor, n_dmg, len(new_names), new_names[:20] or "-")
+                log.info("hudmsg: 游标 lastDmg=%s, 返回 %d 条, 解析出 %d 个新昵称 %s "
+                         "[取消息 %.0fms 本局共 %d 个]",
+                         self._dmg_cursor, n_dmg, len(new_names), new_names[:20] or "-",
+                         (t_msg - t_tick) * 1000, len(self._collected))
             if msgs or (isinstance(hud, dict) and hud):
                 self.nicknames_updated.emit(sorted(self._collected))
                 self._compare()
         self._msg_primed = True
+        dt_ms = (time.perf_counter() - t_tick) * 1000
+        if dt_ms > 1200:
+            log.info("本轮 tick 耗时 %.0f ms(取消息 %.0f ms, 探图 %s ms)",
+                     dt_ms, (t_msg - t_tick) * 1000,
+                     "%0.f" % probe_ms if probe_ms >= 0 else "未探")
 
     # ------------------------------------------------------------------
     def _start_battle(self) -> None:
@@ -344,6 +359,8 @@ class MonitorWorker(QObject):
         self._prefetch_running = True
 
         def work() -> None:
+            t_work = time.perf_counter()
+            log.info("prefetch: 开始(名单 %d 条)", len(list(self.store.entries)))
             try:
                 now = time.time()
                 # 只处理真正需要抓取的 ID(缓存未命中/过期)
@@ -444,6 +461,7 @@ class MonitorWorker(QObject):
 
                 if result:
                     self.profiles_updated.emit(result)
+                log.info("prefetch: 结束(耗时 %.0f ms)", (time.perf_counter() - t_work) * 1000)
                 if callback is not None:
                     callback()
             finally:
@@ -482,12 +500,16 @@ class MonitorWorker(QObject):
         """
         if not self._collected:
             return
+        t_cmp = time.perf_counter()
         entries = list(self.store.entries)
         sig = (len(self._collected), len(entries),
                sum(len(e.player_id or "") + len(e.nickname or "") for e in entries))
         if sig == self._cmp_sig:
             return
         self._cmp_sig = sig
+        n_cand = 0
+        n_hits = 0
+        miss: list[str] = []
         # 区分大小写: 游戏里同一串字母大小写不同就是不同的玩家 ID(不能按小写比较)
         exact = {n: n for n in self._collected}
         lowered = {n.lower(): n for n in self._collected}   # 仅用于“只差大小写”的提示
@@ -503,6 +525,8 @@ class MonitorWorker(QObject):
             manual = (e.nickname or "").strip()
             if manual:
                 candidates.append(manual)
+            if candidates:
+                n_cand += 1
             for cand in candidates:
                 hit = exact.get(cand)
                 if hit is None:
@@ -512,6 +536,7 @@ class MonitorWorker(QObject):
                         log.info("昵称仅大小写不同, 按不同玩家处理: 名单候选 %s vs 对局 %s",
                                  cand, alt)
                 if hit:
+                    n_hits += 1
                     self._alerted.add(key)
                     reason = e.reason or "其他原因"
                     item = (hit, reason)
@@ -522,3 +547,12 @@ class MonitorWorker(QObject):
                                 hit, pid or "-", reason)
                     self.blacklist_alert.emit(hit, pid or "-", reason)
                     break
+            if not hit and candidates and len(miss) < 5:
+                miss.append(f"{pid or '-'}:{candidates}")
+        # 排查用: 每次比对都记一笔输入规模与耗时, 未命中时附带候选样例
+        log.info("比对: 本局 %d 个昵称 vs 名单 %d 条(有候选 %d 条) → 命中 %d, 耗时 %.1f ms",
+                 len(self._collected), len(entries), n_cand, n_hits,
+                 (time.perf_counter() - t_cmp) * 1000)
+        if n_hits == 0:
+            log.info("比对未命中: 本局昵称=%s 名单候选样例=%s",
+                     sorted(self._collected)[:20], miss or "-")
