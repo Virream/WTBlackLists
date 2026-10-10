@@ -133,17 +133,24 @@ class MonitorWorker(QObject):
         # ⚠️ 单次超时**不算**断开(实测换局那几十秒 8111 很忙, 请求偶发要 1~2 秒):
         # 连续 CONNECT_FAIL_TICKS 次都失败才认定断开, 否则只跳过本轮、不动任何状态。
         try:
+            _t_mission = time.perf_counter()
             mission = self.client.mission(raise_on_error=True)
             self._conn_fails = 0
             connected = True
+            mission_ms = (time.perf_counter() - _t_mission) * 1000
+            if mission_ms > 500:
+                log.info("mission 耗时 %.0f ms", mission_ms)
         except requests.RequestException as exc:
             self._conn_fails += 1
             mission = {}
-            connected = self._connected
-            if self._conn_fails < CONNECT_FAIL_TICKS:
-                log.info("mission 没有回答(%s, 连续第 %d 次) → 本轮跳过, 不改状态",
-                         type(exc).__name__, self._conn_fails)
-                return
+            connected = (self._connected if self._conn_fails < CONNECT_FAIL_TICKS
+                         else False)
+            # ⚠️ 只是这一次没答上来 → **继续本轮**: 消息/地图都要照常处理。
+            # 否则“换局那几十秒 / 8111 偶发超时”会整段跳过(实测 mission 每 10~30 秒就
+            # 超时一次, 结果回到车库后叠加层 30 秒都不隐藏)。
+            log.info("mission 没有回答(%s, 连续第 %d 次) → %s", type(exc).__name__,
+                     self._conn_fails,
+                     "继续本轮, 不改连通状态" if connected else "按断线处理")
         if connected != self._connected:
             self._connected = connected
             self.connection_changed.emit(connected)
