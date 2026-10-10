@@ -20,8 +20,14 @@ class WT8111:
 
     def get(self, path: str, params: dict | None = None, timeout: float | None = None):
         url = self.base + path
-        resp = self.session.get(url, params=params, timeout=timeout or self.timeout)
-        resp.raise_for_status()
+        try:
+            resp = self.session.get(url, params=params, timeout=timeout or self.timeout)
+            resp.raise_for_status()
+        except requests.RequestException:
+            # 请求失败时丢掉连接池: 换局/换地图时游戏会把旧连接变成“死连接”,
+            # 复用它会一直卡到超时, 关掉连接池后下一次请求重新建连即恢复。
+            self.session.close()
+            raise
         text = resp.text.strip()
         if not text:
             return None
@@ -36,6 +42,7 @@ class WT8111:
             resp = self.session.get(self.base + "/state", timeout=self.timeout)
             return resp.status_code == 200
         except requests.RequestException:
+            self.session.close()
             return False
 
     def gamechat(self, last_id: int, raise_on_error: bool = False) -> list:
@@ -100,6 +107,7 @@ class WT8111:
             else:
                 data = resp.content or b""
         except requests.RequestException:
+            self.session.close()    # 见 get(): 丢掉可能已经死掉的连接
             if raise_on_error:
                 raise
             return None
