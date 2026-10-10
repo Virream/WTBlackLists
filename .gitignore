@@ -12,3 +12,8 @@ logs/
 *.zip
 *.html
 backups/
+
+# 探针/统计脚本跑出来的数据与图表(可再生, 不入库)
+speed_log*.csv
+*.xlsx
+WTBlackList_promo.png

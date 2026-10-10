@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
 )
 
 _AUTHOR_URL = "https://space.bilibili.com/140035845"
+_GITHUB_URL = "https://github.com/Virream"
 _TOS_URL = "https://legal.gaijin.net/termsofservice"
 
 _DESC = (
@@ -154,7 +155,8 @@ class AboutDialog(QDialog):
           <hr style="border:0; border-top:1px solid #44475a; margin:12px 0;"/>
           <p style="font-size:17px; font-weight:bold; margin:12px 0 4px 0; color:#ffffff;">战争雷霆黑名单助手</p>
           <p style="font-size:12px; margin:0 0 8px 0; font-weight:normal; color:#d0d0e0;">
-            由<a href="{_AUTHOR_URL}" style="color:#7ec8e3;">切真Viream</a>使用DeepSeek生成
+            由<a href="{_AUTHOR_URL}" style="color:#7ec8e3;">切真Viream</a>使用DeepSeek生成 ·
+            <a href="{_GITHUB_URL}" style="color:#7ec8e3;">GitHub</a>
           </p>
         </div>
         """
