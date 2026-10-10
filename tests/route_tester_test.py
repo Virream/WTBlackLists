@@ -24,7 +24,8 @@ import wt81111g.route_window as rw
 from wt81111g.map_cache import MapCache
 from wt81111g.icons import ICON_SIZE, circle_icon, eye_icon
 from wt81111g.route_map_view import (
-    PLAYER_DIR_H, PLAYER_DIR_W, RouteMapView, build_speed_segments, player_dir_points,
+    CURSOR_DIR_LEN, PLAYER_DIR_H, PLAYER_DIR_W,
+    RouteMapView, build_speed_segments, cursor_dir_points, player_dir_points,
 )
 from wt81111g.route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from wt81111g.route_recorder import RouteRecorder, _is_player_obj
@@ -416,36 +417,48 @@ def test_map_render():
 
 
 def test_player_heading():
-    """玩家标记上的 ^ 要跟着 dx/dy 转(渲染级: 不真画一遍看不出来)。
+    """车头朝向要跟着 dx/dy 转(渲染级: 不真画一遍看不出来)。
 
-    做法: 纯色底图 + **沿 ^ 的两条边逐点取样**数亮像素 —— 箭头画在哪一侧、
-    转到哪个角度, 就只该在那一侧取到亮点(比数扇形环更精确, 也不会把
-    实心点和空心圆的像素算进来)。
+    玩家标记上是**蓝色 ^**, 回放光标上是**一根白线**; 做法: 纯色底图 +
+    沿这两个符号逐点取样数亮像素 —— 画在哪一侧、转到哪个角度, 就只该在
+    那一侧取到亮点(不会把实心点/空心圈的像素算进来)。
     """
     view = RouteMapView()
     view.resize(800, 600)
     assert view.set_map_bytes(png_solid("#334455", 64)) is True, "地图图片应加载成功"
     pos = (0.42, 0.41)
-    # 几何自检: 两条边够长取样才有意义
+    # 几何自检: 符号够大取样才有意义
     assert PLAYER_DIR_H > 2.0 and PLAYER_DIR_W > 2.0, "^ 太小了, 看不出朝向"
+    assert CURSOR_DIR_LEN > 2.0, "回放光标的朝向线太短"
 
-    def bright(angle_deg: float) -> int:
-        """沿 ^ 的两条边取样, 数亮像素(底色 #334455 三通道和 204, 箭头是亮蓝 493)。"""
+    def render_now() -> QImage:
         img = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img)
-        c = view.map_pos(*pos)
-        tip, foot1, foot2 = player_dir_points(c, math.radians(angle_deg))
+        return img
+
+    def count_bright(img: QImage, a: QPointF, b: QPointF,
+                     t0: float = 0.0, span: float = 1.0, n_samples: int = 16) -> int:
+        """沿线段 a→b 取样数亮像素(底色 #334455 和 204, ^ 与白线都是亮的)。
+
+        t0/span 控制取哪一段 —— 两端常常挨着实心点/空心圈(它们也亮), 要避开。
+        """
         n = 0
-        for a, b in ((tip, foot1), (tip, foot2)):
-            for i in range(16):
-                t = (i + 0.5) / 16.0          # 跳过两个端点(端点跟圆/点的边缘挨得近)
-                x = int(round(a.x() + (b.x() - a.x()) * t))
-                y = int(round(a.y() + (b.y() - a.y()) * t))
-                if 0 <= x < 800 and 0 <= y < 600:
-                    col = img.pixelColor(x, y)
-                    if col.red() + col.green() + col.blue() > 380:
-                        n += 1
+        for i in range(n_samples):
+            t = t0 + span * (i + 0.5) / n_samples
+            x = int(round(a.x() + (b.x() - a.x()) * t))
+            y = int(round(a.y() + (b.y() - a.y()) * t))
+            if 0 <= x < 800 and 0 <= y < 600:
+                col = img.pixelColor(x, y)
+                if col.red() + col.green() + col.blue() > 380:
+                    n += 1
         return n
+
+    def bright(angle_deg: float) -> int:
+        """玩家标记的蓝色 ^: 两条边上一共取到几个亮点。"""
+        c = view.map_pos(*pos)
+        img = render_now()
+        tip, foot1, foot2 = player_dir_points(c, math.radians(angle_deg))
+        return count_bright(img, tip, foot1) + count_bright(img, tip, foot2)
 
     view.set_player(pos)                       # 没有朝向数据 → 只画圈和点
     assert bright(0.0) == 0 and bright(90.0) == 0 and bright(180.0) == 0, \
@@ -470,6 +483,34 @@ def test_player_heading():
 
     view.set_player(pos, (0.0, 0.0))           # 全零向量 = 无有效朝向
     assert bright(0.0) == 0 and bright(90.0) == 0, "零向量不该画出方向"
+
+    # --- 回放光标: 用**录制时存下的**朝向画白线(游戏没开也能看) ---
+    def cursor_bright(rec, head: float, angle_deg: float) -> int:
+        """在回放光标处沿那根白线取样(中段, 免得碰到光标的白圈/白点)。"""
+        cur = point_at(rec.points, head)
+        c = view.map_pos(cur.x, cur.y)
+        img = render_now()
+        start, tip = cursor_dir_points(c, math.radians(angle_deg))
+        return count_bright(img, start, tip, 0.2, 0.6)
+
+    def playback_rec(dx: float, dy: float) -> RouteRecord:
+        r = RouteRecord(route_id="head", map_key="k", map_name="m", vehicle="v",
+                        created_at="", duration=4.0, start_x=0.4, start_y=0.41)
+        r.points = [RoutePoint(0.40, 0.41, 0.0, 30.0, dx=dx, dy=dy),
+                    RoutePoint(0.60, 0.41, 4.0, 30.0, dx=dx, dy=dy)]
+        return r
+
+    view.set_player(None)
+    rec_dir = playback_rec(0.0, -1.0)          # 录制时朝上
+    view.set_playback(rec_dir, 2.0)
+    assert cursor_bright(rec_dir, 2.0, -90.0) > 8, "回放光标也要画朝向线"
+    assert cursor_bright(rec_dir, 2.0, 90.0) == 0, "反方向不该有朝向线"
+    view.set_playback(None)
+
+    rec_old = playback_rec(0.0, 0.0)           # 旧轨迹: 点里没有朝向
+    view.set_playback(rec_old, 2.0)
+    assert cursor_bright(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画圈和点"
+    view.set_playback(None)
 
     view.set_player(None)
     view.render(QImage(800, 600, QImage.Format.Format_ARGB32))   # 无玩家点也不能抛异常
@@ -1292,10 +1333,10 @@ def test_start_on_move(tmpdir: str):
     rec = armed[0]
     rec_w._recent.clear()
     rec_w._recent.extend([
-        (97.0, 0.400, 0.400, 0.0),      # 更早的静止
-        (98.0, 0.401, 0.400, 0.0),
-        (98.5, 0.402, 0.400, 0.0),      # ★ 最后一个速度为 0 的时刻 → 计时起点
-        (98.9, 0.410, 0.402, 4.0),      # 已经起步的帧(必须补成轨迹点)
+        (97.0, 0.400, 0.400, 0.0, None),           # 更早的静止
+        (98.0, 0.401, 0.400, 0.0, None),
+        (98.5, 0.402, 0.400, 0.0, None),           # ★ 最后一个速度为 0 的时刻 → 计时起点
+        (98.9, 0.410, 0.402, 4.0, (0.0, -1.0)),    # 已经起步的帧(必须补成轨迹点)
     ])
     rec_w._armed_at = 99.2                    # 按下“开始录制”的时刻
     rec_w._arm_check(7.0)                     # 本帧速度 7 km/h → 触发
@@ -1306,6 +1347,7 @@ def test_start_on_move(tmpdir: str):
     assert rec.marks[0].x == 0.402 and rec.marks[0].y == 0.400
     assert len(rec.points) == 1, rec.points   # 起点之后的位移帧被补录
     assert abs(rec.points[0].t - 0.4) < 1e-9 and rec.points[0].speed == 4.0
+    assert (rec.points[0].dx, rec.points[0].dy) == (0.0, -1.0), "补录的点也要带朝向"
     assert rec_w._last_pt_t == rec.points[0].t
 
     # 3) 起步后照常采样/结束, 用时从回溯出的起点算起
@@ -1324,7 +1366,8 @@ def test_start_on_move(tmpdir: str):
     rec_w._tick()
     assert rec_w.armed
     rec_w._recent.clear()
-    rec_w._recent.extend([(200.0, 0.5, 0.5, 40.0), (200.1, 0.51, 0.5, 42.0)])
+    rec_w._recent.extend([(200.0, 0.5, 0.5, 40.0, (1.0, 0.0)),
+                          (200.1, 0.51, 0.5, 42.0, (1.0, 0.0))])
     rec_w._armed_at = 200.2
     rec_w._arm_check(45.0)
     assert len(started) == 1 and rec_w._t0 == 200.2, rec_w._t0
@@ -1864,12 +1907,12 @@ def test_playback_source_selection(tmpdir: str):
 
     # 选中一条 → 只播这一条
     rows[1].setSelected(True)
-    app.processEvents()
+    QTest.qWait(20)      # 离屏下选择模型偶尔要转一两轮事件循环才同步
     assert [r.route_id for r in win._playable_tracks()] == [recs[1].route_id]
 
     # 选中两条 → 播这两条(按侧栏顺序)
     rows[2].setSelected(True)
-    app.processEvents()
+    QTest.qWait(20)
     assert [r.route_id for r in win._playable_tracks()] == \
         [recs[1].route_id, recs[2].route_id]
     win._toggle_playback()

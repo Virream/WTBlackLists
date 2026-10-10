@@ -33,11 +33,16 @@ COLOR_STOP = QColor("#ef4444")    # 红
 # 玩家标记(像素, 不随缩放变): 位置空心圆圈 + 圆心实心点 + 表示车头朝向的 ^
 PLAYER_RING_R = 12.0          # 位置空心圆圈半径
 PLAYER_DOT_R = 4.0            # 圆心实心点半径
-# ^ 用「前进量 + 横向半宽 + 高度」描述(不是两个半径) —— 调 BACK 就是把整个 ^
-# 沿车头方向平移, 调 W 就是把两只脚岔开, 与肉眼看到的效果一一对应。
+# ^ 用「前进量 + 横向半宽 + 高度」描述 —— 调 BACK 就是把整个 ^ 沿车头方向平移,
+# 调 W 就是把两只脚岔开, 与肉眼看到的效果一一对应(2026-10-11 用户选定的形状)
 PLAYER_DIR_BACK = 4.0         # 两只脚相对圆心的前进量(越小越贴近圆心)
 PLAYER_DIR_W = 5.0            # 两只脚相对中轴的横向半宽(越大越岔开)
 PLAYER_DIR_H = 4.5            # 尖点比两只脚连线再往前多少
+# 回放光标**不画 ^**, 而是沿车头方向的一根**白线**(车头朝上时就是竖线);
+# 两头分别贴住光标的白点(半径 3)与白圈(描边内沿≈6.9) → 看着连成一体
+CURSOR_DIR_BACK = 3.0         # 线起点到光标中心的距离
+CURSOR_DIR_LEN = 3.8          # 线长
+COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放白圈同色系)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
 # 回放时**尚未播放**的轨迹段: 半透明淡色 —— 半透明只用在这里
@@ -111,7 +116,7 @@ def bucket_index(speed: float, vmax: float) -> int:
 
 
 def player_dir_points(center: QPointF, ang: float) -> tuple[QPointF, QPointF, QPointF]:
-    """^ 的三个点(尖点, 脚 1, 脚 2); center = 玩家位置, ang = 车头方向(弧度)。
+    """玩家标记那个 ^ 的三个点(尖点, 脚 1, 脚 2); ang = 车头方向(弧度)。
 
     用「前进量 + 横向半宽 + 高度」描述(见 PLAYER_DIR_* 常量)而不是两个半径 ——
     这样"把整个 ^ 沿车头方向平移"就是改 BACK, "把两只脚岔开"就是改 W,
@@ -125,6 +130,17 @@ def player_dir_points(center: QPointF, ang: float) -> tuple[QPointF, QPointF, QP
 
     tip = pt(PLAYER_DIR_BACK + PLAYER_DIR_H, 0.0)
     return (tip, pt(PLAYER_DIR_BACK, -PLAYER_DIR_W), pt(PLAYER_DIR_BACK, PLAYER_DIR_W))
+
+
+def cursor_dir_points(center: QPointF, ang: float, back: float = CURSOR_DIR_BACK,
+                      length: float = CURSOR_DIR_LEN) -> tuple[QPointF, QPointF]:
+    """回放光标那根白线的两个端点(起点, 尖端); ang = 录制时的车头方向(弧度)。"""
+    ca, sa = math.cos(ang), math.sin(ang)
+
+    def pt(fwd: float) -> QPointF:
+        return QPointF(center.x() + fwd * ca, center.y() + fwd * sa)
+
+    return (pt(back), pt(back + length))
 
 
 def build_speed_segments(points: list[RoutePoint], vmax: float,
@@ -889,6 +905,8 @@ class RouteMapView(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(QColor("#f8fafc")))
         p.drawEllipse(c, 3.0, 3.0)
+        # 录制时存过朝向就一起画出来(旧轨迹的点没有朝向 → 只画圈和点)
+        self._draw_cursor_dir(p, c, cur.dx, cur.dy)
 
     def _draw_playback(self, p: QPainter, rec: RouteRecord, head: float,
                        labels: bool = True) -> None:
@@ -1068,22 +1086,27 @@ class RouteMapView(QWidget):
         p.setBrush(QBrush(COLOR_PLAYER))
         p.drawEllipse(c, PLAYER_DOT_R, PLAYER_DOT_R)
         if self._player_dir is not None:
-            self._draw_player_dir(p, c, *self._player_dir)
+            self._draw_player_dir(p, c, self._player_dir[0], self._player_dir[1])
 
-    def _draw_player_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
-        """在玩家标记上画一个 ^ 表示车头朝向(与本体解算的朝向一致)。
+    def _dir_angle(self, dx: float, dy: float) -> float | None:
+        """朝向的像素角度; 地图尺寸未就绪或向量全零时返回 None。
 
         dx/dy 是 map_obj.json 给的**归一化单位方向向量**(与 /map.img 同坐标系)——
         地图显示尺寸可能不是正方形(等比缩放后的 w/h 不等), 所以按 w/h 换算成像素
         方向再求角, 否则朝向会被拉歪。
-        形状/位置见 PLAYER_DIR_* 常量(BACK = 整体沿车头方向平移, W = 两只脚岔开)。
         """
         w, h = self._map_size()
         if w <= 0.0 or h <= 0.0:
-            return
+            return None
         if dx == 0.0 and dy == 0.0:
-            return                            # 全零 = 无有效朝向(录制线程已过滤, 这里再兜一层)
-        ang = math.atan2(dy * h, dx * w)
+            return None            # 全零 = 无有效朝向(旧轨迹 / 没取到)
+        return math.atan2(dy * h, dx * w)
+
+    def _draw_player_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
+        """玩家标记上的**蓝色 ^**(车头朝向); 形状见 PLAYER_DIR_* 常量。"""
+        ang = self._dir_angle(dx, dy)
+        if ang is None:
+            return
         tip, foot1, foot2 = player_dir_points(c, ang)
         # 先描深色底再画亮色: 深/浅底图上都看得清(与 _draw_hover_mark 同一套办法)
         for color, width in ((QColor(15, 23, 42, 220), 4.0), (COLOR_PLAYER, 2.0)):
@@ -1092,6 +1115,29 @@ class RouteMapView(QWidget):
                           Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
             p.drawLine(tip, foot1)
             p.drawLine(tip, foot2)
+
+    def _draw_cursor_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
+        """回放光标上的**白色朝向线**(车头朝上时就是竖线); 几何见 CURSOR_DIR_* 。
+
+        深色描边只留在线**两侧**: 两端各内缩半个描边宽、并改用平头端帽 ——
+        否则线头会露出一截黑头, 看着跟光标的白圈/白点接不上
+        (用户要求: 线看起来要跟这两个白圈是一体的)。
+        """
+        ang = self._dir_angle(dx, dy)
+        if ang is None:
+            return
+        start, tip = cursor_dir_points(c, ang)
+        dark_w, light_w = 4.2, 2.0
+        inset = (dark_w - light_w) / 2.0
+        ux, uy = math.cos(ang), math.sin(ang)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(15, 23, 42, 210), dark_w,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+        p.drawLine(QPointF(start.x() + ux * inset, start.y() + uy * inset),
+                   QPointF(tip.x() - ux * inset, tip.y() - uy * inset))
+        p.setPen(QPen(COLOR_DIR_LINE, light_w,
+                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawLine(start, tip)
 
     def _draw_hover_mark(self, p: QPainter) -> None:
         """在命中的那个轨迹点上画一圈白环。

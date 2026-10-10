@@ -73,6 +73,10 @@ class RoutePoint:
     y: float
     t: float          # 相对录制开始的秒数
     speed: float      # 当时速度 km/h
+    # 车头朝向(归一化单位方向向量, 与 /map.img 同坐标系); 0,0 = 没记录
+    # (旧版本录的轨迹没有这两个字段, 回放时不画朝向箭头)
+    dx: float = 0.0
+    dy: float = 0.0
 
 
 @dataclass
@@ -167,10 +171,14 @@ def point_at(points: list[RoutePoint], t: float) -> RoutePoint | None:
     a, b = points[lo], points[hi]
     span = b.t - a.t
     k = 0.0 if span <= 0 else (t - a.t) / span
+    # 朝向取**更近那一端**的采样值: 单位向量做线性插值在掉头时会退化成零向量
+    # (方向丢失), 而采样间隔只有几十 ms, 取端点肉眼看不出跳变。
+    src = a if k < 0.5 else b
     return RoutePoint(x=a.x + (b.x - a.x) * k,
                       y=a.y + (b.y - a.y) * k,
                       t=t,
-                      speed=a.speed + (b.speed - a.speed) * k)
+                      speed=a.speed + (b.speed - a.speed) * k,
+                      dx=src.dx, dy=src.dy)
 
 
 def split_points(points: list[RoutePoint],

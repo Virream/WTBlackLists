@@ -129,8 +129,10 @@ class RouteRecorder(QObject):
         # 等待载具移动状态(勾选“以速度从零变化时刻作为起点”时)
         self._armed = False
         self._armed_at = 0.0
-        # 最近采样环形缓冲(时间, x, y, 速度): 用于回溯“最后一个速度为 0 的时刻”
-        self._recent: deque[tuple[float, float, float, float]] = deque(maxlen=400)
+        # 最近采样环形缓冲(时间, x, y, 速度, 朝向): 用于回溯“最后一个速度为 0 的时刻”
+        self._recent: deque[tuple[float, float, float, float, tuple | None]] = deque(maxlen=400)
+        # 当前车头朝向(归一化单位方向向量); None = 本帧没拿到
+        self._dir: tuple[float, float] | None = None
 
         # 地图缓存
         self._map_digest: str | None = None
@@ -292,13 +294,14 @@ class RouteRecorder(QObject):
         objects = self.client.map_objects()
         player_obj = self._find_player_obj(objects)
         player = self._find_player(objects, ind)
-        # 车头朝向(给地图上的 ^ 用); 与坐标来自同一条玩家对象
+        # 车头朝向(给地图上的 ^ 用, 也随轨迹点存下来供回放); 与坐标来自同一条玩家对象
         direction = _player_dir(player_obj) if player_obj is not None else None
+        self._dir = direction
         self._update_zones(objects)
 
         # 最近采样缓冲(回溯起点用); 按时间从头部淘汰, 只留 START_LOOKBACK 秒
         if player is not None:
-            self._recent.append((now, player[0], player[1], speed))
+            self._recent.append((now, player[0], player[1], speed, direction))
             cutoff = now - START_LOOKBACK
             while self._recent and self._recent[0][0] < cutoff:
                 self._recent.popleft()
@@ -507,8 +510,9 @@ class RouteRecorder(QObject):
             log.info("回溯起点失败(一直运动中), 改用按下时刻")
             extra: list[RoutePoint] = []
         else:
-            t0, sx, sy, _v = samples[origin_i]      # 元组顺序: (时刻, x, y, 速度)
-            extra = [RoutePoint(x=s[1], y=s[2], t=s[0] - t0, speed=s[3])
+            t0, sx, sy, _v, d0 = samples[origin_i]   # 元组顺序: (时刻, x, y, 速度, 朝向)
+            extra = [RoutePoint(x=s[1], y=s[2], t=s[0] - t0, speed=s[3],
+                                dx=(s[4] or (0.0, 0.0))[0], dy=(s[4] or (0.0, 0.0))[1])
                      for s in samples[origin_i + 1:]]
             log.info("回溯起点: 速度非 0(%.0f km/h) → 起点位于 %.2fs 前",
                      speed, self._armed_at - t0)
@@ -546,8 +550,9 @@ class RouteRecorder(QObject):
         rec = self._rec
         rec.duration = time.monotonic() - self._t0
         if player is not None:
+            dx, dy = self._dir_xy()
             rec.points.append(RoutePoint(x=player[0], y=player[1],
-                                         t=rec.duration, speed=speed))
+                                         t=rec.duration, speed=speed, dx=dx, dy=dy))
             rec.marks.append(RouteMark(x=player[0], y=player[1],
                                        t=rec.duration, kind="stop"))
         else:
@@ -573,6 +578,13 @@ class RouteRecorder(QObject):
             dist = math.hypot(player[0] - self._last_xy[0], player[1] - self._last_xy[1])
             if dist < self.min_move:
                 return
-        rec.points.append(RoutePoint(x=player[0], y=player[1], t=elapsed, speed=speed))
+        dx, dy = self._dir_xy()
+        rec.points.append(RoutePoint(x=player[0], y=player[1], t=elapsed, speed=speed,
+                                     dx=dx, dy=dy))
         self._last_pt_t = elapsed
         self._last_xy = player
+
+    def _dir_xy(self) -> tuple[float, float]:
+        """当前车头朝向的 (dx, dy); 没拿到时为 (0, 0)(= 不画朝向箭头)。"""
+        d = self._dir
+        return d if d is not None else (0.0, 0.0)
