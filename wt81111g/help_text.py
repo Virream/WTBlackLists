@@ -9,6 +9,9 @@ from .global_hotkey import ACTION_LABELS, DEFAULT_BINDINGS, describe_binding
 
 APP_TITLE = "跑图线路测试器"
 APP_SUBTITLE = "记录“重生后多久到达某位置”的独立小工具"
+AUTHOR = "切真Viream"
+AUTHOR_BILI = "https://space.bilibili.com/140035845"
+AUTHOR_GITHUB = "https://github.com/Virream"
 
 
 def hotkey_lines(bindings: dict | None = None) -> list[str]:
@@ -25,7 +28,10 @@ def about_html(bindings: dict | None = None) -> str:
     keys = "".join(f"<li>{line}</li>" for line in hotkey_lines(bindings))
     return f"""
 <h2>{APP_TITLE}</h2>
-<p style="color:#888">{APP_SUBTITLE} —— 与黑名单助手(WBBlackList)相互独立, 可单独运行。</p>
+<p style="color:#888">{APP_SUBTITLE}</p>
+<p style="color:#888">作者 <b>{AUTHOR}</b> ·
+    <a href="{AUTHOR_BILI}" style="color:#7ec8e3;">B站</a> ·
+    <a href="{AUTHOR_GITHUB}" style="color:#7ec8e3;">GitHub</a></p>
 
 <h3>快捷键(全局, 游戏中也能按)</h3>
 <ul>{keys}</ul>
@@ -142,7 +148,6 @@ def about_html(bindings: dict | None = None) -> str:
 <li>本程序是<b>单实例</b>: 重复启动(双击 exe / 开第二个进程)不会开出第二个窗口 ——
     开两份会互相抢地图与录制数据;</li>
 <li>再启动时它会<b>把已经打开的那个窗口调到前面</b>(若正在全屏游戏里抢不到焦点,
-    会闪一下任务栏图标提醒), 同时弹一句“程序已在运行中”;</li>
-<li>与黑名单助手<b>互不影响</b>: 两个程序可以同时开。</li>
+    会闪一下任务栏图标提醒), 同时弹一句“程序已在运行中”。</li>
 </ul>
 """
