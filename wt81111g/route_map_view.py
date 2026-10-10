@@ -142,6 +142,8 @@ class RouteMapView(QWidget):
         # 与“眼睛点亮”无关 —— 选了就应该看得到
         self._highlight: list[RouteRecord] = []
         self._player: tuple[float, float] | None = None
+        # 车头朝向(归一化单位方向向量 dx/dy, 与 /map.img 同坐标系); None = 只画点不画方向
+        self._player_dir: tuple[float, float] | None = None
         # 悬停提示(左下角浮层): 命中的轨迹 + 轨迹上的那个点 + 逐行文本
         self._hover_text: str | None = None
         self._hover_rec: RouteRecord | None = None
@@ -396,14 +398,18 @@ class RouteMapView(QWidget):
         self._drop_hover_if_gone()
         self.update()
 
-    def set_player(self, pos: tuple[float, float] | None) -> None:
+    def set_player(self, pos: tuple[float, float] | None,
+                   direction: tuple[float, float] | None = None) -> None:
+        """更新玩家标记: 位置(归一化坐标) + 车头朝向(归一化单位方向向量, 可为 None)。"""
         self._player = pos
+        self._player_dir = direction
 
     def clear(self) -> None:
         self._live = None
         self._visible = []
         self._highlight = []
         self._player = None
+        self._player_dir = None
         self._reset_hover()
         self._playback_recs = []
         self._playhead = 0.0
@@ -1035,6 +1041,38 @@ class RouteMapView(QWidget):
         p.setPen(QPen(COLOR_PLAYER, 2))
         p.setBrush(QBrush(COLOR_PLAYER))
         p.drawEllipse(c, 4, 4)
+        if self._player_dir is not None:
+            self._draw_player_dir(p, c, *self._player_dir)
+
+    def _draw_player_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
+        """在玩家圆圈**前方**画一个 ^ 表示车头朝向(与本体解算的朝向一致)。
+
+        dx/dy 是 map_obj.json 给的**归一化单位方向向量**(与 /map.img 同坐标系)——
+        地图显示尺寸可能不是正方形(等比缩放后的 w/h 不等), 所以按 w/h 换算成像素
+        方向再求角, 否则朝向会被拉歪。
+        """
+        w, h = self._map_size()
+        if w <= 0.0 or h <= 0.0:
+            return
+        if dx == 0.0 and dy == 0.0:
+            return                            # 全零 = 无有效朝向(录制线程已过滤, 这里再兜一层)
+        ang = math.atan2(dy * h, dx * w)
+        r_circle = 12.0                       # 与上面那个圈的半径一致
+        r_base = r_circle + 1.5               # 两翼起点(贴着圆外沿)
+        r_tip = r_circle + 10.0               # 尖点
+        spread = math.radians(32.0)
+        tip = QPointF(c.x() + r_tip * math.cos(ang), c.y() + r_tip * math.sin(ang))
+        wing1 = QPointF(c.x() + r_base * math.cos(ang - spread),
+                        c.y() + r_base * math.sin(ang - spread))
+        wing2 = QPointF(c.x() + r_base * math.cos(ang + spread),
+                        c.y() + r_base * math.sin(ang + spread))
+        # 先描深色底再画亮色: 深/浅底图上都看得清(与 _draw_hover_mark 同一套办法)
+        for color, width in ((QColor(15, 23, 42, 220), 4.0), (COLOR_PLAYER, 2.0)):
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(color, width, Qt.PenStyle.SolidLine,
+                          Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawLine(tip, wing1)
+            p.drawLine(tip, wing2)
 
     def _draw_hover_mark(self, p: QPainter) -> None:
         """在命中的那个轨迹点上画一圈白环。

@@ -1471,7 +1471,7 @@ class RouteTesterWindow(QMainWindow):
                 self._last_map_try = now
                 self._restore_map_for_current_view()
 
-        self.map_view.set_player(info.get("player"))
+        self.map_view.set_player(info.get("player"), info.get("dir"))
         self._apply_zones(info)
         self.map_view.update()
 

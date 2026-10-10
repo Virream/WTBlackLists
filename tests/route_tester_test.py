@@ -5,6 +5,7 @@
 不依赖游戏与 8111: 用 FakeClient 模拟 8111 数据。
 """
 import hashlib
+import math
 import os
 import sys
 import tempfile
@@ -410,6 +411,63 @@ def test_map_render():
     empty.resize(400, 300)
     empty.render(QImage(400, 300, QImage.Format.Format_ARGB32))
     results.append("地图渲染(轨迹/标记/时间标签/悬停) OK")
+
+
+def test_player_heading():
+    """玩家圈前的 ^ 要跟着 dx/dy 转(渲染级: 不真画一遍看不出来)。
+
+    做法: 纯色底图 + 数“以玩家点为圆心、某方向扇形环里的亮像素” ——
+    ^ 画在哪一侧, 哪一侧就该亮。
+    """
+    view = RouteMapView()
+    view.resize(800, 600)
+    assert view.set_map_bytes(png_solid("#334455", 64)) is True, "地图图片应加载成功"
+    pos = (0.42, 0.41)
+
+    def bright(angle_deg: float, r0: float = 15.0, r1: float = 23.0,
+               half: float = 20.0) -> int:
+        """扇形环里的亮像素数(底色 #334455 三通道和 204, 朝向符号是亮蓝 493)。"""
+        img = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img)
+        c = view.map_pos(*pos)
+        n = 0
+        for i in range(41):
+            a = math.radians(angle_deg - half + 2.0 * half * i / 40.0)
+            for r in range(int(r0), int(r1) + 1):
+                x, y = int(c.x() + r * math.cos(a)), int(c.y() + r * math.sin(a))
+                if 0 <= x < 800 and 0 <= y < 600:
+                    col = img.pixelColor(x, y)
+                    if col.red() + col.green() + col.blue() > 380:
+                        n += 1
+        return n
+
+    view.set_player(pos)                       # 没有朝向数据 → 只画圈和点
+    assert bright(0.0) == 0 and bright(90.0) == 0 and bright(180.0) == 0, \
+        "拿不到 dx/dy 时不该画出朝向符号"
+
+    # 像素坐标 y 向下 → dx=1,dy=0 在右边(0°), dx=0,dy=1 在下边(90°)
+    view.set_player(pos, (1.0, 0.0))
+    right, left = bright(0.0), bright(180.0)
+    assert right > 4 and left == 0, f"朝右时应只在右侧画 ^ (右 {right} / 左 {left})"
+
+    view.set_player(pos, (0.0, 1.0))
+    down, up = bright(90.0), bright(-90.0)
+    assert down > 4 and up == 0, f"朝下时应只在下侧画 ^ (下 {down} / 上 {up})"
+
+    view.set_player(pos, (-1.0, 0.0))
+    assert bright(180.0) > 4 and bright(0.0) == 0, "反向时应画在左侧"
+
+    # 斜向也要落在正确的象限里(dx=-0.67, dy=0.74 是实测样本 → 左下 132°)
+    view.set_player(pos, (-0.67, 0.74))
+    assert bright(132.0) > 4, "斜向朝向应落在左下方向"
+    assert bright(-48.0) == 0, "反方向不该有 ^"
+
+    view.set_player(pos, (0.0, 0.0))           # 全零向量 = 无有效朝向
+    assert bright(0.0) == 0 and bright(90.0) == 0, "零向量不该画出方向"
+
+    view.set_player(None)
+    view.render(QImage(800, 600, QImage.Format.Format_ARGB32))   # 无玩家点也不能抛异常
+    results.append("玩家车头朝向 ^(跟随 dx/dy 旋转) OK")
 
 
 def test_map_hover():
@@ -2579,6 +2637,7 @@ def main() -> int:
     test_spawns(tmpdir)
     test_multi_playback(tmpdir)
     test_map_render()
+    test_player_heading()
     test_map_hover()
     test_map_draw_cache()
     test_playback_draw_cache()

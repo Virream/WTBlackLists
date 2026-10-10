@@ -2,7 +2,7 @@
 
 数据来源:
 - 载具型号 / 速度 : GET /indicators  (type / speed)
-- 玩家坐标        : GET /map_obj.json (type == "player" 的 x/y, 0~1 归一化)
+- 玩家坐标/朝向   : GET /map_obj.json (玩家对象的 x/y 归一化坐标 + dx/dy 单位方向向量)
 - 战区坐标/模式   : GET /map_obj.json (type == "capture_zone", 见 zones.py)
 - 地图图片        : GET /map.img      (节流请求, 内容变化才上报)
 
@@ -67,6 +67,17 @@ def _to_float(value) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _player_dir(obj: dict) -> tuple[float, float] | None:
+    """玩家车头朝向: map_obj.json 里的 dx/dy 单位方向向量(**与 /map.img 同坐标系**)。
+
+    拿不到或全零时返回 None —— 那种情况只能画点, 画不出朝向。
+    """
+    dx, dy = _to_float(obj.get("dx")), _to_float(obj.get("dy"))
+    if dx is None or dy is None or (dx == 0.0 and dy == 0.0):
+        return None
+    return (dx, dy)
 
 
 class RouteRecorder(QObject):
@@ -279,7 +290,10 @@ class RouteRecorder(QObject):
         # 玩家坐标: 每帧请求(轨迹平滑的关键)
         # 顺带从同一份数据里取战区 —— 不额外增加请求
         objects = self.client.map_objects()
+        player_obj = self._find_player_obj(objects)
         player = self._find_player(objects, ind)
+        # 车头朝向(给地图上的 ^ 用); 与坐标来自同一条玩家对象
+        direction = _player_dir(player_obj) if player_obj is not None else None
         self._update_zones(objects)
 
         # 最近采样缓冲(回溯起点用); 按时间从头部淘汰, 只留 START_LOOKBACK 秒
@@ -307,6 +321,7 @@ class RouteRecorder(QObject):
             "vehicle_key": vehicle,
             "speed": speed,
             "player": player,
+            "dir": direction,          # 车头朝向(归一化单位方向向量) 或 None
             "recording": self._rec is not None,
             "armed": self._armed,
             "elapsed": elapsed,
@@ -324,14 +339,20 @@ class RouteRecorder(QObject):
         span = self._rate_window[-1] - self._rate_window[0]
         return (len(self._rate_window) - 1) / span if span > 0 else 0.0
 
-    def _find_player(self, objects: list, ind: dict) -> tuple[float, float] | None:
-        """从 map_obj.json 找玩家自身坐标; 兼底读 indicators 的 map_x/map_y。"""
+    def _find_player_obj(self, objects: list) -> dict | None:
+        """map_obj.json 里代表玩家自己的那条对象(坐标不全的不算)。"""
         for obj in objects or []:
             if not isinstance(obj, dict) or not _is_player_obj(obj):
                 continue
-            x, y = _to_float(obj.get("x")), _to_float(obj.get("y"))
-            if x is not None and y is not None:
-                return (x, y)
+            if _to_float(obj.get("x")) is not None and _to_float(obj.get("y")) is not None:
+                return obj
+        return None
+
+    def _find_player(self, objects: list, ind: dict) -> tuple[float, float] | None:
+        """从 map_obj.json 找玩家自身坐标; 兼底读 indicators 的 map_x/map_y。"""
+        obj = self._find_player_obj(objects)
+        if obj is not None:
+            return (_to_float(obj.get("x")), _to_float(obj.get("y")))
         if ind:
             x, y = _to_float(ind.get("map_x")), _to_float(ind.get("map_y"))
             if x is not None and y is not None:
