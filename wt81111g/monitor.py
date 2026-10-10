@@ -42,6 +42,11 @@ MAP_PROBE_TIMEOUT = 2.0
 # 连续多少次请求都失败才认定“8111 断开连接”: 换局那几十秒游戏很忙, 单次超时不算断开。
 CONNECT_FAIL_TICKS = 3
 
+# 已经在对局里时, 每多少个 tick 才去探一次 /map.img: 真地图几百 KB~几 MB,
+# 每秒完整取一遍既费带宽又让游戏的 8111 变忙(实测换地图那一下 mission/hudmsg 会慢到 2 秒)。
+# 出局时仍然每 tick 都探 —— 要尽快发现“进局”。
+MAP_PROBE_EVERY = 2
+
 
 class MonitorWorker(QObject):
     """后台线程轮询 8111 并维护“当前对局昵称”,与黑名单比对。"""
@@ -80,6 +85,7 @@ class MonitorWorker(QObject):
         self._connected = False
         self._conn_fails = 0      # mission 连续失败次数(单次超时不算断开)
         self._msg_fails = 0       # hudmsg/gamechat 连续失败次数(失败不算“没有新消息”)
+        self._tick_no = 0         # tick 计数(控制探地图图片的频率)
         self._in_battle = False
         self._garage_ticks = 0   # 连续多少个 tick 只看到车库占位图
         self._last_activity = 0.0  # 最近一次收到击杀/发言的时间
@@ -175,18 +181,27 @@ class MonitorWorker(QObject):
         # 为什么不看 map_info/mission: 那两个是**状态**字段, 退出对局回机库后会残留
         # 一会儿(实测 mission.objectives 会短暂保留上一局的内容), 叠加层就会在机库里
         # 多显示一段时间的“正在确认名单中…”。
-        try:
-            probe = self.client.map_image(limit=PROBE_BYTES, timeout=MAP_PROBE_TIMEOUT,
-                                          raise_on_error=True)
-            in_map = in_map_by_image(probe)
-        except requests.RequestException as exc:
-            in_map = self._in_battle       # 未知 → 沿用上一次状态
-            log.info("map.img 没有回答(%s) → 沿用上一次判定 in_map=%s",
-                     type(exc).__name__, in_map)
+        # 探地图图片: 出局时每 tick 都探; 已经在局内时每 MAP_PROBE_EVERY 个 tick 探一次。
+        # 完整取图而不是“读满 16KB 就断”: 中途断开会把连接弄脏, 后续请求会卡到超时。
+        # 没探的那一轮(in_map=None)什么样都不改 —— 特别是不能把“回车库”计数清零。
+        self._tick_no += 1
+        in_map: bool | None
+        if (not self._in_battle) or (self._tick_no % MAP_PROBE_EVERY == 0):
+            try:
+                probe = self.client.map_image(timeout=MAP_PROBE_TIMEOUT,
+                                              raise_on_error=True)
+                in_map = in_map_by_image(probe)
+            except requests.RequestException as exc:
+                in_map = None                  # 未知 → 不改状态
+                log.info("map.img 没有回答(%s) → 沿用上一次判定", type(exc).__name__)
+        else:
+            in_map = None                      # 本轮不探, 不改状态
         now = time.time()
         # 状态驱动进出场: 直接以 in_map 为准, 不再依赖 sig 变化,
         # 避免对局/试车场加载期 sig 抖动导致叠加层闪退。
-        if in_map:
+        if in_map is None:
+            pass
+        elif in_map:
             self._garage_ticks = 0
             if not self._in_battle:
                 self._start_battle()

@@ -306,15 +306,17 @@ def test_battle_detection_by_image() -> None:
     w._tick()                       # 真地图 → 对局开始
     assert len(starts) == 1 and w._in_battle
     w.client.i = 1
-    w._tick()                       # 第 1 tick 只见占位图 → 还差一次连续确认
+    w._tick()                       # 第 1 个“探测 tick”只见占位图 → 还差一次连续确认
     assert not ends and w._in_battle
-    w._tick()                       # 连续第 2 tick → 认定回到车库(叠加层隐藏)
+    w._tick()                       # 局内每 MAP_PROBE_EVERY 个 tick 才探一次, 这轮不探
+    w._tick()                       # 第 2 个探测 tick → 认定回到车库(叠加层隐藏)
     assert len(ends) == 1 and not w._in_battle
     w.client.i = 3
     w._tick()                       # 又拿到真地图 → 重新开始
     assert len(starts) == 2 and w._in_battle
     w.client.i = 4
     w._tick()                       # 拿不到图片(机库里的另一种情形)
+    w._tick()                       # 这轮不探
     w._tick()                       # 连续确认后 → 同样算回到车库
     assert len(ends) == 2 and not w._in_battle
     results.append("battle start/end by map image OK")
@@ -351,8 +353,9 @@ def test_leaving_battle_clears_collected() -> None:
     w._tick()
     assert not ends and w._collected, "刚有击杀/发言时不该判离开"
     w._last_activity = 0.0          # 模拟“确实安静下来了”
-    w._tick()                       # 回车库第 1 tick: 还在连续确认
+    w._tick()                       # 回车库第 1 个探测 tick: 还在连续确认
     assert not ends and w._collected, "确认前不应该清空"
+    w._tick()                       # 局内每 MAP_PROBE_EVERY 个 tick 才探一次, 这轮不探
     w._tick()                       # 连续确认 → 回到车库: 清空本局收集
     assert len(ends) == 1 and not w._in_battle
     assert w._collected == set(), w._collected
@@ -505,7 +508,8 @@ def test_second_battle_ignores_previous_window() -> None:
     w._tick()                       # 第 1 局开始(窗口里那条旧消息被基线吸收)
     w._last_activity = 0.0
     w.client.i = 1
-    w._tick()                       # 占位图第 1 tick
+    w._tick()                       # 占位图第 1 个探测 tick
+    w._tick()                       # 这轮不探
     w._tick()                       # 连续确认 → 回车库: 清空本局收集
     assert not w._in_battle and w._collected == set()
     w.client.i = 3
