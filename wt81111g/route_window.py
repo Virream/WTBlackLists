@@ -39,7 +39,7 @@ from .hotkey_dialog import HotkeyDialog
 from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
-from .route_map_view import COLOR_TEAM_A, COLOR_TEAM_B, GlobalTrack, RouteMapView
+from .route_map_view import RouteMapView
 from .route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from .route_recorder import DEFAULT_INTERVAL_MS, RouteRecorder
 from .route_store import (
@@ -718,9 +718,7 @@ class RouteTesterWindow(QMainWindow):
             item.addChild(sitem)
             # 组内按开始时间**正序**(越靠前时间越早) —— 与单条路线(倒序)刚好相反
             for life in sorted(lives, key=lambda x: (x.t0, x.life_id)):
-                mark_prot = "  🛡" if life.protected else ""
-                litem = QTreeWidgetItem(["", life.label + mark_prot,
-                                         fmt_time(life.duration)])
+                litem = QTreeWidgetItem(["", life.label, fmt_time(life.duration)])
                 litem.setData(0, _ROLE_KIND, "glife")
                 litem.setData(0, _ROLE_ID, life.life_id)
                 litem.setData(0, _ROLE_SIG, side)
@@ -729,10 +727,10 @@ class RouteTesterWindow(QMainWindow):
                 litem.setToolTip(_COL_EYE, "点击显示 / 隐藏这条线路")
                 litem.setToolTip(_COL_NAME,
                                  f"{side} 队 · {life.icon or life.obj_type}\n"
-                                 f"出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}"
-                                 f"(8111 不给玩家名, 这里按载具类别显示)\n"
-                                 f"色标 {life.color or '-'}"
-                                 f"{' · 出生时处于重生保护' if life.protected else ''}")
+                                 f"出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}\n"
+                                 f"点数 {len(life.points)} · 最高速 "
+                                 f"{fmt_speed(max((p.speed for p in life.points), default=0.0))} km/h\n"
+                                 f"色标 {life.color or '-'}(8111 原始颜色, 仅参考)")
                 sitem.addChild(litem)
 
     def _reload_tree(self) -> None:
@@ -996,10 +994,11 @@ class RouteTesterWindow(QMainWindow):
         """
         recs = [r for rid in self._visible_route_ids()
                 if (r := self.store.get(rid)) is not None]
-        gtracks = self._global_map_tracks()
-        picked = self._selection_tracks()
+        # 眼睛点亮的全局线路也当成普通轨迹画(灰色层)
+        recs += self._visible_life_objects()
+        picked = self._selection_playables()
         if picked:
-            highlight = [r for r in picked if r.route_id in self._visible_ids]
+            highlight = [r for r in picked if self._is_shown(r)]
         else:
             # 没选中时退回“刚录制的那条”(只在它还显示着的时候高亮)
             hl = self._last_record
@@ -1009,26 +1008,27 @@ class RouteTesterWindow(QMainWindow):
             # 录制中 live 是正在录的那条, 不能被选中/高亮覆盖
             self.map_view.set_visible_tracks(recs)
             self.map_view.set_highlight([])
-            self.map_view.set_global_tracks(gtracks)
             return
         self.map_view.set_visible_tracks(recs)
         self.map_view.set_highlight(highlight)
-        self.map_view.set_global_tracks(gtracks)
         self.map_view.set_live(None)
         self._apply_zones()
 
-    def _global_map_tracks(self) -> list[GlobalTrack]:
-        """眼睛点亮的全局线路 → 地图上要画的折线(A 队青 / B 队品红)。"""
+    def _is_shown(self, rec) -> bool:
+        """这条轨迹/线路当前是不是“眼睛点亮”状态。"""
+        rid = getattr(rec, "route_id", "")
+        return rid in self._visible_ids or rid in self._visible_lives
+
+    def _visible_life_objects(self) -> list:
+        """眼睛点亮的全局线路(按 `_visible_lives` 里的 id 取出来)。"""
         if not self._visible_lives:
             return []
-        out: list[GlobalTrack] = []
+        out: list = []
         for g in self.store.globals:
             for side in GLOBAL_SIDES:
-                color = COLOR_TEAM_A if side == "A" else COLOR_TEAM_B
                 for life in g.lives(side):
-                    if life.life_id in self._visible_lives and len(life.points) >= 2:
-                        out.append(GlobalTrack(points=life.points, color=color,
-                                               label=f"{side} {life.label}"))
+                    if life.life_id in self._visible_lives:
+                        out.append(life)
         return out
 
 
@@ -1086,6 +1086,44 @@ class RouteTesterWindow(QMainWindow):
         for it in self._iter_route_items():
             it.setSelected(it.data(0, _ROLE_ID) in want)
 
+    def _life_by_id(self, life_id: str):
+        """按 life_id 找全局线路(找不到返回 None)。"""
+        for g in self.store.globals:
+            for side in GLOBAL_SIDES:
+                for life in g.lives(side):
+                    if life.life_id == life_id:
+                        return life
+        return None
+
+    def _selection_lives(self) -> list:
+        """侧栏中选中的**全局线路**(按侧栏顺序)。
+
+        选中整个全局条目 / A·B 队行时, 把它们下面的全部线路都算进来;
+        只选中几条线路时就只算那几条 —— 与用户要的“选了就播选中的”一致。
+        按**树的顺序**取(不能用 `selectedItems()` 的顺序, 那是选择模型的顺序)。
+        """
+        def hit(item: QTreeWidgetItem) -> bool:
+            node: QTreeWidgetItem | None = item
+            while node is not None:
+                if node.isSelected() and node.data(0, _ROLE_KIND) in (
+                        "glife", "gside", "global"):
+                    return True
+                node = node.parent()
+            return False
+
+        out: list = []
+        for it in self._iter_life_items():
+            if not hit(it):
+                continue
+            life = self._life_by_id(it.data(0, _ROLE_ID))
+            if life is not None:
+                out.append(life)
+        return out
+
+    def _selection_playables(self) -> list:
+        """回放/高亮用: 选中的单条轨迹 + 选中的全局线路(侧栏顺序)。"""
+        return self._selection_tracks() + self._selection_lives()
+
     def _on_tree_selection_changed(self) -> None:
         """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
 
@@ -1104,6 +1142,7 @@ class RouteTesterWindow(QMainWindow):
         if not recs:
             self._sel_ids = set()
             self._update_play_label()
+            self._refresh_map_tracks()   # 选中全局线路时也要把高亮刷出来
             return                       # 清空选中时保留基准(图钉不消失)
         groups = {self._group_of(r) for r in recs}
         if len(groups) > 1:
@@ -1200,8 +1239,8 @@ class RouteTesterWindow(QMainWindow):
                 self._refresh_anchor_icon_in(ch)
 
     def _update_play_label(self) -> None:
-        """信息区“回放”那一栏: 显示基准版本 + 待回放条数。"""
-        n = len(self._sel_ids)
+        """信息区“回放”那一栏: 显示基准版本 + 待回放条数(含选中的全局线路)。"""
+        n = len(self._selection_playables())
         if self._anchor is not None:
             base = self._group_name(*self._anchor)
             self.lbl_play.setText(f"基准 {base} | 待回放 {n} 条" if n
@@ -1603,6 +1642,10 @@ class RouteTesterWindow(QMainWindow):
         self._visible_lives.clear()
         self._reload_tree()
         self._update_buttons()
+        # 把底图切回**游戏当前地图**(用户可能正在预览另一张图的轨迹)
+        key = self.recorder.map_key
+        if key and key != PLACEHOLDER_MAP_KEY and self.map_view.map_key != key:
+            self._show_cached_map(key)
         self._set_status(
             f"全局录制已就绪({side} 队 → 「{rec.label}」): 等待第一名玩家重生后开始计时…\n"
             f"现在请让游戏进入开局/回放, 点「停止 A/B 队录制」可取消", sticky=10.0)
@@ -1761,7 +1804,8 @@ class RouteTesterWindow(QMainWindow):
         self.act_refresh.setEnabled(not busy)
         # 回放控制
         has_track = (bool(self.player.records) or self._last_record is not None
-                     or bool(self.store.routes))
+                     or bool(self.store.routes)
+                     or any(g.count() for g in self.store.globals))
         self.btn_play.setEnabled(not busy and has_track)
         self.btn_play_mark.setEnabled(not busy and has_track)
         self.cmb_speed.setEnabled(not busy)
@@ -1777,7 +1821,7 @@ class RouteTesterWindow(QMainWindow):
         """
         if self.player.records:          # 已在回放中 → 保持原来的集合
             return self.player.records
-        picked = self._selection_tracks()
+        picked = self._selection_playables()
         if picked:
             return picked
         shown = self.map_view.visible_tracks
@@ -1927,6 +1971,12 @@ class RouteTesterWindow(QMainWindow):
                 self._restore_map_for_current_view()
 
         self.map_view.set_player(info.get("player"), info.get("dir"))
+        # 全局录制: 边录边画(新点一多就重画一次模型层, 见 _tracks_key)
+        lives = info.get("global_lives")
+        if lives:
+            self.map_view.set_live_multi(lives)
+        elif self.map_view.live_multi:
+            self.map_view.set_live_multi(None)   # 录完了 → 交给侧栏眼睛控制显示
         self._apply_zones(info)
         self.map_view.update()
 

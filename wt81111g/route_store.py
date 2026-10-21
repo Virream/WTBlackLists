@@ -146,17 +146,25 @@ GLOBAL_SIDE_LABELS = {"A": "A 队", "B": "B 队"}
 
 @dataclass(slots=True)
 class TrackPoint:
-    """全局录制的轨迹点: 只有坐标与时间(没有朝向、没有速度)。"""
+    """全局录制的轨迹点: 坐标 + 时间 + **速度**(km/h)。
+
+    没有朝向(用户要求全局录制忽略朝向)。字段名与 `RoutePoint` 对齐, 这样回放、
+    速度配色、playhead 切分与光标这一整套可以直接复用(`_vmax` / `build_speed_segments`
+    / `point_at` 都只认 `.x .y .t .speed`)。
+    """
     x: float
     y: float
     t: float
+    speed: float = 0.0
 
 
 @dataclass
 class UnitLife:
     """全局录制里的一条线路 = 某个单位从出现(重生)到消失(死亡/换车)的一段轨迹。
 
-    `life_id` 形如 `<全局条目 id>:<序号>` —— 侧栏的眼睛图标/地图缓存都拿它当键。
+    `life_id` 形如 `<全局条目 id>:<序号>` —— 侧栏的眼睛图标/地图缓存都拿它当键;
+    为了能被回放与高亮那套代码直接使用, 额外暴露了 `route_id` / `marks` /
+    `map_key` / `duration` 这几个与 `RouteRecord` 同名的属性。
     `icon` / `obj_type` 是 8111 原样的字段(如 `MediumTank` / `ground_model`),
     没有玩家名可用(8111 不给), 所以显示时就用它们当“名字”。
     """
@@ -164,8 +172,18 @@ class UnitLife:
     icon: str = ""
     obj_type: str = ""
     color: str = ""             # 8111 的颜色(仅参考, 不参与分组)
-    protected: bool = False     # 出生时是否处于重生保护(深蓝)
+    map_key: str = ""           # 所属地图(回放时用来判断底图对不对)
     points: list[TrackPoint] = field(default_factory=list)
+
+    @property
+    def route_id(self) -> str:
+        """与 `RouteRecord.route_id` 同名 —— 地图缓存/回放/高亮都按它当键。"""
+        return self.life_id
+
+    @property
+    def marks(self) -> list:
+        """全局线路没有标记点 ⇒ 回放时“到下一标记暂停”会直接播到底。"""
+        return []
 
     @property
     def t0(self) -> float:
@@ -185,15 +203,16 @@ class UnitLife:
         return f"{fmt_time(self.t0)}  {name}"
 
     def to_json(self) -> dict:
-        # 点写成 [t, x, y] 的紧凑数组: 整局几十辆车 → 几十万个点,
+        # 点写成 [t, x, y, speed] 的紧凑数组: 整局几十辆车 → 几十万个点,
         # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上
         return {
             "id": self.life_id,
             "icon": self.icon,
             "type": self.obj_type,
             "color": self.color,
-            "protected": bool(self.protected),
-            "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5)] for p in self.points],
+            "map_key": self.map_key,
+            "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
+                    for p in self.points],
         }
 
     @classmethod
@@ -208,13 +227,19 @@ class UnitLife:
                 t, x, y = float(row[0]), float(row[1]), float(row[2])
             except (IndexError, TypeError, ValueError):
                 continue
-            pts.append(TrackPoint(x=x, y=y, t=t))
+            speed = 0.0
+            if len(row) > 3:
+                try:
+                    speed = float(row[3])
+                except (TypeError, ValueError):
+                    speed = 0.0
+            pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
         return cls(
             life_id=life_id,
             icon=str(data.get("icon") or ""),
             obj_type=str(data.get("type") or ""),
             color=str(data.get("color") or ""),
-            protected=bool(data.get("protected")),
+            map_key=str(data.get("map_key") or ""),
             points=pts,
         )
 

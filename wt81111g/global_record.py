@@ -59,9 +59,14 @@ EMPTY_STOP = 3.0
 MIN_MOVE = 0.0002
 # 心跳: 即使一动不动, 每隔这么久也补一个点 —— 保证“停了 5 分钟”这种事实留得下来
 HEARTBEAT = 15.0
+# 速度上限(km/h): 帧间“跳一下”(刚被匹配上但其实是另一个单位)不该变成尖峰
+MAX_SPEED_KMH = 200.0
+# 拿不到 /map_info.json 时的地图边长(米)。实测陆战图 map_max-map_min = 4096。
+DEFAULT_MAP_SIZE = (4096.0, 4096.0)
 
-# 8111 的“重生保护”颜色(深蓝): 实测 2026-10-21 回放, 约 20s, 移动会缩短
-PROTECTED_COLOR = "#1839a7"
+# 8111 的“重生保护”颜色(深蓝 `#1839A7`)—— **不再参与任何逻辑**:
+# 用户 2026-10-21 决定忽略出生保护(它只是个显示状态); 而且重生时玩家会消失好几秒,
+# “消失即结束”本来就会把重生前后拆成两条线, 不需要再靠颜色判断。
 
 # 能录线路的单位类型(白名单 —— 静态地物/AI 防空/机场/航母等一概不碰)
 GROUND_TYPES = frozenset({
@@ -112,8 +117,12 @@ def recordable(typ: str, icon: str) -> bool:
 
 
 def is_protected(color: str) -> bool:
-    """这一帧是否处于重生保护(深蓝)。"""
-    return str(color or "").strip().lower() == PROTECTED_COLOR
+    """这一帧是否处于重生保护(深蓝)。
+
+    **当前不参与任何逻辑** —— 用户决定忽略出生保护。保留成品函数只是为了将来要用时
+    不必重新实测色值(2026-10-21 实测: 深蓝 `#1839A7`, 约 20s, 移动会缩短)。
+    """
+    return str(color or "").strip().lower() == "#1839a7"
 
 
 def _f(value) -> float | None:
@@ -180,17 +189,34 @@ class GlobalTracker:
     def __init__(self, record: GlobalRecord, side: str,
                  interval: float = SAMPLE_INTERVAL,
                  match_radius: float = MATCH_RADIUS,
-                 end_gap: float = END_GAP):
+                 end_gap: float = END_GAP,
+                 map_size: tuple[float, float] = DEFAULT_MAP_SIZE):
         self.record = record
         self.side = side
         self.interval = max(0.02, float(interval))
         self.match_radius = max(0.0, float(match_radius))
         self.end_gap = max(0.1, float(end_gap))
+        # 地图实际边长(米): 归一化位移 × 边长 = 实际距离 → 速度(km/h)。
+        # 来自 8111 的 /map_info.json(map_max - map_min), 拿不到就用默认值。
+        self.map_size = (float(map_size[0]), float(map_size[1]))
         self.lives: list[UnitLife] = []
         self._live: list[_Live] = []
         self._seq = 0
         self._empty_since: float | None = None
         self.seen_skipped: dict[tuple[str, str], int] = {}
+
+    def set_map_size(self, width_m: float, height_m: float) -> None:
+        """更新地图边长(米)。轮询线程每次拿到 /map_info 都会调一次。"""
+        self.map_size = (max(1.0, float(width_m)), max(1.0, float(height_m)))
+
+    def _speed(self, x0: float, y0: float, x1: float, y1: float, dt: float) -> float:
+        """两点之间的速度(km/h)。dt<=0 时返回 0。"""
+        if dt <= 0.0:
+            return 0.0
+        w, h = self.map_size
+        dist_m = math.hypot((x1 - x0) * w, (y1 - y0) * h)
+        # 上限 200 km/h: 帧间“跳一下”(例如刚被匹配上但其实是另一个单位)不该变成尖峰
+        return min(MAX_SPEED_KMH, dist_m / dt * 3.6)
 
     # ------------------------------------------------------------------ 对外
     @property
@@ -232,9 +258,9 @@ class GlobalTracker:
             icon=u.icon,
             obj_type=u.typ,
             color=u.color,
-            protected=is_protected(u.color),
+            map_key=self.record.map_key,
         )
-        life.points.append(TrackPoint(x=u.x, y=u.y, t=t))
+        life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
         self.lives.append(life)
         return _Live(life=life, x=u.x, y=u.y, last_seen=t, last_store=t,
                      last_x=u.x, last_y=u.y)
@@ -244,7 +270,8 @@ class GlobalTracker:
         if lv.life.points:
             last = lv.life.points[-1]
             if math.hypot(lv.x - last.x, lv.y - last.y) > 1e-9:
-                lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen))
+                lv.life.points.append(TrackPoint(x=lv.x, y=lv.y, t=lv.last_seen,
+                                                 speed=last.speed))
 
     def _match(self, t: float, units: list[Unit]) -> None:
         """帧间最近邻 + 贪心匹配(先按距离排序, 短的先配)。"""
@@ -265,30 +292,16 @@ class GlobalTracker:
                 continue
             taken_l[i] = j
             taken_u.add(j)
-        # 注意: 拆分(重生)会**替换**列表里的元素, 所以先收集、循环外再改 ——
-        # 循环里直接 remove 会让后面几项的下标错位。
-        replaced: dict[int, _Live] = {}
         for i, j in taken_l.items():
-            new = self._touch(self._live[i], units[j], t)
-            if new is not None:
-                replaced[i] = new
-        for i, new in replaced.items():
-            self._live[i] = new
+            self._touch(self._live[i], units[j], t)
         # 没接上的 → 新线; 接不上的 live 交给 _expire 按 end_gap 收尾
         for j, u in enumerate(units):
             if j in taken_u:
                 continue
             self._live.append(self._new_life(u, t))
 
-    def _touch(self, lv: _Live, u: Unit, t: float) -> _Live | None:
-        """一条线接上了这一帧: 更新位置、必要时拆线(重生)或存点。
-
-        返回非 None 表示“这条线到此结束, 用返回值替换它”(重生: 蓝 → 深蓝)。
-        """
-        if is_protected(u.color) and not lv.life.protected:
-            # 蓝 → 深蓝 = 重生: 上一段到此为止, 同一位置开一条新线
-            self._close(lv)
-            return self._new_life(u, t)
+    def _touch(self, lv: _Live, u: Unit, t: float) -> None:
+        """一条线接上了这一帧: 更新位置, 到点就存一个带速度的采样点。"""
         lv.x, lv.y = u.x, u.y
         lv.last_seen = t
         lv.life.color = u.color
@@ -296,14 +309,14 @@ class GlobalTracker:
         if moved < MIN_MOVE:
             # 一动不动: 只保留偶尔的心跳点(“在这儿停了 5 分钟”也要留痕)
             if (t - lv.last_store) >= HEARTBEAT:
-                lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t))
+                lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
                 lv.last_store = t
-            return None
+            return
         if (t - lv.last_store) >= self.interval:
-            lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t))
+            speed = self._speed(lv.last_x, lv.last_y, u.x, u.y, t - lv.last_store)
+            lv.life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=speed))
             lv.last_x, lv.last_y = u.x, u.y
             lv.last_store = t
-        return None
 
     def _expire(self, t: float) -> None:
         """连续 `end_gap` 秒没接上的线 → 结束。"""

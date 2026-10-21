@@ -33,7 +33,7 @@ rw.play_error = lambda *a, **k: None
 
 results: list[str] = []
 
-PROT = "#1839A7"     # 重生保护(深蓝)
+PROT = "#1839A7"     # 重生保护(深蓝) —— 现已不参与逻辑, 仅留作实测记录
 BLUE = "#174DFF"     # 我方
 YELLOW = "#faC81E"   # 自己
 
@@ -115,23 +115,34 @@ def test_tracker_two_and_death():
     results.append("全局跟踪: 并排两辆不串线 + 消失即结束 OK")
 
 
-def test_tracker_respawn():
-    """蓝 → 深蓝 = 重生: 同一位置要拆成两条线(上一段到此为止)。"""
+def test_tracker_speed():
+    """速度用“帧间位移 × 地图边长”算出来(8111 只给摄像机的速度)。
+
+    地图 4096m 宽, 每 0.05s 走 0.001 归一化 = 4.096m → 81.92 m/s ≈ 294 km/h,
+    但这个值会被 MAX_SPEED_KMH 截断 —— 所以另用慢速再验一遍。
+    """
     rec = GlobalRecord(route_id="g3", map_key="M", map_name="地图", created_at="")
-    tr = GlobalTracker(rec, "A")
+    tr = GlobalTracker(rec, "A", map_size=(4096.0, 4096.0))
     t = 0.0
-    for i in range(10):
-        tr.feed(t, [tank(0.20 + 0.001 * i, 0.5)])
-        t += 0.05
-    for i in range(10):                        # 重生: 原地变深蓝
-        tr.feed(t, [tank(0.209 + 0.0005 * i, 0.5, color=PROT)])
+    # 每帧 0.05s 走 0.00005 归一化 → 0.2048 m / 0.05s = 4.096 m/s ≈ 14.7 km/h
+    for i in range(41):
+        tr.feed(t, [tank(0.20 + 0.00005 * i, 0.5)])
         t += 0.05
     lives = tr.finish()
-    assert len(lives) == 2, f"重生应拆成两条线, 实际 {len(lives)}"
-    assert not lives[0].protected, "前一段不是重生保护状态"
-    assert lives[1].protected, "后一段出生时处于重生保护"
-    assert lives[0].t1 <= lives[1].t0 + 1e-9
-    results.append("全局跟踪: 深蓝重生保护 → 拆成两条线并标记 OK")
+    assert len(lives) == 1, f"应只有 1 条线, 实际 {len(lives)}"
+    speeds = [p.speed for p in lives[0].points[1:]]
+    assert speeds, "没有采样点"
+    avg = sum(speeds) / len(speeds)
+    assert 10.0 < avg < 20.0, f"速度应约 14.7 km/h, 实际 {avg:.1f}"
+    # 地图边长翻倍 → 速度也翻倍
+    tr2 = GlobalTracker(rec, "A", map_size=(8192.0, 8192.0))
+    t = 0.0
+    for i in range(41):
+        tr2.feed(t, [tank(0.20 + 0.00005 * i, 0.5)])
+        t += 0.05
+    sp2 = [p.speed for p in tr2.finish()[0].points[1:]]
+    assert 20.0 < sum(sp2) / len(sp2) < 40.0, "地图边长翻倍, 速度也应翻倍"
+    results.append("全局跟踪: 速度 = 位移 × 地图边长(缩放到 km/h) OK")
 
 
 def test_tracker_empty_stop():
@@ -153,20 +164,24 @@ def test_store(tmpdir: str):
                          mode_name="战区控制")
     assert g.label and len(g.label) >= 5, g.label            # 名字 = 录制时间
     life = UnitLife(life_id=f"{g.route_id}:A1", icon="MediumTank",
-                    obj_type="ground_model", protected=True,
-                    points=[TrackPoint(0.1, 0.2, 0.0), TrackPoint(0.3, 0.4, 3.5)])
+                    obj_type="ground_model", map_key="MAP1",
+                    points=[TrackPoint(0.1, 0.2, 0.0, 0.0),
+                            TrackPoint(0.3, 0.4, 3.5, 42.5)])
     g.sides["A"].append(life)
     store.add_global(g)
     assert store.get_global(g.route_id) is g
+    assert life.route_id == life.life_id, "全局线路要能被当成 RouteRecord 用"
+    assert life.marks == [] and life.map_key == "MAP1"
 
-    # 重新读盘: 图元/时间/保护标志都要在
+    # 重新读盘: 坐标/时间/**速度**都要在
     again = RouteStore(path)
     got = again.get_global(g.route_id)
     assert got is not None and got.count() == 1, "全局条目没有落盘/读回"
     l2 = got.lives("A")[0]
-    assert l2.protected and l2.icon == "MediumTank"
+    assert l2.icon == "MediumTank" and l2.map_key == "MAP1"
     assert len(l2.points) == 2 and abs(l2.points[1].t - 3.5) < 1e-9
     assert abs(l2.points[1].x - 0.3) < 1e-9
+    assert abs(l2.points[1].speed - 42.5) < 1e-9, "速度没存住"
 
     # 标记: 同一队只能指向一条记录(打新的会自动清掉旧的)
     g2 = again.new_global("MAP1", "地图 1")
@@ -273,16 +288,36 @@ def test_window(tmpdir: str):
     assert len(_children_kind(sides[0], "glife")) == 2
     assert len(_children_kind(sides[1], "glife")) == 2
 
-    # 3) 眼睛: 点全局条目 → 全部线路交给地图; 再点一次 → 清空
+    # 3) 眼睛: 点全局条目 → 4 条线进入地图的“显示中”集合(与单条轨迹同一套)
     win._set_lives_visible(win._life_ids_of(items[0]), True)
     app.processEvents()
     assert len(win._visible_lives) == 4
-    assert len(win.map_view.global_tracks) == 4, len(win.map_view.global_tracks)
-    colors = {t.color.name() for t in win.map_view.global_tracks}
-    assert len(colors) == 2, f"A/B 队应分两种颜色: {colors}"
+    assert len(win.map_view.visible_tracks) == 4, len(win.map_view.visible_tracks)
     win._set_lives_visible(win._life_ids_of(items[0]), False)
     app.processEvents()
-    assert not win.map_view.global_tracks
+    assert not win.map_view.visible_tracks
+
+    # 3.5) 回放: 选中全局条目 → 播它下面的全部线路; 只选几条 → 只播那几条
+    win._set_lives_visible([l.life_id for s in GLOBAL_SIDES for l in g.lives(s)], True)
+    items = _global_items(win)
+    win.tree.clearSelection()
+    items[0].setSelected(True)
+    app.processEvents()
+    picked = win._playable_tracks()
+    assert len(picked) == 4, [p.route_id for p in picked]
+    win._load_playback(picked)
+    app.processEvents()
+    assert len(win.player.records) == 4 and win._in_playback()
+    assert win.map_view.playback_records, "回放对象没交给地图"
+    win._end_playback()
+    app.processEvents()
+    life_items = list(win._iter_life_items())
+    win.tree.clearSelection()
+    life_items[0].setSelected(True)
+    app.processEvents()
+    picked = win._playable_tracks()
+    assert len(picked) == 1, f"只选一条就该只播一条, 实际 {len(picked)}"
+    assert picked[0].life_id == life_items[0].data(0, rw._ROLE_ID)
 
     # 4) 标记: 打上 A 后, 条目文字带 [A], 且 marked_global 能找到它
     win.store.set_mark(g.route_id, "A", True)
@@ -343,9 +378,11 @@ def test_buttons_and_map_lock(tmpdir: str):
 
 
 def test_map_paint():
-    """全局线路真的画到地图上了: A/B 队两种颜色、线宽比单条轨迹细。"""
+    """全局线路用**速度配色**画(与单条轨迹同一套), 且实时预览也走这条路径。"""
     from PyQt6.QtGui import QImage
-    from wt81111g.route_map_view import COLOR_TEAM_A, COLOR_TEAM_B, GlobalTrack, RouteMapView
+    from wt81111g.route_map_view import (
+        _SPEED_BUCKETS, RouteMapView, bucket_index, speed_color,
+    )
 
     def png(size=256):
         from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
@@ -362,39 +399,45 @@ def test_map_paint():
     view = RouteMapView()
     view.resize(400, 400)
     view.set_map_bytes(png(), key="M")
-    view.set_global_tracks([
-        GlobalTrack(points=[TrackPoint(0.2, 0.3, 0.0), TrackPoint(0.8, 0.3, 1.0)],
-                    color=COLOR_TEAM_A),
-        GlobalTrack(points=[TrackPoint(0.2, 0.7, 0.0), TrackPoint(0.8, 0.7, 1.0)],
-                    color=COLOR_TEAM_B),
-    ])
-    view.show()
-    QApplication.instance().processEvents()
-    canvas = QImage(view.size(), QImage.Format.Format_ARGB32)
-    view.render(canvas)
+    # 一条速度 0 → 50 → 100 的线: 两段的桶中点分别是 25 与 75
+    life = UnitLife(
+        life_id="L1", icon="MediumTank", obj_type="ground_model", map_key="M",
+        points=[TrackPoint(0.2, 0.3, 0.0, 0.0),
+                TrackPoint(0.5, 0.5, 1.0, 50.0),
+                TrackPoint(0.8, 0.7, 2.0, 100.0)])
 
-    def count(color, tol=60):
-        # 抗锯齿会让线条两侧混色, 所以按“通道距离”判近似色, 不用精确相等
+    def canvas_of():
+        view.show()
+        QApplication.instance().processEvents()
+        img = QImage(view.size(), QImage.Format.Format_ARGB32)
+        view.render(img)
+        return img
+
+    def count(img, color, tol=70):
         want = (color.red(), color.green(), color.blue())
         n = 0
-        for y in range(canvas.height()):
-            for x in range(canvas.width()):
-                c = canvas.pixelColor(x, y)
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
                 if (abs(c.red() - want[0]) <= tol and abs(c.green() - want[1]) <= tol
                         and abs(c.blue() - want[2]) <= tol):
                     n += 1
         return n
 
-    na, nb = count(COLOR_TEAM_A), count(COLOR_TEAM_B)
-    assert na > 50 and nb > 50, (na, nb)
-    view.set_global_tracks(None)
-    QApplication.instance().processEvents()
-    canvas2 = QImage(view.size(), QImage.Format.Format_ARGB32)
-    view.render(canvas2)
-    assert count(COLOR_TEAM_A) > 0            # 上一帧的画布不受影响
-    canvas = canvas2
-    assert count(COLOR_TEAM_A) == 0, "清空后不该还留着全局线路"
-    results.append("地图: 全局线路按 A/B 队分色绘制 + 可清空 OK")
+    # 选中层(与单条轨迹一样): 按速度分档上色
+    view.set_highlight([life])
+    idx = bucket_index(25.0, 100.0)
+    want = speed_color((idx + 0.5) / _SPEED_BUCKETS * 100.0, 100.0)
+    assert count(canvas_of(), want) > 20, "选中/高亮的全局线路没有按速度配色画出来"
+
+    # 录制中的实时预览走同一条路径
+    view.set_highlight(None)
+    view.set_live_multi([life])
+    img = canvas_of()
+    assert count(img, want) > 20, "全局录制时没有边录边画"
+    view.set_live_multi(None)
+    assert not count(canvas_of(), want), "清空后不该还留着全局线路"
+    results.append("地图: 全局线路按速度配色绘制 + 录制中实时预览 OK")
 
 
 def test_only_global(tmpdir: str):
@@ -435,7 +478,7 @@ def main() -> int:
     test_filters()
     test_tracker_basic()
     test_tracker_two_and_death()
-    test_tracker_respawn()
+    test_tracker_speed()
     test_tracker_empty_stop()
     test_store(tmpdir)
     test_map_paint()

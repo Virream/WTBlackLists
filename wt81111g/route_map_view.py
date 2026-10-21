@@ -9,7 +9,6 @@ import hashlib
 import logging
 import math
 from bisect import bisect_right
-from dataclasses import dataclass
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
 from PyQt6.QtGui import (
@@ -94,21 +93,6 @@ LAYER_MARGIN = 0.35
 # 轨迹线宽(px): 归一化几何 + 缩放画笔, 实际线宽 = 它们(见 _draw_route)
 TRACK_PEN = 2.4          # 选中的/正在录的(速度配色)
 PLAY_PEN = 2.6           # 回放中已播放的段
-
-# ---- 全局录制(整局所有玩家的线路): **不按速度配色**, 只按队伍分色 ----
-# 这两种颜色刻意避开速度配色(蓝→红)、标记圈(绿/黄/红)与玩家标记(浅蓝),
-# 叠在同一个地图上也一眼能分清。
-COLOR_TEAM_A = QColor("#22d3ee")     # A 队 = 青
-COLOR_TEAM_B = QColor("#e879f9")     # B 队 = 品红
-GLOBAL_PEN = 1.8          # 全局线路的线宽(比单条轨迹细一点: 一次几十条线)
-
-
-@dataclass
-class GlobalTrack:
-    """地图上要画的一条全局线路(全局录制里的一辆车的某一段)。"""
-    points: list          # TrackPoint(x/y/t) 或任何带 x/y 的点
-    color: QColor
-    label: str = ""
 
 
 def _normalized(x: float, y: float) -> QPointF:
@@ -199,9 +183,8 @@ class RouteMapView(QWidget):
         # **高亮层**: 侧栏当前选中的那几条 → 用速度配色画(可多条),
         # 与“眼睛点亮”无关 —— 选了就应该看得到
         self._highlight: list[RouteRecord] = []
-        # 全局录制里“眼睛点亮的”线路(按 A/B 队分色画, 不走速度配色)
-        self._global_tracks: list[GlobalTrack] = []
-        self._global_ver = 0
+        # 全局录制“边录边画”的线路(与单条录制的 _live 同一套画法: 速度配色)
+        self._live_multi: list = []
         self._player: tuple[float, float] | None = None
         # 车头朝向(归一化单位方向向量 dx/dy, 与 /map.img 同坐标系); None = 只画点不画方向
         self._player_dir: tuple[float, float] | None = None
@@ -405,6 +388,11 @@ class RouteMapView(QWidget):
         if len(keep) != len(self._visible):
             self._visible = keep
             dropped.append("显示的轨迹")
+        if not keep_live and self._live_multi:
+            keep_lm = [r for r in self._live_multi if getattr(r, "map_key", "") == map_key]
+            if len(keep_lm) != len(self._live_multi):
+                self._live_multi = keep_lm
+                dropped.append("实时轨迹")
         if self._playback_recs and any(r.map_key != map_key for r in self._playback_recs):
             self._playback_recs = []
             self._playhead = 0.0
@@ -419,6 +407,20 @@ class RouteMapView(QWidget):
 
     def set_live(self, rec: RouteRecord | None) -> None:
         self._live = rec
+        self.update()
+
+    def set_live_multi(self, recs: list | None) -> None:
+        """全局录制期间“边录边画”的线路(一次几十条, 都用速度配色)。
+
+        它们与单条录制的 `_live` 走同一条绘制路径(`_draw_route`),
+        所以元素只需具备 `.points`(带 x/y/t/speed) 与 `.route_id`(缓存键)。
+        """
+        self._live_multi = list(recs or [])
+        self.update()
+
+    @property
+    def live_multi(self) -> list:
+        return list(self._live_multi)
 
     def set_visible_tracks(self, recs: list[RouteRecord] | None) -> None:
         """设置要显示的历史轨迹(可多条, 按给定顺序绘制)。"""
@@ -435,20 +437,6 @@ class RouteMapView(QWidget):
     @property
     def highlight_records(self) -> list[RouteRecord]:
         return list(self._highlight)
-
-    def set_global_tracks(self, tracks: list[GlobalTrack] | None) -> None:
-        """设置要画的**全局录制线路**(整局所有玩家的线, 按 A/B 队分色)。
-
-        这些线不参与悬停/回放/速度配色, 也不需要 `RouteRecord` —— 它们只是
-        “一大把折线”, 所以单独一个列表单独画(见 `_draw_global_tracks`)。
-        """
-        self._global_tracks = list(tracks or [])
-        self._global_ver += 1        # 内容指纹变化 → 轨迹缓存层重建
-        self.update()
-
-    @property
-    def global_tracks(self) -> list[GlobalTrack]:
-        return list(self._global_tracks)
 
     def set_playback(self, recs, playhead: float = 0.0) -> None:
         """进入/退出回放绘制模式(可多条同时回放)。
@@ -481,10 +469,9 @@ class RouteMapView(QWidget):
 
     def clear(self) -> None:
         self._live = None
+        self._live_multi = []
         self._visible = []
         self._highlight = []
-        self._global_tracks = []
-        self._global_ver += 1
         self._player = None
         self._player_dir = None
         self._reset_hover()
@@ -640,6 +627,9 @@ class RouteMapView(QWidget):
         hi = list(self._highlight)
         if self._live is not None and all(r is not self._live for r in hi):
             hi.append(self._live)
+        for rec in self._live_multi:
+            if all(r is not rec for r in hi):
+                hi.append(rec)        # 全局录制“边录边画”的线路也是高亮层
         hi_ids = {id(r) for r in hi}
         total = len(self._visible) + len(hi)
         labels = total <= 1      # 多条时时间标签会完全重叠、无法阅读
@@ -649,28 +639,6 @@ class RouteMapView(QWidget):
             self._draw_route(p, rec, history=True, vmax=self._vmax(rec), labels=labels)
         for rec in hi:
             self._draw_route(p, rec, history=False, vmax=self._vmax(rec), labels=labels)
-        # 全局录制的线路画在最上面: 线细、但一次几十条, 被单条轨迹盖住就看不见了
-        self._draw_global_tracks(p)
-
-    def _draw_global_tracks(self, p: QPainter) -> None:
-        """全局录制的线路: 每条一个颜色(按 A/B 队), **不做速度配色**。
-
-        几何直接每层重建一次(它们只在换图/改显示时才变), 不单独做缓存 ——
-        全局录制可能一次点开几十条线, 而缓存层本身已经是“不变才不重画”了。
-        """
-        if not self._global_tracks or not self._scaled(p):
-            return
-        s = self._px_scale()
-        try:
-            for track in self._global_tracks:
-                pts = track.points
-                if len(pts) < 2:
-                    continue
-                p.setPen(QPen(track.color, GLOBAL_PEN / s, Qt.PenStyle.SolidLine,
-                              Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-                p.drawPolyline(QPolygonF([QPointF(pt.x, pt.y) for pt in pts]))
-        finally:
-            p.restore()
 
     def _margin(self) -> tuple[float, float]:
         """缓存层四周的余量(像素): 拖动地图时靠偏移贴图复用, 不必重建。"""
@@ -736,9 +704,10 @@ class RouteMapView(QWidget):
 
         return (self._geom_key(), sig(self._visible), sig(self._highlight),
                 (live.route_id, len(live.points), len(live.marks)) if live else None,
+                sig(self._live_multi),
                 sig(self._playback_recs),
                 round(self._playhead, 3) if self._playback_recs else None,
-                self._show_spawns, self._spawns_ver, self._global_ver)
+                self._show_spawns, self._spawns_ver)
 
     def _layer_tracks(self) -> QImage | None:
         """轨迹层(半透明, 带余量): 内容或定位超出余量才重建。"""

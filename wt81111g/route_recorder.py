@@ -34,7 +34,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
 from .config import WT_BASE_URL
-from .global_record import GlobalTracker, extract_units
+from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
 from .map_cache import MapCache
 from .route_store import (
     GLOBAL_SIDES, PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, GlobalRecord, RouteMark,
@@ -161,6 +161,12 @@ class RouteRecorder(QObject):
         self._global_waiting = False                # 还没等到第一名玩家重生
         self._global_t0 = 0.0
         self._map_lock = False                      # 全局录制期间锁定地面底图
+        # 地图实际边长(米, 来自 /map_info.json): 归一化位移 × 边长 → 速度(km/h)
+        self._map_size: tuple[float, float] = DEFAULT_MAP_SIZE
+        self._map_info_at = 0.0
+        # 速度标定(只写日志): (单调时刻, x, y) 与上次记录的时机
+        self._cal_prev: tuple[float, float, float] | None = None
+        self._cal_at = 0.0
 
         # 地图缓存
         self._map_digest: str | None = None
@@ -365,6 +371,10 @@ class RouteRecorder(QObject):
         self._dir = direction
         self._update_zones(objects)
 
+        # 全局录制: 顺手标定“位移推算的速度”和 8111 直报的速度(只写日志)
+        if self._global is not None and player is not None:
+            self._calibrate(now, player, _to_float(ind.get("speed")) if ind else None)
+
         # 最近采样缓冲(回溯起点用); 按时间从头部淘汰, 只留 START_LOOKBACK 秒
         if player is not None:
             self._recent.append((now, player[0], player[1], speed, direction))
@@ -386,6 +396,10 @@ class RouteRecorder(QObject):
         # 全局录制: 每帧把**全场**的单位喂给跟踪器(与单条录制互斥)
         global_elapsed = 0.0
         if self._global is not None:
+            # 地图实际边长(算速度用)不必每帧取
+            if now - self._map_info_at >= 2.0:
+                self._map_info_at = now
+                self._update_map_size()
             global_elapsed = self._global_feed(now, objects)
 
         self.tick.emit({
@@ -412,6 +426,8 @@ class RouteRecorder(QObject):
                 "lives": self._tracker.total if self._tracker else 0,
                 "active": self._tracker.active if self._tracker else 0,
             } if self._global is not None else None),
+            # 实时线路(录制期间给地图“边录边画”用; 列表是快照, 元素引用共享)
+            "global_lives": (list(self._tracker.lives) if self._tracker else None),
         })
 
     def _current_rate(self) -> float:
@@ -512,7 +528,53 @@ class RouteRecorder(QObject):
             elif name == "global_stop":
                 self._do_global_stop()
 
+    def _calibrate(self, now: float, player: tuple[float, float],
+                   speed_kmh: float | None) -> None:
+        """把“帧间位移推算的速度”与 `/indicators` 直报的速度放在一起记一行日志。
+
+        **为什么需要它**: `/indicators` 只给**摄像机所在载具**的速度(而且无人机/空战视角
+        直接是 `valid:false`), 其它玩家的速度只能用“归一化位移 × 地图边长(米)”算;
+        而边长取自 `/map_info.json` 的 `map_max - map_min`。下面这一行就是验证那个尺度:
+        两个数字接近 → 换算正确; 差一个固定倍数 → 说明边长取错了(改 `_map_size` 即可)。
+
+        2 秒取一次位移、最多 5 秒记一行, 不给日志添负担。
+        """
+        prev = self._cal_prev
+        if prev is None or (now - prev[0]) < 2.0:
+            return
+        self._cal_prev = (now, player[0], player[1])
+        dt = now - prev[0]
+        if dt <= 0.0 or speed_kmh is None or (now - self._cal_at) < 5.0:
+            return
+        self._cal_at = now
+        w, h = self._map_size
+        dist_m = math.hypot((player[0] - prev[1]) * w, (player[1] - prev[2]) * h)
+        log.info("速度标定: 8111=%.1f km/h | 位移推算=%.1f km/h | 地图=%.0f×%.0f m",
+                 speed_kmh, dist_m / dt * 3.6, w, h)
+
     # ------------------------------------------------------------ 全局录制
+    def _update_map_size(self) -> None:
+        """从 `/map_info.json` 取地图实际边长(米)。
+
+        `map_min` / `map_max` 是**世界坐标(米)**(官方例子是 ±32768; 实测陆战图
+        `0..4096`)。归一化坐标 × 边长 = 实际距离, 才能把帧间位移换算成 km/h。
+        拿不到或数值不合法时保持上一次的值(首次为 4096 m)。
+        """
+        info = self.client.map_info()
+        try:
+            lo = [float(v) for v in (info.get("map_min") or [])]
+            hi = [float(v) for v in (info.get("map_max") or [])]
+        except (TypeError, ValueError):
+            return
+        if len(lo) < 2 or len(hi) < 2:
+            return
+        w, h = hi[0] - lo[0], hi[1] - lo[1]
+        if w <= 0 or h <= 0:
+            return
+        self._map_size = (w, h)
+        if self._tracker is not None:
+            self._tracker.set_map_size(w, h)
+
     def _do_global_start(self, side: str, target: GlobalRecord | None) -> None:
         """开始全局录制。
 
@@ -555,11 +617,12 @@ class RouteRecorder(QObject):
         self._global_side = side
         self._global_created = created
         self._global_prev_lives = list(rec.lives(side))
-        self._tracker = GlobalTracker(rec, side)
+        self._tracker = GlobalTracker(rec, side, map_size=self._map_size)
         self._global_waiting = True
         self._global_t0 = 0.0
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
         self._map_lock = True
+        self._map_info_at = 0.0          # 下一次 tick 立刻取一次地图边长
         if created:
             self.store.add_global(rec)
         else:
