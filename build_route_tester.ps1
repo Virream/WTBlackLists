@@ -43,6 +43,16 @@ if (Test-Path $dataDir) {
 }
 
 Write-Host "== 1/3 打包 onedir(启动更快) =="
+# GPU 画布(wt81111g\route_map_gl.py)用到 pygfx / wgpu / rendercanvas / pylinalg。
+# 它们的 shader 与 wgpu-native.dll 属于“包内数据文件”, PyInstaller **不会**自动收全,
+# 必须 --collect-all, 否则打包版一启动就回退到软件渲染(界面看着正常, 只是慢)。
+# 没装这些包时(纯软件版环境)自动跳过, 不影响打包。
+$glArgs = @()
+if (Test-Path (Join-Path $root ".venv\Lib\site-packages\pygfx")) {
+    $glArgs = @("--collect-all", "pygfx", "--collect-all", "wgpu",
+                "--collect-all", "rendercanvas", "--collect-all", "pylinalg")
+    Write-Host "   (已启用 GPU 依赖收集)"
+}
 & $py -m PyInstaller `
     --noconfirm `
     --clean `
@@ -53,6 +63,7 @@ Write-Host "== 1/3 打包 onedir(启动更快) =="
     --version-file version_info_route.txt `
     --add-data "assets\icons;assets\icons" `
     --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
+    @glArgs `
     route_tester.py
 
 Write-Host "== 2/3 精简 Qt 体积(保留 jpeg/webp 图片插件, 保证地图图片可解码) =="
@@ -69,6 +80,7 @@ if ($OneFile) {
         --version-file version_info_route.txt `
         --add-data "assets\icons;assets\icons" `
         --add-data "icon\icon_512X512_WTRouteTester.png;icon" `
+        @glArgs `
         route_tester.py
 }
 

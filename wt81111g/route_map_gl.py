@@ -261,13 +261,19 @@ class RouteMapGlView(RouteMapView):
             self._canvas = RenderCanvas(size=(1400, 900), pixel_ratio=1)
         else:
             from rendercanvas.qt import RenderCanvas
-            self._canvas = RenderCanvas(size=(900, 620), title="路线地图 (GPU)",
+            # `RenderCanvas`(= QRenderCanvas)本身是个 **toplevel QWidget**, 构造函数里
+            # 会直接 `self.show()`。以前我只把它的内部 `_subwidget` 抢进自己的布局,
+            # 于是 canvas 自己变成了一个空窗口挂在屏幕上(用户 2026-10-22: “测试时
+            # 总显示两个窗口, 一个是主界面, 另一个什么都没有”)。正确做法是把整个
+            # canvas 作为**子控件**创建(parent=self), 它就不会单独顶出来。
+            self._canvas = RenderCanvas(parent=self, size=(900, 620),
+                                        title="路线地图 (GPU)",
                                         present_method=present_method)
-            sub = getattr(self._canvas, "_subwidget", None)
             lay = QVBoxLayout(self)
             lay.setContentsMargins(0, 0, 0, 0)
+            lay.addWidget(self._canvas)
+            sub = getattr(self._canvas, "_subwidget", None)
             if sub is not None:
-                lay.addWidget(sub)
                 # 鼠标/滚轮事件全落在 canvas 的内嵌控件上, 必须由它转发过来
                 sub.setMouseTracking(True)
                 sub.installEventFilter(self)
