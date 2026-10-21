@@ -265,6 +265,16 @@ def test_frame_align():
         t += 0.05
     killed = [lf for lf in tr2.lives if abs(lf.points[0].y - 0.70) < 1e-6]
     assert killed and killed[0].dead is True, "过了宽限期再消失 → 应判为击毁"
+
+    # ④ 交叉校验日志: 拟合尺度应该等于“当前图框 ÷ 参考图框”
+    #    (真实数据是 坦克图框 4096 m ↔ 空中图框 65536 m = 16×; 这里合成数据是 1/0.4 = 2.5×)
+    tr.seen_extent = (4096.0 / AIR_SCALE, 4096.0 / AIR_SCALE)
+    msg = tr._cross_check(tr.aligner.fit)
+    assert "与拟合一致" in msg, msg
+    tr.seen_extent = (4096.0, 4096.0)          # 图框没变 → 说明 fit 不该是 2.5×
+    assert "不一致" in tr._cross_check(tr.aligner.fit)
+    tr.seen_extent = None                      # 拿不到 map_info 也不能炸
+    assert "无法交叉校验" in tr._cross_check(tr.aligner.fit)
     results.append("全局录制: 空战图坐标换算(线路不断/换视角不误判击毁) OK")
 
 

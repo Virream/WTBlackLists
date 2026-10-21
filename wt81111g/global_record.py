@@ -473,6 +473,11 @@ class GlobalTracker:
         self.aligner = FrameAligner()
         self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
         self.frame_changes = 0                          # 换算过多少个不同坐标系(日志用)
+        # 这一帧 /map_info.json 报的图框尺寸(米) —— **只用来交叉校验**拟合尺度:
+        # 知识库(Dagor/8111)的口径是“归一化 × 图框 = 世界米”, 两个视角只是图框不同
+        # (坦克图框 4096 m / 空中图框 65536 m → 比值 16), 所以拟合出的尺度应该与
+        # “当前图框 ÷ 参考图框” 一致。不一致 → 要么锚点拟合错了, 要么地图信息不可信。
+        self.seen_extent: tuple[float, float] | None = None
 
     def set_map_size(self, width_m: float, height_m: float) -> None:
         """更新地图边长(米)。轮询线程每次拿到 /map_info 都会调一次。"""
@@ -534,7 +539,8 @@ class GlobalTracker:
         if before is not None and fit is not before and not fit.same_as_reference:
             self._view_changed_at = t
             self.frame_changes += 1
-            log.info("全局录制: 坐标系变化(视野切到空中单位?) → %s", fit.describe())
+            log.info("全局录制: 坐标系变化(视野切到空中单位?) → %s %s",
+                     fit.describe(), self._cross_check(fit))
         elif before is not None and before is not fit and fit.same_as_reference \
                 and not before.same_as_reference:
             self._view_changed_at = t
@@ -545,6 +551,30 @@ class GlobalTracker:
             u.x, u.y = fit.apply(u.x, u.y)
         # 换算后再按参考坐标系判一次范围(空战图里机场 AI 防空的坐标在 2.9~3.4)
         units[:] = [u for u in units if 0.0 <= u.x <= 1.0 and 0.0 <= u.y <= 1.0]
+
+    def _cross_check(self, fit: FrameFit) -> str:
+        """交叉校验: 拟合出的尺度 vs `/map_info.json` 的图框比。
+
+        8111/Dagor 的口径是“归一化坐标 × 图框 = 世界米”(知识库 07 章 §4.4),
+        所以把两个视角的图框一除, 就该等于拟合出的尺度 —— 两个数字对得上,
+        “坐标换算对不对”就是一个能一眼确认的事实。
+
+        对不上时不报错, 只写日志(可能只是 map_info 还没跟上换图的那一瞬间)。
+        """
+        seen = self.seen_extent
+        ref = self.map_size
+        if not seen or ref[0] <= 0.0 or seen[0] <= 0.0:
+            return "| map_info 图框未知, 无法交叉校验"
+        expect = seen[0] / ref[0]
+        diff = abs(fit.scale - expect) / expect
+        if diff <= 0.02:
+            verdict = "与拟合一致"
+        elif diff <= 0.2:
+            verdict = "偏差较大, 注意核对"
+        else:
+            verdict = "不一致"
+        return (f"| map_info 图框 {seen[0]:.0f}/{ref[0]:.0f} = {expect:.4f}× "
+                f"→ {verdict}(差 {diff * 100:.2f}%)")
 
     def _dead_allowed(self, t: float) -> bool:
         """现在这个时刻能不能判“被击毁”。

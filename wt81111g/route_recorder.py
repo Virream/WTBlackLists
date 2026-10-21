@@ -163,6 +163,9 @@ class RouteRecorder(QObject):
         self._map_lock = False                      # 全局录制期间锁定地面底图
         # 地图实际边长(米, 来自 /map_info.json): 归一化位移 × 边长 → 速度(km/h)
         self._map_size: tuple[float, float] = DEFAULT_MAP_SIZE
+        # 这一帧 /map_info.json 报的图框尺寸(**总是**记下来, 包括“当前坐标系与参考不同、
+        # 不采用”的情况) —— 全局录制的坐标系拟合尺度要拿它交叉校验
+        self._map_size_seen: tuple[float, float] | None = None
         self._map_info_at = 0.0
         # 速度标定(只写日志): (单调时刻, x, y) 与上次记录的时机
         self._cal_prev: tuple[float, float, float] | None = None
@@ -572,7 +575,9 @@ class RouteRecorder(QObject):
         if w <= 0 or h <= 0:
             return
         tracker = self._tracker
+        self._map_size_seen = (w, h)
         if tracker is not None:
+            tracker.seen_extent = (w, h)      # 仅用于日志里的交叉校验
             fit = tracker.aligner.fit
             if fit is not None and not fit.same_as_reference:
                 # 观战中的玩家上了飞机: 8111 切成空战图, 连 map_min/map_max 都变了。
