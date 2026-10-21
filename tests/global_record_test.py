@@ -43,6 +43,20 @@ def tank(x, y, color=BLUE, icon="MediumTank", typ="ground_model"):
     return {"type": typ, "icon": icon, "color": color, "x": x, "y": y}
 
 
+def png_bytes(color: str = "#334455", size: int = 256) -> bytes:
+    """内存生成一张纯色 PNG 当作地图底图(不依赖游戏)。"""
+    from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
+    from PyQt6.QtGui import QColor
+    img = QImage(size, size, QImage.Format.Format_RGB32)
+    img.fill(QColor(color))
+    ba = QByteArray()
+    buf = QBuffer(ba)
+    buf.open(QIODevice.OpenModeFlag.WriteOnly)
+    img.save(buf, "PNG")
+    buf.close()
+    return bytes(ba)
+
+
 # ---------------------------------------------------------------- 单位过滤
 def test_filters():
     # 地面载具: 录
@@ -299,6 +313,14 @@ def test_window(tmpdir: str):
     assert not win.map_view.visible_tracks
 
     # 3.5) 回放: 选中全局条目 → 播它下面的全部线路; 只选几条 → 只播那几条
+    # (先把“录制完成”走一遍: 录完自动点亮, 且眼睛图标与地图显示保持一致)
+    win._on_global_finished(g, "A")
+    app.processEvents()
+    assert len(win._visible_lives) == 2, "录完应只点亮刚录的 A 队"
+    assert len(win.map_view.visible_tracks) == 2, "录完路线应该还在地图上(不能自己藏起来)"
+    lit = [it for it in win._iter_life_items()
+           if it.data(0, rw._ROLE_ID) in win._visible_lives]
+    assert len(lit) == 2, "眼睛图标必须与显示状态联动"
     win._set_lives_visible([l.life_id for s in GLOBAL_SIDES for l in g.lives(s)], True)
     items = _global_items(win)
     win.tree.clearSelection()
@@ -310,13 +332,14 @@ def test_window(tmpdir: str):
     app.processEvents()
     assert len(win.player.records) == 4 and win._in_playback()
     assert win.map_view.playback_records, "回放对象没交给地图"
-    # 真渲染一帧: 回放光标/时间轴会读点的朝向, 全局点没有 dx/dy(曾经在这里崩过)
-    win.player.seek(0.5)
+    # 真渲染一帧: 必须有底图, 否则 _paint 会直接返回、根本走不到回放光标那段
+    win.map_view.set_map_bytes(png_bytes(), key="MAPX")
     app.processEvents()
     img = QImage(win.map_view.size(), QImage.Format.Format_ARGB32)
-    win.map_view.render(img)
-    win.player.seek(0.4)
-    win.map_view.render(img)
+    for t in (0.0, 0.5, 999.0):    # 0 点/中间/超出末尾(前两者会直接返回原始 TrackPoint)
+        win.player.seek(t)
+        app.processEvents()
+        win.map_view.render(img)
     win._end_playback()
     app.processEvents()
     life_items = list(win._iter_life_items())
@@ -392,21 +415,9 @@ def test_map_paint():
         _SPEED_BUCKETS, RouteMapView, bucket_index, speed_color,
     )
 
-    def png(size=256):
-        from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
-        from PyQt6.QtGui import QColor
-        img = QImage(size, size, QImage.Format.Format_RGB32)
-        img.fill(QColor("#303030"))
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
-        buf.close()
-        return bytes(ba)
-
     view = RouteMapView()
     view.resize(400, 400)
-    view.set_map_bytes(png(), key="M")
+    view.set_map_bytes(png_bytes(), key="M")
     # 一条速度 0 → 50 → 100 的线: 两段的桶中点分别是 25 与 75
     life = UnitLife(
         life_id="L1", icon="MediumTank", obj_type="ground_model", map_key="M",
@@ -489,21 +500,9 @@ def test_live_layer_no_rebuild():
     """
     from wt81111g.route_map_view import RouteMapView
 
-    def png(size=256):
-        from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
-        from PyQt6.QtGui import QColor
-        img = QImage(size, size, QImage.Format.Format_RGB32)
-        img.fill(QColor("#334455"))
-        ba = QByteArray()
-        buf = QBuffer(ba)
-        buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
-        buf.close()
-        return bytes(ba)
-
     view = RouteMapView()
     view.resize(600, 500)
-    view.set_map_bytes(png(), key="M")
+    view.set_map_bytes(png_bytes(), key="M")
     life = UnitLife(life_id="L1", icon="IFV", obj_type="ground_model", map_key="M",
                     points=[TrackPoint(0.2 + 0.01 * i, 0.3 + 0.005 * i, i * 0.2, 30.0)
                             for i in range(20)])
@@ -534,11 +533,26 @@ def test_live_layer_no_rebuild():
     assert abs(got[1][0] - 1.25) < 1e-6, f"应按缩放比贴图, 实际 {got[1]}"
 
     # 停手后重建(定时器触发)
+    view._live_zoom_at = 0.0          # 模拟“早就停手了”
     view._rebuild_live_now()
     app.processEvents()
     view.render(canvas)
     assert view._live_layer is not layer, "停手后应重建一次以恢复清晰度"
-    results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 OK")
+
+    # 重建之后,"边录边画”必须能继续长(曾经: 定时器被每帧重置 → 永远不重建 → 线路卡住)
+    layer2 = view._live_layer
+    for i in range(10):
+        life.points.append(TrackPoint(0.2 + 0.01 * i, 0.32 + 0.005 * i,
+                                      6.0 + i * 0.2, 40.0))
+    view.render(canvas)
+    assert view._live_layer is layer2, "重建后新增点不该再触发重建"
+    n_before = view._live_seg[life.route_id].n
+    for i in range(10):
+        life.points.append(TrackPoint(0.2 + 0.01 * i, 0.33 + 0.005 * i,
+                                      8.0 + i * 0.2, 45.0))
+    view.render(canvas)
+    assert view._live_seg[life.route_id].n > n_before, "缩放后线路不再增长(实时显示卡住)"
+    results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 + 缩放后仍能继续增长 OK")
 
 
 def main() -> int:

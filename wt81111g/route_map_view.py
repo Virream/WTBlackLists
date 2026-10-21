@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import time
 from bisect import bisect_right
 
 from PyQt6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
@@ -268,6 +269,8 @@ class RouteMapView(QWidget):
         self._live_ids: tuple | None = None
         self._live_anchor: tuple[float, float] | None = None
         self._live_size: tuple[float, float] = (0.0, 0.0)
+        self._live_seen_size: tuple[float, float] = (0.0, 0.0)
+        self._live_zoom_at = 0.0
         self._live_timer: QTimer | None = None
         # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
         self._blink_t = 0.0
@@ -741,15 +744,25 @@ class RouteMapView(QWidget):
         return self._live_layer
 
     def _schedule_live_rebuild(self) -> None:
-        """缩放过程中不重建(一次重建实测 270 ms), 停手 200ms 后再重建。"""
+        """缩放过程中不重建(一次重建实测 270 ms), 停手 200ms 后再重建。
+
+        注意**不能在已经计时时再 start()** —— 录制时每 40ms 就 paint 一次,
+        重新计时会让它永远不触发, 于是实时线路一直卡在“缩放后的旧图”上不再长
+        (2026-10-21 用户实测: 缩放+拖动后不再实时显示).
+        """
         if self._live_timer is None:
             self._live_timer = QTimer(self)
             self._live_timer.setSingleShot(True)
             self._live_timer.timeout.connect(self._rebuild_live_now)
-        self._live_timer.start(200)
+        if not self._live_timer.isActive():
+            self._live_timer.start(200)
 
     def _rebuild_live_now(self) -> None:
         if not self._live_multi:
+            return
+        if time.monotonic() - self._live_zoom_at < 0.25:
+            # 还在缩放/改窗口 → 再等一轮, 别每 200ms 重建一次(每次都是 200ms 的卡)
+            self._live_timer.start(200)
             return
         self._live_layer = None
         self._live_ids = None
@@ -775,6 +788,9 @@ class RouteMapView(QWidget):
             return (layer, (1.0, 1.0)) if layer is not None else None
         if size != self._live_size and self._live_size[0] > 0 and self._live_size[1] > 0:
             # 缩放/改窗口 → 旧图层按比例贴(即时反馈), 稍后重建
+            if size != self._live_seen_size:
+                self._live_seen_size = size
+                self._live_zoom_at = time.monotonic()   # 记下“最后一次几何变化”
             self._schedule_live_rebuild()
             return (self._live_layer,
                     (size[0] / self._live_size[0], size[1] / self._live_size[1]))

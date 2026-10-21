@@ -149,14 +149,17 @@ GLOBAL_SIDE_LABELS = {"A": "A 队", "B": "B 队"}
 class TrackPoint:
     """全局录制的轨迹点: 坐标 + 时间 + **速度**(km/h)。
 
-    没有朝向(用户要求全局录制忽略朝向)。字段名与 `RoutePoint` 对齐, 这样回放、
-    速度配色、playhead 切分与光标这一整套可以直接复用(`_vmax` / `build_speed_segments`
-    / `point_at` 都只认 `.x .y .t .speed`)。
+    `dx`/`dy` 恒为 0(全局录制不记朝向), 但**字段必须有**: `point_at()` 在
+    “早于首点/晚于末点”时会把原始点直接返回, 回放光标随即读 `.dx/.dy` ——
+    缺了就会每帧抛 AttributeError(2026-10-21 实测: 整张地图画不出来)。
+    字段名与 `RoutePoint` 对齐, 速度配色/playhead 切分/光标那套可以直接复用。
     """
     x: float
     y: float
     t: float
     speed: float = 0.0
+    dx: float = 0.0
+    dy: float = 0.0
 
 
 @dataclass
@@ -397,13 +400,12 @@ def point_at(points: list[RoutePoint], t: float) -> RoutePoint | None:
     k = 0.0 if span <= 0 else (t - a.t) / span
     # 朝向取**更近那一端**的采样值: 单位向量做线性插值在掉头时会退化成零向量
     # (方向丢失), 而采样间隔只有几十 ms, 取端点肉眼看不出跳变。
-    # 全局线路的 TrackPoint **没有朝向**(用户要求忽略朝向) → getattr 兜成 0,0。
     src = a if k < 0.5 else b
     return RoutePoint(x=a.x + (b.x - a.x) * k,
                       y=a.y + (b.y - a.y) * k,
                       t=t,
                       speed=a.speed + (b.speed - a.speed) * k,
-                      dx=getattr(src, "dx", 0.0), dy=getattr(src, "dy", 0.0))
+                      dx=src.dx, dy=src.dy)
 
 
 def split_points(points: list[RoutePoint],
