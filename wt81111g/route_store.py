@@ -178,8 +178,9 @@ class UnitLife:
     map_key: str = ""           # 所属地图(回放时用来判断底图对不对)
     points: list[TrackPoint] = field(default_factory=list)
     # 这条线的单位是**被击毁**结束的(而不是录制结束时还活着)。
-    # 判定只看 8111: 线断了那一刻场上**还有其它可录单位** → 算被击毁;
-    # 全场一起消失(回到车库/录制结束) → 不算(见 global_record.GlobalTracker.feed)。
+    # 用户口径(2026-10-21): “在 8111 中玩家对应的 icon 消失就是死了” ——
+    # 一次只能开一台载具, 想换固定翼必先阵亡; 退局后载具停在原地、
+    # 8111 过一会儿不再上报, 也算击毁。实现上只看“线断那一刻场上还有没有别人”。
     dead: bool = False
 
     @property
