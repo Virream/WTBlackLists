@@ -24,7 +24,7 @@ import time
 
 import numpy as np
 
-from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt
 from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
@@ -144,6 +144,9 @@ class RouteMapGlView(QWidget):
             lay.setContentsMargins(0, 0, 0, 0)
             if sub is not None:
                 lay.addWidget(sub)
+                # 鼠标/滚轮事件都落在 subwidget 上, 必须由它转发(见 eventFilter 说明)
+                sub.setMouseTracking(True)
+                sub.installEventFilter(self)
 
         self._renderer = gfx.WgpuRenderer(self._canvas)
         self._scene = gfx.Scene()
@@ -445,17 +448,53 @@ class RouteMapGlView(QWidget):
                 self._canvas.set_title(f"路线地图 (GPU)  {self._fps:.0f} fps")
 
     # ------------------------------------------------------------ 交互
-    def wheelEvent(self, event) -> None:  # noqa: N802 - Qt 命名
-        steps = event.angleDelta().y() / 120.0
+    # 关键: 鼠标/滚轮事件都发生在 canvas 内嵌的 `_subwidget`(QRenderWidget)上,
+    # **不会**传给我们这个外层 QWidget —— 2026-10-21 用户实测“缩放和拖拽没反应”。
+    # 所以在 subwidget 上装 Qt 事件过滤器, 直接截它的 Wheel/Mouse* 事件。
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        t = event.type()
+        if t == QEvent.Type.Wheel:
+            self._zoom_at(event.angleDelta().y() / 120.0, event.position())
+            return True
+        if t == QEvent.Type.MouseButtonDblClick:
+            self.reset_view()
+            return True
+        if t == QEvent.Type.MouseButtonPress:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._dragging = True
+                self._drag_last = event.position()
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+                return True
+            return False
+        if t == QEvent.Type.MouseButtonRelease:
+            if event.button() == Qt.MouseButton.MiddleButton:
+                self._dragging = False
+                self.setCursor(Qt.CursorShape.ArrowCursor)
+                return True
+            return False
+        if t == QEvent.Type.MouseMove and self._dragging:
+            self._pan_by(event.position())
+            return True
+        return super().eventFilter(obj, event)
+
+    def _zoom_at(self, steps: float, pos: QPointF) -> None:
+        """以 `pos`(控件坐标)为中心缩放 `steps` 格(鼠标下那个点保持不动)。"""
         if not steps:
             return
-        before = self._map_pos_at(event.position())
+        before = self._map_pos_at(pos)
         self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * (WHEEL_STEP ** steps)))
         self._clamp_pan()
-        after = self._map_pos_at(event.position())
-        # 让鼠标下的那个点不动
+        after = self._map_pos_at(pos)
         self._pan_x += after.x() - before.x()
         self._pan_y += after.y() - before.y()
+        self._clamp_pan()
+        self.update()
+
+    def _pan_by(self, pos: QPointF) -> None:
+        """跟着鼠标平移(delta 由上一次位置算)。"""
+        self._pan_x += pos.x() - self._drag_last.x()
+        self._pan_y += pos.y() - self._drag_last.y()
+        self._drag_last = pos
         self._clamp_pan()
         self.update()
 
@@ -466,6 +505,10 @@ class RouteMapGlView(QWidget):
         if dw <= 0 or dh <= 0:
             return QPointF()
         return QPointF((pos.x() - r.left()) / dw, (pos.y() - r.top()) / dh)
+
+    # 下面四个是“本控件自己拿到事件”时的入口(不带内嵌 canvas 时/测试用)。
+    def wheelEvent(self, event) -> None:  # noqa: N802
+        self._zoom_at(event.angleDelta().y() / 120.0, event.position())
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.MiddleButton:
@@ -479,14 +522,8 @@ class RouteMapGlView(QWidget):
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if not self._dragging:
-            return
-        pos = event.position()
-        self._pan_x += pos.x() - self._drag_last.x()
-        self._pan_y += pos.y() - self._drag_last.y()
-        self._drag_last = pos
-        self._clamp_pan()
-        self.update()
+        if self._dragging:
+            self._pan_by(event.position())
 
     def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
         self.reset_view()
