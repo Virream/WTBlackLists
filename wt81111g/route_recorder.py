@@ -643,7 +643,9 @@ class RouteRecorder(QObject):
             self.store.save()
         log.info("全局录制已就绪: %s %s 队 (条目 %s)", rec.label, side, rec.route_id)
         self.global_armed.emit(rec, side)
-        self.notice.emit(f"已就绪: 等待第一名玩家重生后开始计时({side} 队)")
+        self.notice.emit(
+            f"已就绪: 等待第一名玩家重生后开始计时({side} 队) —— "
+            f"回放请保持 1× 且不要暂停, 否则 A/B 时间轴会对不上")
 
     def _global_feed(self, now: float, objects: list) -> float:
         """每帧喂给跟踪器; 返回已录制的秒数(还没开始时为 0)。
@@ -713,6 +715,8 @@ class RouteRecorder(QObject):
         self._global_prev_lives = []
         log.info("全局录制完成: %s %s 队 %d 条线路, 用时 %.1fs",
                  rec.label, side, len(lives), duration)
+        # 两队都录过时, 顺手把时间轴对比写进日志(见 GlobalRecord.timeline_note)
+        log.info("全局录制 时间轴: %s", rec.timeline_note())
         self.global_finished.emit(rec, side)
 
     def _do_start(self, now: float, player: tuple[float, float] | None, vehicle: str,

@@ -606,6 +606,7 @@ class GlobalTracker:
             obj_type=u.typ,
             color=u.color,
             map_key=self.record.map_key,
+            side=self.side,
         )
         life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
         self.lives.append(life)

@@ -172,6 +172,33 @@ def test_tracker_empty_stop():
     results.append("全局跟踪: 全场无单位超时 → 自动停止 OK")
 
 
+def test_timeline_note():
+    """A/B 两队的时间轴对比(写日志用): 两边都从 0 开始, 只比结尾。
+
+    用户要求的对齐机制是“第一辆载具出现 = 0 点”, 两次录制各自取到 0;
+    但 8111 只给观战那一方的单位, 所以两侧“第一辆”未必是同一瞬间 ——
+    结尾差就是这两个量的**合计**(分不清是某队先打光还是 0 点错开), 只能作为诊断。
+    """
+    rec = GlobalRecord(route_id="g9", map_key="M", map_name="地图", created_at="")
+    assert rec.timeline_note() == "无线路"
+
+    def life(side: str, t0: float, t1: float) -> UnitLife:
+        lf = UnitLife(life_id=f"g9:{side}1", icon="T", obj_type="ground_model",
+                      map_key="M", side=side)
+        lf.points = [TrackPoint(0.2, 0.2, t0, 0.0), TrackPoint(0.3, 0.3, t1, 30.0)]
+        return lf
+
+    rec.sides["A"] = [life("A", 0.0, 500.0), life("A", 5.0, 300.0)]
+    rec.sides["B"] = [life("B", 0.0, 500.2)]
+    note = rec.timeline_note()
+    assert "A 队 2 条 0~500.0s" in note and "B 队 1 条 0~500.2s" in note, note
+    assert "结尾对齐" in note, note            # 差 0.2s ≤ 0.5s
+
+    rec.sides["B"] = [life("B", 0.0, 503.0)]
+    assert "结尾差 -3.0s" in rec.timeline_note()
+    results.append("全局录制: A/B 时间轴对比(0 点 + 结尾差诊断) OK")
+
+
 def test_frame_align():
     """观战玩家上了固定翼 → 8111 切成空战图, 单位坐标整体被缩放/平移。
 
@@ -322,7 +349,13 @@ def test_tracker_dead_flag():
     row = json.loads(json.dumps(killed.to_json()))
     back = type(killed).from_json(row)
     assert back.dead is True, row
+    assert killed.side == "A" and back.side == "A", "队号(A/B)也要跟着落盘"
     assert type(alive).from_json(json.loads(json.dumps(alive.to_json()))).dead is False
+    # 旧数据没有 side 字段 → 由 GlobalRecord.from_json 按所在分组补回来
+    legacy = {"route_id": "g9", "map_key": "M", "sides": {
+        "B": [{"id": "g9:B1", "pts": [[0.0, 0.2, 0.2, 0.0], [1.0, 0.3, 0.3, 10.0]]}]}}
+    rec9 = GlobalRecord.from_json(legacy)
+    assert rec9 is not None and rec9.lives("B")[0].side == "B"
     results.append("全局跟踪: 被击毁判定(icon 中途消失 / 全场消失不算 / 落盘往返) OK")
 
 
@@ -777,6 +810,7 @@ def main() -> int:
     test_tracker_speed()
     test_tracker_empty_stop()
     test_tracker_dead_flag()
+    test_timeline_note()
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()
@@ -793,4 +827,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
 

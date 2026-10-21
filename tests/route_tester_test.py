@@ -2938,6 +2938,18 @@ def test_dead_style(tmpdir: str):
                     n += 1
         return n
 
+    def blue_pixels(img: QImage, nx: float, ny: float, half: int = 8) -> int:
+        """8111 蓝 `#174DFF` 的像素个数(A 队的阵亡标记)。"""
+        q = view.map_pos(nx, ny)
+        cx, cy = int(round(q.x())), int(round(q.y()))
+        n = 0
+        for dy in range(-half, half + 1):
+            for dx in range(-half, half + 1):
+                c = img.pixelColor(cx + dx, cy + dy)
+                if c.blue() > 170 and c.red() < 120 and c.green() < 130:
+                    n += 1
+        return n
+
     # ① 阵亡之前(t=3 < 9): 彩色 + 光标, 没有红叉
     assert view._dead_now(life, 3.0) is False
     before = shot(3.0)
@@ -2989,6 +3001,28 @@ def test_dead_style(tmpdir: str):
     assert red_pixels(with_x, 0.55, 0.7) == red_pixels(without_x, 0.55, 0.7), \
         "没有阵亡信息的轨迹不该画红叉"
     assert sat(at(with_x, 0.20, 0.7)) > 60, "普通轨迹到末尾仍是速度配色"
+
+    # ⑤b 标记颜色按队区分: **A 队蓝、B 队红**
+    life.side = "A"
+    img_a = QImage(640, 480, QImage.Format.Format_ARGB32)
+    view.set_playback([life], 12.0)
+    view._play_layer = None
+    view.render(img_a)
+    assert blue_pixels(img_a, 0.55, 0.5) > 3, "A 队的阵亡标记应是蓝色"
+    assert red_pixels(img_a, 0.55, 0.5) == 0, "A 队不该再有红叉"
+    life.side = "B"
+    img_b = QImage(640, 480, QImage.Format.Format_ARGB32)
+    view.set_playback([life], 12.0)
+    view._play_layer = None
+    view.render(img_b)
+    assert red_pixels(img_b, 0.55, 0.5) > 3, "B 队的阵亡标记仍是红色"
+    assert blue_pixels(img_b, 0.55, 0.5) == 0
+    life.side = ""                     # 没有队号(普通轨迹) → 红色兜底
+    img_none = QImage(640, 480, QImage.Format.Format_ARGB32)
+    view.set_playback([life], 12.0)
+    view._play_layer = None
+    view.render(img_none)
+    assert red_pixels(img_none, 0.55, 0.5) > 3
 
     view.set_playback(None)
 

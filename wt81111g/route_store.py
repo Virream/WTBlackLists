@@ -177,6 +177,9 @@ class UnitLife:
     color: str = ""             # 8111 的颜色(仅参考, 不参与分组)
     map_key: str = ""           # 所属地图(回放时用来判断底图对不对)
     points: list[TrackPoint] = field(default_factory=list)
+    # 这条线是在哪一队录到的(`A` / `B`): 回放时阵亡标记的颜色靠它区分
+    # (A 队 = 蓝, B 队 = 红)。旧数据没这个字段 → 读取时按 life_id 里的队号补。
+    side: str = ""
     # 这条线的单位是**被击毁**结束的(而不是录制结束时还活着)。
     # 用户口径(2026-10-21): “在 8111 中玩家对应的 icon 消失就是死了” ——
     # 一次只能开一台载具, 想换固定翼必先阵亡; 退局后载具停在原地、
@@ -228,6 +231,7 @@ class UnitLife:
             "type": self.obj_type,
             "color": self.color,
             "map_key": self.map_key,
+            "side": self.side,
             "dead": 1 if self.dead else 0,
             "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
                     for p in self.points],
@@ -259,6 +263,7 @@ class UnitLife:
             color=str(data.get("color") or ""),
             map_key=str(data.get("map_key") or ""),
             points=pts,
+            side=str(data.get("side") or ""),
             dead=bool(data.get("dead")),
         )
 
@@ -306,6 +311,36 @@ class GlobalRecord:
     def count(self) -> int:
         return sum(len(v) for v in self.sides.values())
 
+    def timeline_note(self) -> str:
+        """A/B 两队的**时间轴对比**(写日志/诊断用)。
+
+        两队都是“抓到第一辆载具的那一刻 = 0 点”, 所以两边都从 0 开始 ——
+        能拿来比的只有**结尾**:
+
+        * 结尾相同(±0.5s) → 两边的可录单位消失于同一时刻(通常就是战斗结束),
+          说明两次录制的 0 点也对得上;
+        * 结尾差得多 → 两种可能, 8111 的数据**分不出来**:
+          ① 某一队先被打光/退场(跟对齐无关),
+          ② 两次录制的 0 点真的错开了(两侧“第一辆车”不是同一瞬间重生)。
+
+        没有更好锚点的原因: 8111 不提供战斗时钟(`/hudmsg` 的 `time` 实测不可靠),
+        而 `/map_obj.json` 只给**观战那一方**的单位 —— 两侧看到的第一个重生时刻
+        本来就可能差 1~2 秒。
+        """
+        spans = []
+        for side in GLOBAL_SIDES:
+            lives = [lf for lf in self.lives(side) if lf.points]
+            if lives:
+                spans.append((side, len(lives),
+                              max(lf.points[-1].t for lf in lives)))
+        if not spans:
+            return "无线路"
+        parts = [f"{side} 队 {n} 条 0~{last:.1f}s" for side, n, last in spans]
+        if len(spans) == 2:
+            diff = spans[0][2] - spans[1][2]
+            parts.append("结尾对齐" if abs(diff) <= 0.5 else f"结尾差 {diff:+.1f}s")
+        return " | ".join(parts)
+
     def to_json(self) -> dict:
         return {
             "route_id": self.route_id,
@@ -350,6 +385,8 @@ class GlobalRecord:
                     # 早期版本没存 map_key → 用条目自己的(否则切图后会被当成“别的地图”)
                     if not life.map_key:
                         life.map_key = rec.map_key
+                    if life.side not in GLOBAL_SIDES:
+                        life.side = side          # 早期版本没存 side → 用所在组的队号
                     rec.sides[side].append(life)
         _infer_legacy_deaths(rec, data)
         return rec

@@ -52,7 +52,10 @@ COLOR_UNPLAYED = QColor(140, 160, 200, 120)
 # 回放中“这个玩家已经阵亡”的线路: **半透明纯灰**(不带蓝味, 与未播放的底衬区分开)
 COLOR_DEAD_ROUTE = QColor(170, 176, 188, 120)
 # 阵亡位置的红叉: **细而小的两笔**, 平头端点(圆头看起来会发胖/像描边)
-COLOR_DEAD_MARK = QColor("#ff3b30")
+# 颜色按“哪一队录的”区分: A 队 = 蓝(与 8111 的我方蓝一致), B 队 = 红
+COLOR_DEAD_MARK = QColor("#ff3b30")       # 默认/B 队: 红
+COLOR_DEAD_MARK_A = QColor("#174DFF")     # A 队: 蓝
+COLOR_DEAD_MARK_B = COLOR_DEAD_MARK       # B 队: 红(不变)
 DEAD_MARK_HALF = 2.6          # X 的半臂长(px, 不随缩放变)
 DEAD_MARK_PEN = 1.2           # X 的线宽(px)
 COLOR_PLAYER = QColor("#38bdf8")
@@ -1358,9 +1361,14 @@ class RouteMapView(QWidget):
     def dead_mark(self) -> bool:
         return self._dead_mark
 
-    def _draw_dead_mark(self, p: QPainter, rec, head: float) -> None:
-        """阵亡位置的红叉: 画在线路末端(最后一个采样点), 大小与回放光标白点相当。
+    def _dead_mark_color(self, rec) -> QColor:
+        """阵亡标记的颜色: A 队蓝 / B 队红(普通轨迹没有队号 → 红)。"""
+        return COLOR_DEAD_MARK_A if getattr(rec, "side", "") == "A" else COLOR_DEAD_MARK_B
 
+    def _draw_dead_mark(self, p: QPainter, rec, head: float) -> None:
+        """阵亡位置的叉: 画在线路末端(最后一个采样点), 大小与回放光标白点相当。
+
+        颜色按队区分(A 队蓝 / B 队红, 见 `_dead_mark_color`);
         只在“回放已经越过阵亡时刻”后才出现 —— 否则等于提前剧透。
         """
         if not self._dead_mark or not self._dead_now(rec, head):
@@ -1368,7 +1376,7 @@ class RouteMapView(QWidget):
         last = rec.points[-1]
         c = self._to_px(last.x, last.y)
         h = DEAD_MARK_HALF
-        p.setPen(QPen(COLOR_DEAD_MARK, DEAD_MARK_PEN, Qt.PenStyle.SolidLine,
+        p.setPen(QPen(self._dead_mark_color(rec), DEAD_MARK_PEN, Qt.PenStyle.SolidLine,
                       Qt.PenCapStyle.FlatCap))
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawLine(QPointF(c.x() - h, c.y() - h), QPointF(c.x() + h, c.y() + h))
