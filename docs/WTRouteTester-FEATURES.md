@@ -121,9 +121,10 @@ Qt 6 的 `QPainter` 没有 GPU 后端(纯 CPU 光栅), 换成 OpenGL 自绘收�
 
 ### 单位过滤(`wt81111g/global_record.py`)
 
-- 录: `ground_model` 等地面类型 + **微型侦察无人机**(`type`/`icon` 含 uav/drone/scout/recon);
-- 不录: `aircraft` / `helicopter` 等空中单位(侦察无人机除外)、
-  `capture_zone` / `respawn_base_*` / `airfield` / `Airdefence` 等静态对象;
+- 录: `ground_model` 等地面类型(含 AI 地面目标);
+- 不录: `aircraft` / `helicopter` 等**全部空中单位** —— 实测侦察无人机的 `icon` 就是
+  `Fighter`(与固定翼一字不差), 分不开, 只能整体跳过(详见 `docs/8111使用经验.md` §7.9.1);
+- 不录: `capture_zone` / `respawn_base_*` / `airfield` / `Airdefence` 等静态对象;
 - 坐标必须落在 0~1: 空中/无人机视角会带出机场附近 10 个 AI 防空, 坐标 2.9~3.4。
 
 ### 跟踪(8111 没有 id、没有玩家名)
