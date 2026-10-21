@@ -2821,6 +2821,75 @@ def test_zoom_scaled_blit_offset(tmpdir: str):
     results.append("按比例贴旧层不产生偏移(q×scale) OK")
 
 
+def test_playback_zoom_resumes(tmpdir: str):
+    """回放中缩放之后, 必须能自己恢复“继续累加着色段”(不能永久卡在按比例贴的旧图)。
+
+    回归(2026-10-21 用户反馈“播放全局线路时颜色只显示一部分就不显示了, 只有我重新
+    缩放时才显示”): `_note_geom_change()` 每帧都被调用(因为“当前几何 != 建层几何”
+    在重建之前每帧都成立), 它会刷新 `_geom_at` —— 于是 `_geom_settle()` 永远看到
+    “刚刚还在缩放”, 无限推迟重建, 画面停在旧图层上不再长; 而再缩放一次可能触发
+    锚点超余量的立即重建, 于是“一缩放就又有了”。
+    """
+    from PyQt6.QtGui import QWheelEvent
+
+    store = RouteStore(os.path.join(tmpdir, "playzoom.json"))
+    recs = []
+    for k in range(3):
+        rec = store.new_route("AAA", "地图 A", "T", 0.1, 0.2 + k * 0.25)
+        rec.points = [RoutePoint(0.1 + i * 0.045, 0.2 + k * 0.25 + 0.01 * (i % 3),
+                                 i * 2.0, 20.0 + i) for i in range(20)]
+        rec.duration = 38.0
+        recs.append(rec)
+
+    view = RouteMapView()
+    view.resize(700, 500)
+    view.set_map_bytes(png_solid("#202020"))
+    canvas = QImage(700, 500, QImage.Format.Format_ARGB32)
+    view.set_playback(recs, 0.0)
+    view.render(canvas)
+    assert view._play_geom == view._geom_key()
+
+    # 缩放一次 → 进入“按比例贴旧层”
+    pos = QPointF(350.0, 250.0)
+    view.wheelEvent(QWheelEvent(pos, QPointF(pos.x(), pos.y()), QPoint(0, 0),
+                                QPoint(0, 120), Qt.MouseButton.NoButton,
+                                Qt.KeyboardModifier.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False))
+    view.set_playback(recs, 10.0)
+    view.render(canvas)
+    assert view._play_geom != view._geom_key(), "刚缩放完应是按比例贴(还没重建)"
+
+    # 之后回放每帧都会渲染(几何“不再变化”但依旧 != 建层几何):
+    # 必须能在 GEOM_SETTLE_MS 之后重建一次 —— 不能每帧把时间戳顶回去
+    for i in range(8):
+        QTest.qWait(50)
+        view.set_playback(recs, 10.0 + i)
+        view.render(canvas)
+    assert view._play_geom == view._geom_key(), \
+        "缩放停手超过 200ms 必须重建(否则着色段永远停在旧画面上)"
+
+    # 重建之后继续推进 → 已画点数必须继续增长
+    before = sum(view._play_drawn.values())
+    view.set_playback(recs, 20.0)
+    view.render(canvas)
+    assert sum(view._play_drawn.values()) > before, "恢复后着色段应继续累加"
+
+    # 轨迹层同理(p_chart 不在回放时)
+    view.set_playback(None)
+    view.set_visible_tracks(recs)
+    view.render(canvas)
+    pos = QPointF(350.0, 250.0)
+    view.wheelEvent(QWheelEvent(pos, QPointF(pos.x(), pos.y()), QPoint(0, 0),
+                                QPoint(0, 120), Qt.MouseButton.NoButton,
+                                Qt.KeyboardModifier.NoModifier,
+                                Qt.ScrollPhase.NoScrollPhase, False))
+    for _ in range(8):
+        QTest.qWait(50)
+        view.render(canvas)
+    assert view._track_geom == view._geom_key(), "轨迹层同样必须停手后重建"
+    results.append("回放中缩放后自动恢复(延迟重建不会被每帧刷新时间戳顶掉) OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -2858,6 +2927,7 @@ def main() -> int:
     test_map_smooth_zoom(tmpdir)
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)
+    test_playback_zoom_resumes(tmpdir)
     test_map_sharpest(tmpdir)
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)

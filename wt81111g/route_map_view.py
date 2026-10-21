@@ -281,6 +281,7 @@ class RouteMapView(QWidget):
         self._track_margin: tuple[float, float] | None = None
         self._spare_img: QImage | None = None       # 回收的层图像(省掉每次重建 20MB 的分配)
         self._geom_at = 0.0                         # 最后一次几何变化的时刻
+        self._geom_seen: tuple | None = None        # 上一帧看到的几何(避免每帧刷新时间戳)
         self._geom_timer: QTimer | None = None
         self._paint_dpr = 0.0                       # 当前画笔设备的缩放比(建层用)
         self._play_layer: QImage | None = None     # 回放累加层(见 _layer_playback)
@@ -993,7 +994,7 @@ class RouteMapView(QWidget):
                 return None
             return (self._track_layer, (1.0, 1.0))
         if geom != self._track_geom:
-            self._note_geom_change()
+            self._note_geom_change(geom)
             return (self._track_layer, scale)
         return (self._track_layer, (1.0, 1.0))
 
@@ -1006,8 +1007,18 @@ class RouteMapView(QWidget):
         return (now[0] / built[0], now[1] / built[1])
 
     # ------------------------------------------- 缩放/改窗口后的延迟重建
-    def _note_geom_change(self) -> None:
-        """记下“几何刚变过”, 并安排停手后重建(不能在计时中再 start —— 会永远不触发)。"""
+    def _note_geom_change(self, geom: tuple) -> None:
+        """记下“几何这次真的变了”, 并安排停手后重建。
+
+        注意这里必须**只在几何再一次变化时**才刷新时间戳: `_layer_tracks` /
+        `_layer_playback` 是“当前几何 != 建层时几何”就调进来, 而重建之前这个条件
+        **每帧都成立** —— 若每帧都刷新时间戳, `_geom_settle` 就会一直以为“刚刚还在
+        缩放”而无限推迟, 画面便永远卡在按比例贴的旧图上(用户实测: 播放全局线路时
+        着色段画到一半就不再增长, 重新缩放一下才又出现)。2026-10-21。
+        """
+        if geom == self._geom_seen:
+            return                          # 几何没再变 → 不要刷新时间戳
+        self._geom_seen = geom
         self._geom_at = time.monotonic()
         if self._geom_timer is None:
             self._geom_timer = QTimer(self)
@@ -1097,7 +1108,7 @@ class RouteMapView(QWidget):
                 self._play_drawn[rec.route_id], _ = self._played_prefix(rec, self._playhead)
         elif geom != self._play_geom:
             # 只是几何变了 → 旧层按比例顶着(播放中滚轮缩放不再一顿一顿)
-            self._note_geom_change()
+            self._note_geom_change(geom)
             return (self._play_layer, scale)
         mx, my = self._margin()
         p = QPainter(self._play_layer)
