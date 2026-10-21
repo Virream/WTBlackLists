@@ -1,0 +1,14 @@
+# 路线测试器(WTRouteTester)的 GPU 画布依赖 —— **黑名单程序不需要这个文件**。
+#
+# 只装 PyQt6/requests 时一切照常(地图走软件渲染);
+# 想要 GPU 画布再装这一份:
+#     pip install -r requirements-gl.txt
+#
+# 注意: pygfx 还是 0.x、API 会变, 所以**锁版本**; 升级前先跑
+#     python tools/route_map_gl_demo.py
+# 看效果, 再跑一遍 tests\route_tester_test.py。
+#
+# 另外 Python 3.14 的 numpy 轮子在清华镜像上可能还没同步, 装不上时改用官方源:
+#     pip install -i https://pypi.org/simple pygfx
+-r requirements.txt
+pygfx==0.17.0
