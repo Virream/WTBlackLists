@@ -245,7 +245,10 @@ class RouteMapGlView(RouteMapView):
         self._offscreen = offscreen
         self._gl_pixels: dict = {}
         self._gl_objs: list = []
+        self._gl_icons: list = []       # 图标类对象(尺寸按屏幕像素算 → 缩放时要重算)
+        self._icon_mode = False
         self._gl_key: tuple | None = None
+        self._gl_geom: tuple | None = None
         self._gl_tracks: list[_Track] = []
         self._gl_anim = 0.0
         self._fps_n = 0
@@ -410,8 +413,22 @@ class RouteMapGlView(RouteMapView):
         for obj in self._gl_objs:
             obj.remove()
         self._gl_objs = []
+        self._gl_icons = []
         self._gl_tracks = []
         self._hover_obj = None
+        self._gl_hover_box = None
+        self._gl_hover_px = None
+
+    def _clear_icons(self) -> None:
+        """只删图标类对象(轨迹保留) —— 缩放时走这条路。"""
+        for obj in self._gl_icons:
+            obj.remove()
+        icons = {id(o) for o in self._gl_icons}
+        self._gl_objs = [o for o in self._gl_objs if id(o) not in icons]
+        self._gl_icons = []
+        self._hover_obj = None
+        self._gl_hover_box = None
+        self._gl_hover_px = None
 
     def _add(self, obj, order: float = 0.0):
         """加入场景, 并把整个场景统一成“画家算法”的 2D 叠加。
@@ -435,13 +452,46 @@ class RouteMapGlView(RouteMapView):
         obj.render_order = order
         self._scene.add(obj)
         self._gl_objs.append(obj)
+        if self._icon_mode:
+            self._gl_icons.append(obj)
         return obj
+
+    def _rebuild_icons(self) -> None:
+        """重建所有**图标**图层(战区/重生方块/标记/标签/阵亡叉/玩家/光标/悬停)。
+
+        图标在软件版里全是用**固定像素**画的(`ZONE_RADIUS=8`、`SPAWN_HALF=3.4`
+        等常量注释都写明“px, 不随缩放变”), 而 GPU 版要把像素换算成归一化尺寸
+        (÷ 地图显示宽高) —— 所以一旦缩放/改窗口, 这些几何就必须重算, 否则
+        图标会跟着地图一起放大缩小(用户 2026-10-22 指出)。
+        轨迹本身是归一化坐标 + `thickness_space="screen"`, 不需要重建。
+        """
+        self._clear_icons()
+        self._icon_mode = True
+        try:
+            self._build_spawns()
+            self._build_zones()
+            self._build_marks()
+            self._build_dead_marks()
+            self._build_player()
+            self._build_cursor()
+            self._build_border()
+            self._build_hover()
+            self._build_status()
+        finally:
+            self._icon_mode = False
 
     def _sync_objects(self) -> None:
         key = self._content_key()
+        geom = self._geom_key()
         if key != self._gl_key:
             self._gl_key = key
+            self._gl_geom = geom
             self._rebuild_objects()
+        elif geom != self._gl_geom:
+            # 只缩放了/改了窗口: 轨迹几何不用动(归一化 + 屏幕线宽),
+            # 但图标的像素尺寸要按新的地图尺寸重算
+            self._gl_geom = geom
+            self._rebuild_icons()
         elif getattr(self, "_gl_tracks", None):
             self._extend_tracks()          # 录制中点涨了 → 只补新段
         self._apply_progress()
@@ -462,21 +512,14 @@ class RouteMapGlView(RouteMapView):
                 self._make_track(rec, colored=True, under=False)
             if self._live is not None:
                 self._make_track(self._live, colored=True, under=False)
-        # 3) 全局录制中“边录边画”的线路: 始终画
+        # 3) 全局录制中“边录边画”的线路: 始终画(软件版画在轨迹层**之上**)
         for rec in self._live_multi:
-            self._make_track(rec, colored=True, under=False)
-        # 4) 重生方块 / 战区 / 起终点标记 / 阵亡叉 / 玩家 / 光标
-        self._build_spawns()
-        self._build_zones()
-        self._build_marks()
-        self._build_dead_marks()
-        self._build_player()
-        self._build_cursor()
-        self._build_border()
-        self._build_hover()
-        self._build_status()
+            self._make_track(rec, colored=True, under=False, order=O_TRACK + 1)
+        # 4) 图标层(尺寸按屏幕像素 → 与缩放相关, 单独可重建)
+        self._rebuild_icons()
 
-    def _make_track(self, rec, *, colored: bool, under: bool) -> None:
+    def _make_track(self, rec, *, colored: bool, under: bool,
+                    order: float = O_TRACK) -> None:
         pts = getattr(rec, "points", None)
         if not pts or len(pts) < 2:
             return
@@ -651,6 +694,7 @@ class RouteMapGlView(RouteMapView):
         """
         self._gl_marks = None
         self._gl_mark_info = []
+        self._gl_label_edges = []
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
@@ -713,6 +757,9 @@ class RouteMapGlView(RouteMapView):
 
         与软件版 `_draw_time_label` 同几何: 框在圆环右侧(距中心 11px), 高 16px,
         文字左对齐、垂直居中。宽度用 Consolas 10pt 的近似字宽估(数字等宽)。
+
+        边框颜色会被存进 `_gl_label_edges`, 由 `_apply_anim` 按回放进度淡化 ——
+        软件版是把**已淡化**的 color 直接传给 `_draw_time_label` 当边框色的。
         """
         text = rmv.fmt_time(t)
         tw = 6.3 * len(text)
@@ -735,10 +782,11 @@ class RouteMapGlView(RouteMapView):
         segs = np.empty((8, 3), dtype=np.float32)
         segs[0::2] = edge[:-1]
         segs[1::2] = edge[1:]
-        self._add(gfx.Line(
+        edge_obj = self._add(gfx.Line(
             gfx.Geometry(positions=segs),
             gfx.LineSegmentMaterial(thickness=1.0, thickness_space="screen",
                                     color=_rgba(color), alpha_mode="blend")), O_LABEL_EDGE)
+        self._gl_label_edges.append((t, edge_obj, color))
         t_obj = self._add(gfx.Text(
             text=text, font_size=10, screen_space=True, family="Consolas",
             anchor="middle-center",
@@ -865,8 +913,14 @@ class RouteMapGlView(RouteMapView):
 
         对应软件版的 `_draw_hover_mark`(深色 4.0px 底环 + 白色 1.8px 环, 半径 5)
         与 `_draw_hover`(左下角 alpha=215 的深色框, 内边距 7/4)。
+
+        浮层在软件版里是用**控件坐标**画的(左下角), 而这里场景是地图世界坐标 ——
+        所以要记下像素位置和世界尺寸, 由 `_apply_anim` 每帧按当前平移换算
+        (平移不在重建指纹里, 否则拖动地图后浮层会跟着地图跑)。
         """
         self._hover_obj = None
+        self._gl_hover_box = None
+        self._gl_hover_px = None
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
@@ -908,6 +962,8 @@ class RouteMapGlView(RouteMapView):
             gfx.MeshBasicMaterial(color=_rgba(QColor(15, 23, 42, 215)), side="both")),
             O_HOVER_BOX)
         box.local.position = (nx + w / 2.0, ny - h / 2.0, z)
+        self._gl_hover_box = box
+        self._gl_hover_px = (x, y, w, h)
         # 软件版: 文字左对齐、垂直居中, 内边距左 7 / 上 4;
         # 行高要与 QFontMetrics.height() 一致(9pt ≈ 17px), pygfx 默认 1.2×字号 只有 10.8px
         self._hover_obj = self._add(gfx.Text(
@@ -969,6 +1025,17 @@ class RouteMapGlView(RouteMapView):
                 arr[v0:v1] = (rgba[0], rgba[1], rgba[2], a)
             self._mark_line.geometry.colors.update_full()
 
+        # 时间标签的**边框**也跟着淡化(软件版把已淡化的 color 传给 _draw_time_label)。
+        # 只有回放模式才淡化 —— 普通显示时 `_playhead` 是 0, 不能让所有标签变淡。
+        playing = bool(self._playback_recs)
+        for t, edge_obj, color in getattr(self, "_gl_label_edges", ()):
+            if playing and t > self._playhead:
+                c = QColor(color)
+                c.setAlpha(80)
+                edge_obj.material.color = _rgba(c)
+            else:
+                edge_obj.material.color = _rgba(color)
+
         # 阵亡叉: 只在“回放已经越过阵亡时刻”后显示(软件版逐帧判 _dead_now)
         if getattr(self, "_gl_dead", None) is not None and self._gl_dead_info:
             arr = self._gl_dead.geometry.colors.data
@@ -988,6 +1055,20 @@ class RouteMapGlView(RouteMapView):
                 k = rmv.BLINK_DIM + (1.0 - rmv.BLINK_DIM) * bv
                 c = rmv._blend(rmv.ZONE_DARK, (color.red(), color.green(), color.blue()), k)
                 fill.material.color = (c.redF(), c.greenF(), c.blueF(), 1.0)
+
+        # 悬停浮层: 软件版是“控件左下角固定位置”, 而这里是世界坐标 ——
+        # 平移/缩放后必须重算, 否则浮层会跟着地图跑(用户拖动地图就会看出来)。
+        if getattr(self, "_gl_hover_box", None) is not None and self._gl_hover_px:
+            dw, dh = self._map_size()
+            r = self._map_rect()
+            if dw > 0 and dh > 0:
+                px, py, w, h = self._gl_hover_px
+                nx = (px - r.left()) / dw
+                ny = 1.0 - (py - r.top()) / dh
+                self._gl_hover_box.local.position = (nx + w / 2.0, ny - h / 2.0, Z_PLAYER + 0.008)
+                if self._hover_obj is not None:
+                    self._hover_obj.local.position = (nx + 7.0 / dw, ny - 4.0 / dh,
+                                                      Z_PLAYER + 0.010)
 
         if getattr(self, "_gl_player", None) is not None and self._player is not None:
             x, y = self._player[0], 1.0 - self._player[1]
@@ -1034,8 +1115,8 @@ class RouteMapGlView(RouteMapView):
             far = -1.0e6
             for i, rec in enumerate(self._playback_recs):
                 cur = rmv.point_at(rec.points, self._playhead) if rec.points else None
-                visible = cur is not None and not (
-                    self._dead_mark and self._dead_now(rec, self._playhead))
+                # 软件版: `if not self._dead_now(rec, head)` —— 与“画红叉”开关无关
+                visible = cur is not None and not self._dead_now(rec, self._playhead)
                 if not visible or not dw or not dh:
                     parr[i] = (far, far, 0.0)
                     if darr is not None:
