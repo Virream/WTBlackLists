@@ -1,4 +1,4 @@
-# 打包"跑图线路测试器"为 exe(独立程序, 与黑名单助手互不影响)
+﻿# 打包"跑图线路测试器"为 exe(独立程序, 与黑名单助手互不影响)
 #
 #   .\build_route_tester.ps1              # ★默认: 只打 onedir 目录版(启动快, 推荐)
 #   .\build_route_tester.ps1 -OneFile     # 仅"需要多版本分发"时才用(额外产出单文件版, 耗时约翻倍)
@@ -29,7 +29,17 @@ $dataBak = Join-Path $root "dist\_data_backup"
 if (Test-Path $dataDir) {
     Write-Host "== 0/3 暂存用户数据(routes.json / maps\ 缓存) =="
     Remove-Item $dataBak -Recurse -Force -ErrorAction SilentlyContinue
-    Move-Item $dataDir $dataBak -Force
+    try {
+        Move-Item $dataDir $dataBak -Force -ErrorAction Stop
+    } catch {
+        # 目录被占用时**绝不能继续** —— PyInstaller 会连 data\ 一起删掉
+        Write-Host ""
+        Write-Host "!! 无法暂存 data\ —— 有程序占用着它, 打包已中止(数据未动)。" -ForegroundColor Red
+        Write-Host "   常见原因: ① 跑图线路测试器还开着; ② 某个资源管理器窗口正停在 data\ 里" -ForegroundColor Yellow
+        Write-Host "   (程序的「地图 → 打开地图缓存文件夹」会开在那里)。" -ForegroundColor Yellow
+        Write-Host "   关掉它们后重跑本脚本即可。" -ForegroundColor Yellow
+        exit 1
+    }
 }
 
 Write-Host "== 1/3 打包 onedir(启动更快) =="
