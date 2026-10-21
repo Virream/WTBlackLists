@@ -142,18 +142,60 @@ def _pos3(xy: np.ndarray, z: float) -> np.ndarray:
     return out
 
 
+def _fill_segs(dst: np.ndarray, xy: np.ndarray, dst_seg: int, count: int, z: float) -> None:
+    """把 xy[0..count] 的相邻点写成“段对”, 写入 dst 里从第 dst_seg 段开始。
+
+    `LineSegmentMaterial` 要的是 **(2N,3) 成对顶点**, 不是 strip。用段对而不是 strip
+    是必需的选择: strip 的厚线会给每个拐点生成 miter 接头, 而接头长度 = 线宽/sin(θ/2),
+    录制时车停着不动、相邻采样点几乎重合(θ接近180°) → 接头长度爆炸, 画面上每个
+    采样点都会刺出一根白线(用户 2026-10-21 截图)。段与段独立就没有接头。
+    """
+    if count <= 0:
+        return
+    i = 2 * dst_seg
+    j = i + 2 * count
+    dst[i:j:2, 0] = xy[:count, 0]
+    dst[i:j:2, 1] = xy[:count, 1]
+    dst[i + 1:j:2, 0] = xy[1:count + 1, 0]
+    dst[i + 1:j:2, 1] = xy[1:count + 1, 1]
+    dst[i:j, 2] = z
+
+
+def _seg_colors(pts, i0: int, i1: int, vmax: float) -> np.ndarray:
+    """第 [i0, i1) 段的颜色(按段中点速度), 返回 (2*(i1-i0), 4)。"""
+    out = np.empty((2 * (i1 - i0), 4), dtype=np.float32)
+    cache: dict[int, tuple] = {}
+    for j, i in enumerate(range(i0, i1)):
+        a, b = pts[i], pts[i + 1]
+        k = bucket_index((a.speed + b.speed) * 0.5, vmax)
+        c = cache.get(k)
+        if c is None:
+            c = _rgba(speed_color((k + 0.5) / 24 * vmax, vmax))
+            cache[k] = c
+        out[2 * j] = c
+        out[2 * j + 1] = c
+    return out
+
+
 class _Track:
-    """一条线路的 GPU 对象: 单色底衬(可选) + 速度配色线。"""
+    """一条线路的 GPU 对象(段对几何) + 已填段数。
 
-    __slots__ = ("rec", "pos", "colors", "vmax", "under", "play", "drawn", "dead")
+    容量(`cap`)预留一段余量: 录制时点数一直在涨, 有了预留就能只写新段 +
+    `update_range`, 不必每帧重建整个几何(重建 64 条线路实测 150 ms 级)。
+    """
 
-    def __init__(self, rec, pos, colors, vmax, under, play) -> None:
+    __slots__ = ("rec", "pos", "colors", "vmax", "under", "play", "nseg", "cap",
+                 "drawn", "dead")
+
+    def __init__(self, rec, pos, colors, vmax, under, play, nseg, cap) -> None:
         self.rec = rec
         self.pos = pos
         self.colors = colors
         self.vmax = vmax
         self.under = under
         self.play = play
+        self.nseg = nseg
+        self.cap = cap
         self.drawn = 0
         self.dead = False
 
@@ -192,6 +234,11 @@ class RouteMapGlView(RouteMapView):
                 sub.installEventFilter(self)
 
         self._renderer = gfx.WgpuRenderer(self._canvas)
+        # 关掉默认的 2x 超采样(SSAA): `thickness_space="screen"` 的线宽按**内部像素**
+        # 算, 开着 SSAA 时内部是逻辑尺寸的 2 倍, 于是 2.6 px 的线看起来只有 1.3 px
+        # (实测对比图里 GPU 的线与阵亡叉都比软件版细一半)。关掉后线宽准确,
+        # 每帧像素量也降到 1/4。线本身的抗锯齿用 `aa=True` 就够。
+        self._renderer.pixel_scale = 1
         self._scene = gfx.Scene()
         self._scene.add(gfx.Background(None, gfx.BackgroundMaterial(BG_COLOR)))
         self._camera = gfx.OrthographicCamera(1, 1, maintain_aspect=True)
@@ -260,9 +307,15 @@ class RouteMapGlView(RouteMapView):
 
     # -------------------------------------------------------- 相机
     def _sync_camera(self) -> None:
+        """把 zoom/pan 换算成相机的可见矩形(归一化地图坐标, y 朝上)。
+
+        **必须用控件尺寸**(`self.width()/height()`), 不能用 canvas 的逻辑尺寸:
+        父类 `_map_rect()` / `map_pos()` 都是按控件尺寸算的, 两边不一致就会错位
+        (实测: 离屏画布 1400x900 + 控件 640x480 时画面整体偏移)。
+        """
         r = self._map_rect()
         dw, dh = self._map_size()
-        w, h = self._canvas.get_logical_size()
+        w, h = float(self.width()), float(self.height())
         if dw <= 0 or dh <= 0 or w <= 0 or h <= 0:
             return
         self._camera.show_rect(-r.left() / dw, (w - r.left()) / dw,
@@ -300,7 +353,7 @@ class RouteMapGlView(RouteMapView):
         """决定要不要**重建 GPU 对象**的指纹(进度/闪烁不在内, 那些每帧只改颜色)。"""
 
         def sig(recs) -> tuple:
-            return tuple((getattr(r, "route_id", id(r)), len(r.points)) for r in recs)
+            return tuple(getattr(r, "route_id", id(r)) for r in recs)
 
         live = self._live
         zones = ()
@@ -308,7 +361,7 @@ class RouteMapGlView(RouteMapView):
             zones = tuple((z.get("label"), z.get("side"), round(float(z.get("x", 0)), 6),
                            round(float(z.get("y", 0)), 6)) for z in self._zones)
         return (sig(self._visible), sig(self._highlight),
-                (getattr(live, "route_id", ""), len(live.points)) if live else None,
+                getattr(live, "route_id", "") if live else None,
                 sig(self._live_multi), sig(self._playback_recs),
                 self._show_zones, zones, self._show_spawns, self._spawns_ver,
                 self._map_digest)
@@ -330,6 +383,8 @@ class RouteMapGlView(RouteMapView):
         if key != self._gl_key:
             self._gl_key = key
             self._rebuild_objects()
+        elif getattr(self, "_gl_tracks", None):
+            self._extend_tracks()          # 录制中点涨了 → 只补新段
         self._apply_progress()
         self._apply_anim()
 
@@ -357,6 +412,7 @@ class RouteMapGlView(RouteMapView):
         self._build_dead_marks()
         self._build_player()
         self._build_cursor()
+        self._build_border()
         self._build_hover()
 
     def _make_track(self, rec, *, colored: bool, under: bool) -> None:
@@ -364,39 +420,82 @@ class RouteMapGlView(RouteMapView):
         if not pts or len(pts) < 2:
             return
         n = len(pts)
-        pos = np.empty((n, 3), dtype=np.float32)
-        pos[:, 0] = [p.x for p in pts]
-        pos[:, 1] = [1.0 - p.y for p in pts]
-        pos[:, 2] = Z_TRACK if not under else Z_PLAY
+        segs = n - 1
+        cap = segs + max(64, segs // 4)          # 预留容量(增量录制用)
+        xy = np.empty((n, 2), dtype=np.float32)
+        xy[:, 0] = [p.x for p in pts]
+        xy[:, 1] = [1.0 - p.y for p in pts]
+        z = Z_PLAY if under else Z_TRACK
+        pos = np.empty((cap * 2, 3), dtype=np.float32)
+        _fill_segs(pos, xy, 0, segs, z)
+        pos[segs * 2:] = (xy[-1, 0], xy[-1, 1], z)   # 未用段: 零长, 不会画出来
         if not colored:
             line = self._add(gfx.Line(
                 gfx.Geometry(positions=pos),
-                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
-                                 color=_rgba(rmv.COLOR_HISTORY))))
-            self._gl_tracks.append(_Track(rec, pos, None, 0.0, line, None))
+                gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
+                                        color=_rgba(rmv.COLOR_HISTORY))))
+            self._gl_tracks.append(_Track(rec, pos, None, 0.0, line, None, segs, cap))
             return
         vmax = self._vmax(rec)
-        colors = np.empty((n, 4), dtype=np.float32)
-        cache: dict[int, tuple] = {}
-        for i, p in enumerate(pts):
-            k = bucket_index(p.speed, vmax)
-            c = cache.get(k)
-            if c is None:
-                c = _rgba(speed_color((k + 0.5) / 24 * vmax, vmax))
-                cache[k] = c
-            colors[i] = c
+        colors = np.zeros((cap * 2, 4), dtype=np.float32)
+        colors[:segs * 2] = _seg_colors(pts, 0, segs, vmax)
         under_obj = None
         if under:
             under_obj = self._add(gfx.Line(
-                gfx.Geometry(positions=_pos3(pos[:, :2], Z_UNDER)),
-                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
-                                 color=_rgba(rmv.COLOR_UNPLAYED)),
+                gfx.Geometry(positions=pos),
+                gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
+                                        color=_rgba(rmv.COLOR_UNPLAYED)),
                 render_order=-1))
         play = self._add(gfx.Line(
-            gfx.Geometry(positions=pos, colors=np.zeros_like(colors)),
-            gfx.LineMaterial(thickness=rmv.PLAY_PEN, thickness_space="screen",
-                             color_mode="vertex", aa=True)))
-        self._gl_tracks.append(_Track(rec, pos, colors, vmax, under_obj, play))
+            # 回放(under=True)的“已播放”从空开始, 由进度逐段填色;
+            # 录制/预览的线路本身就整条可见, 直接带着颜色开始
+            gfx.Geometry(positions=pos,
+                         colors=np.zeros_like(colors) if under else colors.copy()),
+            gfx.LineSegmentMaterial(thickness=rmv.PLAY_PEN, thickness_space="screen",
+                                    color_mode="vertex", aa=True,
+                                    # 必须显式 blend: 顶点 alpha=1 时 auto 会判成 solid,
+                                    # 而半透明的底衬属于 blend 队列 —— pygfx 先画 solid
+                                    # 再画 blend, 底衬就会把彩线整个盖掉(实测画面只剩
+                                    # 蓝灰底衬色)。同类之后才能靠 render_order/z 排序。
+                                    alpha_mode="blend"),
+            render_order=1))
+        self._gl_tracks.append(_Track(rec, pos, colors, vmax, under_obj, play, segs, cap))
+
+    def _extend_tracks(self) -> None:
+        """录制中点数在涨 → 只把**新段**写进去并 update_range(不重建几何)。
+
+        容量不够或速度基准涨太多(颜色桶全变)时把 `_gl_key` 置空, 下一帧整层重建。
+        """
+        for tr in self._gl_tracks:
+            pts = tr.rec.points
+            n = len(pts)
+            if n < 2:
+                continue
+            if abs(self._vmax(tr.rec) - tr.vmax) > rmv.VMAX_REBUILD_RATIO * max(tr.vmax, 1e-6):
+                self._gl_key = None       # 基准变了, 颜色全要重算
+                return
+            segs = n - 1
+            if segs <= tr.nseg:
+                continue
+            if segs > tr.cap:
+                self._gl_key = None
+                return
+            i0, i1 = tr.nseg, segs
+            xy = np.empty(((i1 - i0) + 1, 2), dtype=np.float32)
+            for j, i in enumerate(range(i0, i1 + 1)):
+                p = pts[i]
+                xy[j, 0] = p.x
+                xy[j, 1] = 1.0 - p.y
+            _fill_segs(tr.pos, xy, i0, i1 - i0, tr.pos[0, 2])
+            tr.play.geometry.positions.update_range(2 * i0, 2 * (i1 - i0))
+            if tr.colors is not None:
+                cols = _seg_colors(pts, i0, i1, tr.vmax)
+                tr.colors[2 * i0:2 * i1] = cols
+                if tr.under is None and not tr.dead:
+                    tr.play.geometry.colors.data[2 * i0:2 * i1] = cols
+                    tr.play.geometry.colors.update_range(2 * i0, 2 * (i1 - i0))
+                    tr.drawn = max(tr.drawn, i1)
+            tr.nseg = i1
 
     # ---------------------------------------------------- 图元: 重生/战区/叉
     def _build_spawns(self) -> None:
@@ -488,7 +587,7 @@ class RouteMapGlView(RouteMapView):
         self._add(gfx.Line(
             gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
                          colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
-            gfx.LineSegmentMaterial(thickness=rmv.DEAD_MARK_PEN + 1.0,
+            gfx.LineSegmentMaterial(thickness=rmv.DEAD_MARK_PEN,
                                     thickness_space="screen", color_mode="vertex"),
             render_order=2))
 
@@ -501,23 +600,75 @@ class RouteMapGlView(RouteMapView):
         pts.geometry.positions.data[0] = (0.0, 0.0, 0.0)
         return pts
 
+    @staticmethod
+    def _ring(x: float, y: float, rx: float, ry: float, z: float,
+              seg: int = 16) -> np.ndarray:
+        """圆环折线顶点(闭合)。"""
+        a = np.linspace(0.0, 2.0 * math.pi, seg + 1, dtype=np.float32)
+        out = np.empty((seg + 1, 3), dtype=np.float32)
+        out[:, 0] = x + np.cos(a) * rx
+        out[:, 1] = y + np.sin(a) * ry
+        out[:, 2] = z
+        return out
+
     def _build_player(self) -> None:
-        self._gl_player = None
-        self._gl_player_dir = None
+        """玩家标记: 空心圈(半透明蓝) + 实心点 + **蓝色 ^**(带深色垫底), 与软件版一致。"""
+        self._gl_player = self._gl_player_ring = None
+        self._gl_player_dir = self._gl_player_dir_dark = None
         if self._player is None:
             return
-        self._gl_player = self._add(self._dot(rmv.COLOR_PLAYER, rmv.PLAYER_DOT_R * 1.6))
-        self._gl_player.local.position = (self._player[0], 1.0 - self._player[1], Z_PLAYER)
+        dw, dh = self._map_size()
+        if dw <= 0 or dh <= 0:
+            return
+        x, y = self._player[0], 1.0 - self._player[1]
+        self._gl_player_ring = self._add(gfx.Line(
+            gfx.Geometry(positions=self._ring(x, y, rmv.PLAYER_RING_R / dw,
+                                              rmv.PLAYER_RING_R / dh, Z_PLAYER)),
+            gfx.LineMaterial(thickness=1.0, thickness_space="screen",
+                             color=_rgba(QColor(56, 189, 248, 90)))))
+        self._gl_player = self._add(self._dot(rmv.COLOR_PLAYER, rmv.PLAYER_DOT_R))
+        self._gl_player.local.position = (x, y, Z_PLAYER)
+        # ^ 是两条线段(4 个顶点): 深色垫底 + 蓝色
+        self._gl_player_dir_dark = self._add(gfx.Line(
+            gfx.Geometry(positions=np.zeros((4, 3), dtype=np.float32)),
+            gfx.LineSegmentMaterial(thickness=4.0, thickness_space="screen",
+                                    color=_rgba(QColor(15, 23, 42, 220)))))
         self._gl_player_dir = self._add(gfx.Line(
-            gfx.Geometry(positions=np.zeros((2, 3), dtype=np.float32)),
-            gfx.LineMaterial(thickness=2.0, thickness_space="screen",
-                             color=_rgba(PLAYER_DIR_COLOR))))
+            gfx.Geometry(positions=np.zeros((4, 3), dtype=np.float32)),
+            gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
+                                    color=_rgba(rmv.COLOR_PLAYER))))
 
     def _build_cursor(self) -> None:
-        self._gl_cursor = None
-        if not self._playback_recs:
+        """回放光标: 每条线路一个白点 + 白色朝向线(带深色垫底), 与软件版一致。"""
+        self._gl_cursor = self._gl_cursor_dir = self._gl_cursor_dir_dark = None
+        n = len(self._playback_recs)
+        if not n:
             return
-        self._gl_cursor = self._add(self._dot(QColor("#f8fafc"), CURSOR_DOT_R))
+        self._gl_cursor = self._add(gfx.Points(
+            gfx.Geometry(positions=np.zeros((n, 3), dtype=np.float32)),
+            gfx.PointsMaterial(size=CURSOR_DOT_R * 2.0, size_space="screen",
+                               color=_rgba(QColor("#f8fafc")))))
+        self._gl_cursor_dir_dark = self._add(gfx.Line(
+            gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
+            gfx.LineSegmentMaterial(thickness=4.2, thickness_space="screen",
+                                    color=_rgba(QColor(15, 23, 42, 210))),
+            render_order=3))
+        self._gl_cursor_dir = self._add(gfx.Line(
+            gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
+            gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
+                                    color=_rgba(rmv.COLOR_DIR_LINE)),
+            render_order=4))
+
+    def _build_border(self) -> None:
+        """地图边框(与软件版 `_draw_base` 末尾那条细框一致)。"""
+        xy = np.array([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (0.0, 0.0)],
+                      dtype=np.float32)
+        pos = np.empty((len(xy), 3), dtype=np.float32)
+        pos[:, :2] = xy
+        pos[:, 2] = Z_MAP + 0.001
+        self._add(gfx.Line(gfx.Geometry(positions=pos),
+                           gfx.LineMaterial(thickness=1.0, thickness_space="screen",
+                                            color=_rgba(rmv.COLOR_GRID))))
 
     def _build_hover(self) -> None:
         self._hover_obj = None
@@ -558,12 +709,13 @@ class RouteMapGlView(RouteMapView):
                     tr.drawn = 0
                 continue
             if id(tr.rec) in playing:
-                k = _bisect_time(pts, head)
-                if k > tr.drawn:
+                kseg = max(0, _bisect_time(pts, head) - 1)
+                if kseg > tr.drawn:
                     arr = tr.play.geometry.colors.data
-                    arr[tr.drawn:k] = tr.colors[tr.drawn:k]
-                    tr.play.geometry.colors.update_range(tr.drawn, k - tr.drawn)
-                    tr.drawn = k
+                    arr[2 * tr.drawn:2 * kseg] = tr.colors[2 * tr.drawn:2 * kseg]
+                    tr.play.geometry.colors.update_range(2 * tr.drawn,
+                                                        2 * (kseg - tr.drawn))
+                    tr.drawn = kseg
 
     def _apply_anim(self) -> None:
         """闪烁 / 玩家位置 / 回放光标(每帧都变, 但都只改 uniform 或几个点)。"""
@@ -583,31 +735,83 @@ class RouteMapGlView(RouteMapView):
         if getattr(self, "_gl_player", None) is not None and self._player is not None:
             x, y = self._player[0], 1.0 - self._player[1]
             self._gl_player.local.position = (x, y, Z_PLAYER)
-            line = getattr(self, "_gl_player_dir", None)
+            dw, dh = self._map_size()
+            if getattr(self, "_gl_player_ring", None) is not None and dw > 0 and dh > 0:
+                self._gl_player_ring.geometry.positions.data[:] = self._ring(
+                    x, y, rmv.PLAYER_RING_R / dw, rmv.PLAYER_RING_R / dh, Z_PLAYER)
+                self._gl_player_ring.geometry.positions.update_full()
             ang = self._dir_angle(*self._player_dir) if self._player_dir else None
-            if line is not None:
-                if ang is None:
-                    line.visible = False
-                else:
+            dirs = [getattr(self, "_gl_player_dir_dark", None),
+                    getattr(self, "_gl_player_dir", None)]
+            if ang is None or not dw or not dh:
+                for line in dirs:
+                    if line is not None:
+                        line.visible = False
+            else:
+                # ^ 的几何与软件版 `player_dir_points` 一致: 尖点在前, 两只脚在后
+                ca, sa = math.cos(ang), math.sin(ang)
+
+                def pt(fwd: float, lat: float) -> tuple[float, float, float]:
+                    dx_px = fwd * ca - lat * sa
+                    dy_px = fwd * sa + lat * ca
+                    return (x + dx_px / dw, y - dy_px / dh, Z_PLAYER)
+
+                tip = pt(rmv.PLAYER_DIR_BACK + rmv.PLAYER_DIR_H, 0.0)
+                f1 = pt(rmv.PLAYER_DIR_BACK, -rmv.PLAYER_DIR_W)
+                f2 = pt(rmv.PLAYER_DIR_BACK, rmv.PLAYER_DIR_W)
+                for line in dirs:
+                    if line is None:
+                        continue
                     line.visible = True
-                    dw, dh = self._map_size()
-                    ca, sa = math.cos(ang), math.sin(ang)
-                    # 长度是像素量, 换算成归一化单位(x/y 分别除, 角度已在像素空间算好)
-                    ln = (rmv.PLAYER_DIR_BACK + rmv.PLAYER_DIR_H)
-                    tip_x = x + ln * ca / dw if dw else x
-                    tip_y = y + ln * sa / dh if dh else y
                     arr = line.geometry.positions.data
-                    arr[0] = (x, y, Z_PLAYER)
-                    arr[1] = (tip_x, tip_y, Z_PLAYER)
+                    arr[0], arr[1] = tip, f1
+                    arr[2], arr[3] = tip, f2
                     line.geometry.positions.update_full()
 
         if getattr(self, "_gl_cursor", None) is not None and self._playback_recs:
-            pt = _point_at(self._playback_recs[0].points, self._playhead)
-            if pt is None:
-                self._gl_cursor.visible = False
-            else:
-                self._gl_cursor.visible = True
-                self._gl_cursor.local.position = (pt.x, 1.0 - pt.y, Z_PLAYER)
+            dw, dh = self._map_size()
+            parr = self._gl_cursor.geometry.positions.data
+            darr = self._gl_cursor_dir.geometry.positions.data if self._gl_cursor_dir else None
+            ddarr = (self._gl_cursor_dir_dark.geometry.positions.data
+                     if self._gl_cursor_dir_dark else None)
+            far = -1.0e6
+            for i, rec in enumerate(self._playback_recs):
+                cur = rmv.point_at(rec.points, self._playhead) if rec.points else None
+                visible = cur is not None and not (
+                    self._dead_mark and self._dead_now(rec, self._playhead))
+                if not visible or not dw or not dh:
+                    parr[i] = (far, far, 0.0)
+                    if darr is not None:
+                        darr[2 * i] = darr[2 * i + 1] = (far, far, 0.0)
+                    if ddarr is not None:
+                        ddarr[2 * i] = ddarr[2 * i + 1] = (far, far, 0.0)
+                    continue
+                x, y = cur.x, 1.0 - cur.y
+                if not np.isfinite(x) or not np.isfinite(y):
+                    x = y = far
+                parr[i] = (x, y, Z_PLAYER)
+                ang = self._dir_angle(cur.dx, cur.dy)
+                if ang is None:
+                    if darr is not None:
+                        darr[2 * i] = darr[2 * i + 1] = (far, far, 0.0)
+                    if ddarr is not None:
+                        ddarr[2 * i] = ddarr[2 * i + 1] = (far, far, 0.0)
+                    continue
+                ca, sa = math.cos(ang), math.sin(ang)
+                inset = (4.2 - 2.0) / 2.0
+                # 深色垫底两端各内缩半个描边宽(否则线头会露出黑头, 与白点接不上)
+                for arr, shrink in ((ddarr, inset), (darr, 0.0)):
+                    if arr is None:
+                        continue
+                    b0 = rmv.CURSOR_DIR_BACK + shrink
+                    b1 = rmv.CURSOR_DIR_BACK + rmv.CURSOR_DIR_LEN - shrink
+                    arr[2 * i] = (x + b0 * ca / dw, y - b0 * sa / dh, Z_PLAYER)
+                    arr[2 * i + 1] = (x + b1 * ca / dw, y - b1 * sa / dh, Z_PLAYER)
+            self._gl_cursor.geometry.positions.update_full()
+            if self._gl_cursor_dir is not None:
+                self._gl_cursor_dir.geometry.positions.update_full()
+            if self._gl_cursor_dir_dark is not None:
+                self._gl_cursor_dir_dark.geometry.positions.update_full()
 
         # 悬停浮层文本(内容随鼠标变, 就地改 Text 即可, 不必重建对象)
         if self._hover_text != getattr(self, "_gl_hover_text", None):
