@@ -92,6 +92,10 @@ HOVER_RADIUS = 18.0
 # 缓存层四周多画的反向余量(占控件尺寸比例): 拖动地图时靠偏移贴图复用整层,
 # 超出余量才重建(见 _layer_tracks / _layer_stale)
 LAYER_MARGIN = 0.35
+# 缩放/改窗口后“先用旧层按比例顶着, 停手这么久再重建一次变清晰”的延迟(毫秒)。
+# 重建一次实测 20~50ms(1920×1040, 20 条线 1.7 万点), 滚轮连发时每格都重建就是
+# “缩放卡”的唯一原因; 按比例贴一次只要 1~2ms(2026-10-21)。
+GEOM_SETTLE_MS = 200
 # 轨迹线宽(px): 归一化几何 + 缩放画笔, 实际线宽 = 它们(见 _draw_route)
 TRACK_PEN = 2.4          # 选中的/正在录的(速度配色)
 PLAY_PEN = 2.6           # 回放中已播放的段
@@ -271,10 +275,20 @@ class RouteMapView(QWidget):
         self._track_layer: QImage | None = None
         self._track_key: tuple | None = None
         self._track_anchor: tuple[float, float] | None = None
+        # 建层时的几何指纹与地图尺寸: 缩放/改窗口后据此**按比例贴旧层**(见 _layer_tracks)
+        self._track_geom: tuple | None = None
+        self._track_size: tuple[float, float] = (0.0, 0.0)
+        self._track_margin: tuple[float, float] | None = None
+        self._spare_img: QImage | None = None       # 回收的层图像(省掉每次重建 20MB 的分配)
+        self._geom_at = 0.0                         # 最后一次几何变化的时刻
+        self._geom_timer: QTimer | None = None
         self._paint_dpr = 0.0                       # 当前画笔设备的缩放比(建层用)
         self._play_layer: QImage | None = None     # 回放累加层(见 _layer_playback)
         self._play_key: tuple | None = None
         self._play_anchor: tuple[float, float] | None = None
+        self._play_geom: tuple | None = None
+        self._play_size: tuple[float, float] = (0.0, 0.0)
+        self._play_margin: tuple[float, float] | None = None
         self._play_drawn: dict[str, int] = {}       # route_id -> 已画进累加层的点数
         # 全局录制“边录边画”的累加层(见 _layer_live)
         self._live_layer: QImage | None = None
@@ -282,6 +296,7 @@ class RouteMapView(QWidget):
         self._live_anchor: tuple[float, float] | None = None
         self._live_size: tuple[float, float] = (0.0, 0.0)
         self._live_seen_size: tuple[float, float] = (0.0, 0.0)
+        self._live_margin: tuple[float, float] | None = None
         self._live_zoom_at = 0.0
         self._live_timer: QTimer | None = None
         # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
@@ -297,6 +312,7 @@ class RouteMapView(QWidget):
         self._line_cache: dict[str, tuple] = {}    # route_id -> (点数, QPolygonF)
         self._vmax_cache: dict[str, tuple] = {}    # route_id -> (点数, 峰值速度)
         self._times_cache: dict[str, tuple] = {}   # route_id -> (点数, [t...])
+        self._bbox_cache: dict[str, tuple] = {}    # route_id -> (点数, 包围盒) 视野裁剪用
 
     def _on_blink_tick(self) -> None:
         """推进闪烁相位并重画。"""
@@ -482,6 +498,7 @@ class RouteMapView(QWidget):
         for rid in [k for k in self._live_seg if k not in ids]:
             self._live_seg.pop(rid, None)      # 录制已结束/被清掉 → 丢掉它的缓存
         if not self._live_multi:               # 录完了 → 释放累加层(省一张窗口大小的图)
+            self._recycle(self._live_layer)
             self._live_layer = None
             self._live_ids = None
             self._live_seg.clear()
@@ -523,6 +540,7 @@ class RouteMapView(QWidget):
         else:
             new = [recs]
         if [r.route_id for r in new] != [r.route_id for r in self._playback_recs]:
+            self._recycle(self._play_layer)
             self._play_layer = None      # 换了回放对象 → 累加层作废(下次重画)
             self._play_drawn = {}
         self._playback_recs = new
@@ -558,6 +576,7 @@ class RouteMapView(QWidget):
         self._line_cache.clear()
         self._vmax_cache.clear()
         self._times_cache.clear()
+        self._bbox_cache.clear()
         self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -652,9 +671,10 @@ class RouteMapView(QWidget):
                 # 回放: 未播放底衬 + 已播放着色段都在**累加层**里, 每帧只补新段;
                 # 标记与光标每帧现画(几个圈, 便宜)
                 labels = len(self._playback_recs) <= 1
-                layer = self._layer_playback()
-                if layer is not None:
-                    self._blit_layer(p, layer, self._play_anchor)
+                got = self._layer_playback()
+                if got is not None:
+                    layer, pscale = got
+                    self._blit_layer(p, layer, self._play_anchor, pscale, self._play_margin)
                     for rec in self._playback_recs:
                         self._draw_play_marks(p, rec, self._playhead, labels=labels)
                         self._draw_play_cursor(p, rec, self._playhead)
@@ -662,9 +682,11 @@ class RouteMapView(QWidget):
                     for rec in self._playback_recs:
                         self._draw_playback(p, rec, self._playhead, labels=labels)
             else:
-                top = self._layer_tracks()
-                if top is not None:
-                    self._blit_layer(p, top, self._track_anchor)
+                got = self._layer_tracks()
+                if got is not None:
+                    layer, tscale = got
+                    self._blit_layer(p, layer, self._track_anchor, tscale,
+                                     self._track_margin)
                 else:
                     self._draw_tracks(p)
             # 全局录制“边录边画”: 走累加层(每帧只补新段; 缩放时先缩放贴图)
@@ -672,7 +694,8 @@ class RouteMapView(QWidget):
                 got = self._layer_live()
                 if got is not None:
                     layer_live, live_scale = got
-                    self._blit_layer_scaled(p, layer_live, self._live_anchor, live_scale)
+                    self._blit_layer(p, layer_live, self._live_anchor, live_scale,
+                                     self._live_margin)
             self._draw_player(p)
 
             if self._hover_text:
@@ -752,6 +775,7 @@ class RouteMapView(QWidget):
         self._live_ids = ids
         self._live_size = self._map_size()
         self._live_anchor = (self._map_rect().left(), self._map_rect().top())
+        self._live_margin = self._margin()
         self._live_layer = self._make_layer(self._draw_live_layer, self._live_anchor)
         return self._live_layer
 
@@ -830,26 +854,23 @@ class RouteMapView(QWidget):
             p.end()
         return self._live_layer, (1.0, 1.0)
 
-    def _blit_layer_scaled(self, p: QPainter, layer: QImage,
-                           anchor: tuple[float, float], scale: tuple[float, float]) -> None:
-        """按 scale 贴图(缩放过程中的临时显示)。
-
-        画笔已在“地图本地坐标”里: 先按比例缩放画笔, 再按**建层时**的锚点贴 ——
-        这样图层内容 c 会落在 c×scale 处, 正好与新的地图尺寸对得上。
-        """
-        if scale == (1.0, 1.0):
-            self._blit_layer(p, layer, anchor)
-            return
-        p.save()
-        try:
-            p.scale(scale[0], scale[1])
-            self._blit_layer(p, layer, anchor)
-        finally:
-            p.restore()
-
     def _margin(self) -> tuple[float, float]:
         """缓存层四周的余量(像素): 拖动地图时靠偏移贴图复用, 不必重建。"""
         return (self.width() * LAYER_MARGIN, self.height() * LAYER_MARGIN)
+
+    def _recycle(self, img: QImage | None) -> None:
+        """回收不再显示的层图像: 下次建层直接复用(省掉 20MB 级的分配 + 页错误)。"""
+        if img is not None and not img.isNull() and self._spare_img is None:
+            self._spare_img = img
+
+    def _take_spare(self, w: int, h: int, dpr: float) -> QImage | None:
+        """取一张尺寸正好合适的回收图像(尺寸不同就丢掉, 不为此额外占内存)。"""
+        img, self._spare_img = self._spare_img, None
+        if img is None or img.isNull() or img.width() != w or img.height() != h:
+            return None
+        img.setDevicePixelRatio(dpr)
+        return img
+
     def _make_layer(self, draw, anchor: tuple[float, float]) -> QImage | None:
         """把一次绘制结果渲进离屏图像(拿不到就返回 None, 上层退回直接绘制)。
 
@@ -860,12 +881,14 @@ class RouteMapView(QWidget):
         """
         mx, my = self._margin()
         dpr = self._paint_dpr or 1.0     # 与画笔设备一致 → 贴图时 1:1, 不会被重采样
-        img = QImage(int(round((self.width() + 2 * mx) * dpr)),
-                     int(round((self.height() + 2 * my) * dpr)),
-                     QImage.Format.Format_ARGB32_Premultiplied)
-        if img.isNull():
-            return None
-        img.setDevicePixelRatio(dpr)
+        w = int(round((self.width() + 2 * mx) * dpr))
+        h = int(round((self.height() + 2 * my) * dpr))
+        img = self._take_spare(w, h, dpr)
+        if img is None:
+            img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+            if img.isNull():
+                return None
+            img.setDevicePixelRatio(dpr)
         img.fill(Qt.GlobalColor.transparent)
         lp = QPainter(img)
         try:
@@ -881,60 +904,156 @@ class RouteMapView(QWidget):
             lp.end()
         return img
 
-    def _blit_layer(self, p: QPainter, layer: QImage, anchor: tuple[float, float]) -> None:
+    def _blit_layer(self, p: QPainter, layer: QImage, anchor: tuple[float, float],
+                    scale: tuple[float, float] = (1.0, 1.0),
+                    margin: tuple[float, float] | None = None) -> None:
         """把缓存层贴到当前视图(画笔已平移到地图本地坐标)。
 
         显式给出目标矩形: 层图带 devicePixelRatio(高 DPI 屏上 1.5/2.0),
         用 `drawImage(QPointF, img)` 不一定会按逻辑尺寸贴(实测 150% 缩放下会偏)。
+
+        `scale` 是“缩放过程中先用旧层顶着”的比例(见 `_layer_tracks`): 图层里的
+        归一化内容必须落在 **q×scale** 处, 所以目标矩形要按 `scale` 缩放 ——
+        不能简单 `p.scale()` 后再贴(那样会多出 `(余量+锚点)×(scale-1)` 的偏移,
+        1920 宽下实测能偏几十像素)。
+
+        `margin` 必须是**建层时**的余量(窗口改大小后 `_margin()` 会变), 否则偏移也错。
         """
-        mx, my = self._margin()
+        mx, my = margin if margin is not None else self._margin()
         dpr = layer.devicePixelRatio() or 1.0
-        p.drawImage(QRectF(-mx - anchor[0], -my - anchor[1],
-                           layer.width() / dpr, layer.height() / dpr),
+        sx, sy = scale
+        p.drawImage(QRectF((-mx - anchor[0]) * sx, (-my - anchor[1]) * sy,
+                           layer.width() / dpr * sx, layer.height() / dpr * sy),
                     layer, QRectF(0, 0, layer.width(), layer.height()))
 
-    def _layer_stale(self, anchor: tuple[float, float] | None) -> bool:
-        """层的定位锚点离当前位置太远(超出余量)→ 必须重新渲染。"""
+    def _layer_stale(self, anchor: tuple[float, float] | None,
+                     scale: tuple[float, float] = (1.0, 1.0)) -> bool:
+        """层的定位锚点离当前位置太远(超出余量)→ 必须重新渲染。
+
+        按比例贴图时**覆盖范围也会按比例变大**, 所以允许的偏移量要乘上缩放比 ——
+        否则放大过程中锚点一漂就重建(一次 20~50ms), 滚轮又变成一顿一顿的。
+        """
         if anchor is None:
             return True
         mx, my = self._margin()
+        mx *= max(1.0, scale[0])
+        my *= max(1.0, scale[1])
         r = self._map_rect()
         return (abs(r.left() - anchor[0]) > mx or abs(r.top() - anchor[1]) > my)
 
     def _tracks_key(self) -> tuple:
-        """轨迹层的内容指纹(点数/标记数/回放进度/重生方块都在内) —— **不含平移**。"""
+        """轨迹层的内容指纹(点数/标记数/回放进度/重生方块都在内)。
+
+        **不含几何**(缩放/窗口尺寸)与平移 —— 几何变化走“先缩放贴旧层”那条路
+        (见 `_layer_tracks`), 只有内容真的变了才值得在 Python 里重画一遍。
+        """
         live = self._live
 
         def sig(recs) -> tuple:
             return tuple((r.route_id, len(r.points), len(r.marks)) for r in recs)
 
-        return (self._geom_key(), sig(self._visible), sig(self._highlight),
+        return (sig(self._visible), sig(self._highlight),
                 (live.route_id, len(live.points), len(live.marks)) if live else None,
                 sig(self._playback_recs),
                 round(self._playhead, 3) if self._playback_recs else None,
                 self._show_spawns, self._spawns_ver)
 
-    def _layer_tracks(self) -> QImage | None:
-        """轨迹层(半透明, 带余量): 内容或定位超出余量才重建。"""
+    def _build_track_layer(self) -> None:
+        """(重)建轨迹层, 并记下建层时的几何/尺寸(之后缩放要按比例贴)。"""
+        self._track_anchor = (self._map_rect().left(), self._map_rect().top())
+        self._track_margin = self._margin()
+        self._recycle(self._track_layer)
+        self._track_layer = self._make_layer(self._draw_tracks, self._track_anchor)
+        self._track_key = self._tracks_key()
+        self._track_geom = self._geom_key()
+        self._track_size = self._map_size()
+
+    def _layer_tracks(self) -> tuple[QImage, tuple[float, float]] | None:
+        """轨迹层(半透明, 带余量): 返回 (图层, 缩放比)。
+
+        三种情况:
+
+        1. 没有层 / **内容变了**(眼睛开关、选中、重生位置…) → 立刻重建;
+        2. 拖出余量 → 立刻重建(锚点必须跟着走);
+        3. 只是**几何变了**(滚轮缩放、改窗口大小) → 先把旧层按比例贴上顶住
+           (1~2ms), 停手 200ms 后再重建一次变清晰。
+
+        第 3 条是 2026-10-21 的卡顿修正: 重建一次实测 20~50ms(1920×1040, 20 条线
+        1.7 万点), 而滚轮连发 6 格就要重建 6 次 → 一段滚轮要 250~500ms, 手感就是
+        “缩放卡”。旧层按比例贴的画质会临时略糊/线宽略变, 停手 200ms 后自动复原。
+        """
         key = self._tracks_key()
+        geom = self._geom_key()
+        size = self._map_size()
+        scale = self._scale_vs(self._track_size, size)
         if (self._track_layer is None or self._track_key != key
-                or self._layer_stale(self._track_anchor)):
-            self._track_anchor = (self._map_rect().left(), self._map_rect().top())
-            self._track_layer = self._make_layer(self._draw_tracks, self._track_anchor)
-            self._track_key = key
-        return self._track_layer
+                or self._layer_stale(self._track_anchor, scale)):
+            self._build_track_layer()
+            if self._track_layer is None:
+                return None
+            return (self._track_layer, (1.0, 1.0))
+        if geom != self._track_geom:
+            self._note_geom_change()
+            return (self._track_layer, scale)
+        return (self._track_layer, (1.0, 1.0))
+
+    @staticmethod
+    def _scale_vs(built: tuple[float, float],
+                  now: tuple[float, float]) -> tuple[float, float]:
+        """当前地图尺寸 / 建层时的地图尺寸(无法判断时当作 1)。"""
+        if built[0] <= 0 or built[1] <= 0 or now[0] <= 0 or now[1] <= 0:
+            return (1.0, 1.0)
+        return (now[0] / built[0], now[1] / built[1])
+
+    # ------------------------------------------- 缩放/改窗口后的延迟重建
+    def _note_geom_change(self) -> None:
+        """记下“几何刚变过”, 并安排停手后重建(不能在计时中再 start —— 会永远不触发)。"""
+        self._geom_at = time.monotonic()
+        if self._geom_timer is None:
+            self._geom_timer = QTimer(self)
+            self._geom_timer.setSingleShot(True)
+            self._geom_timer.timeout.connect(self._geom_settle)
+        if not self._geom_timer.isActive():
+            self._geom_timer.start(GEOM_SETTLE_MS)
+
+    def _geom_settle(self) -> None:
+        """停手 GEOM_SETTLE_MS 之后: 丢掉按比例顶着的旧层, 下次 paint 重建(变清晰)。"""
+        if time.monotonic() - self._geom_at < GEOM_SETTLE_MS / 1000.0:
+            self._geom_timer.start(GEOM_SETTLE_MS)     # 还在缩放 → 再等一轮
+            return
+        geom = self._geom_key()
+        dirty = False
+        if self._track_layer is not None and self._track_geom != geom:
+            self._recycle(self._track_layer)
+            self._track_layer = None
+            self._track_key = None
+            dirty = True
+        if self._play_layer is not None and self._play_geom != geom:
+            self._recycle(self._play_layer)
+            self._play_layer = None
+            self._play_key = None
+            dirty = True
+        if dirty:
+            self.update()
 
     def _drop_layers(self) -> None:
+        self._recycle(self._track_layer)
         self._track_layer = None
         self._track_key = None
         self._track_anchor = None
+        self._track_geom = None
+        self._track_margin = None
+        self._recycle(self._play_layer)
         self._play_layer = None
         self._play_key = None
         self._play_anchor = None
+        self._play_geom = None
+        self._play_margin = None
         self._play_drawn = {}
 
     def _play_layer_key(self) -> tuple:
-        return (self._geom_key(), tuple(r0.route_id for r0 in self._playback_recs),
+        """回放累加层的内容指纹(**不含几何**: 几何变化走“先缩放贴旧层”)。"""
+        return (tuple(r0.route_id for r0 in self._playback_recs),
                 self._show_spawns, self._spawns_ver)
 
     def _draw_play_static(self, p: QPainter) -> None:
@@ -947,27 +1066,39 @@ class RouteMapView(QWidget):
             k, _mid = self._played_prefix(rec, self._playhead)
             self._extend_play(p, rec, 0, k)
 
-    def _layer_playback(self) -> QImage | None:
-        """回放**累加层**(半透明): 未播放底衬 + 已播放的着色段。
+    def _layer_playback(self) -> tuple[QImage, tuple[float, float]] | None:
+        """回放**累加层**(半透明): 未播放底衬 + 已播放的着色段。返回 (图层, 缩放比)。
 
         回放时进度每帧都在推进, 而“已播放”是只增不减的前缀 —— 于是把画好的部分
         **留在图像里**, 每帧只补新播放到的几段。否则每帧都要重画全部已播放线段
         (5 条线要 35ms/帧, 30fps 下必卡)。
-        往回拖拽 / 定位超出余量 / 缩放 / 换底图 / 换回放对象 → 重建。
+        往回拖拽 / 定位超出余量 / 换回放对象 → 重建;
+        缩放/改窗口 → 先按比例贴旧层, 停手 200ms 再重建(同 `_layer_tracks`)。
         """
         key = self._play_layer_key()
+        geom = self._geom_key()
+        size = self._map_size()
+        scale = self._scale_vs(self._play_size, size)
         back = any(self._played_prefix(r, self._playhead)[0]
                    < self._play_drawn.get(r.route_id, 0) for r in self._playback_recs)
         if (self._play_layer is None or self._play_key != key or back
-                or self._layer_stale(self._play_anchor)):
+                or self._layer_stale(self._play_anchor, scale)):
             self._play_drawn = {}
             self._play_anchor = (self._map_rect().left(), self._map_rect().top())
+            self._play_margin = self._margin()
+            self._recycle(self._play_layer)
             self._play_layer = self._make_layer(self._draw_play_static, self._play_anchor)
             self._play_key = key
+            self._play_geom = geom
+            self._play_size = size
             if self._play_layer is None:
                 return None
             for rec in self._playback_recs:          # 记下已经画到哪
                 self._play_drawn[rec.route_id], _ = self._played_prefix(rec, self._playhead)
+        elif geom != self._play_geom:
+            # 只是几何变了 → 旧层按比例顶着(播放中滚轮缩放不再一顿一顿)
+            self._note_geom_change()
+            return (self._play_layer, scale)
         mx, my = self._margin()
         p = QPainter(self._play_layer)
         try:
@@ -981,7 +1112,7 @@ class RouteMapView(QWidget):
                     self._play_drawn[rec.route_id] = k
         finally:
             p.end()
-        return self._play_layer
+        return (self._play_layer, (1.0, 1.0))
 
     def _geom_key(self) -> tuple:
         """**像素坐标**的几何指纹: 缩放/窗口尺寸/底图变了, 缓存像素的东西就失效。
@@ -1065,6 +1196,40 @@ class RouteMapView(QWidget):
             got = (n, [pt.t for pt in rec.points])
             self._times_cache[rec.route_id] = got
         return got[1]
+
+    def _bbox(self, rec: RouteRecord) -> tuple[float, float, float, float]:
+        """轨迹的归一化包围盒 (x0, y0, x1, y1), 按点数缓存。"""
+        n = len(rec.points)
+        got = self._bbox_cache.get(rec.route_id)
+        if got is not None and got[0] == n:
+            return got[1]
+        pts = rec.points
+        if pts:
+            box = (min(p.x for p in pts), min(p.y for p in pts),
+                   max(p.x for p in pts), max(p.y for p in pts))
+        else:
+            box = (0.0, 0.0, 0.0, 0.0)
+        self._bbox_cache[rec.route_id] = (n, box)
+        return box
+
+    def _in_view(self, rec: RouteRecord) -> bool:
+        """这条轨迹是否与当前可见区域相交(**视野裁剪**)。
+
+        放大后地图上大部分线路都在视野外, 但 QPainter 自己的 clip 并不会“提前拒绝”
+        —— 实测 zoom 1x/8x 重建一层的耗时几乎一样(22~47ms)。于是这里先用包围盒
+        判一下: 看不见的线一条段也不用栅格化(2026-10-21)。
+        """
+        w, h = self._map_size()
+        if w <= 0 or h <= 0:
+            return True
+        r = self._map_rect()
+        pad = 8.0 / w, 8.0 / h            # 留点余量(线宽/圆头)
+        x0, y0, x1, y1 = self._bbox(rec)
+        vx0 = (-r.left()) / w - pad[0]
+        vy0 = (-r.top()) / h - pad[1]
+        vx1 = (self.width() - r.left()) / w + pad[0]
+        vy1 = (self.height() - r.top()) / h + pad[1]
+        return not (x1 < vx0 or x0 > vx1 or y1 < vy0 or y0 > vy1)
 
     def _played_prefix(self, rec: RouteRecord, head: float
                        ) -> tuple[int, RoutePoint | None]:
@@ -1163,7 +1328,7 @@ class RouteMapView(QWidget):
     def _draw_route(self, p: QPainter, rec: RouteRecord, history: bool, vmax: float,
                     labels: bool = True) -> None:
         pts = rec.points
-        if len(pts) >= 2 and self._scaled(p):
+        if len(pts) >= 2 and self._in_view(rec) and self._scaled(p):
             s = self._px_scale()
             try:
                 if history:

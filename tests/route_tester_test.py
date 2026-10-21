@@ -699,11 +699,17 @@ def test_map_draw_cache():
         view.render(canvas)
         n_lay = len(lay_calls)
 
-        # 缩放 → 必须重建层, 但**几何是归一化的, 不该重算分桶几何**
+        # 缩放 → **不重建**(先按比例贴旧层, 见 _layer_tracks), 停手后才重建一次;
+        # 几何是归一化的, 无论如何都不该重算分桶几何
         view._zoom = 2.5
         view.render(canvas)
-        assert len(lay_calls) > n_lay, "缩放后必须重建缓存层"
+        assert len(lay_calls) == n_lay, "缩放过程中不该重建缓存层(先按比例贴旧层)"
         assert len(seg_calls) == n_seg, "缩放不该重算分桶几何(归一化 + 缩放画笔)"
+        view._geom_at = 0.0                  # 模拟“停手超过 GEOM_SETTLE_MS”
+        view._geom_settle()
+        view.render(canvas)
+        assert len(lay_calls) > n_lay, "停手后应重建缓存层(变清晰)"
+        n_lay = len(lay_calls)
         before = len(lay_calls)
 
         # 隐藏线路 → 也必须重建(几何仍缓存着)
@@ -787,11 +793,16 @@ def test_playback_draw_cache():
         assert len(lay_calls) > n, "往回拖拽必须重建累加层"
         n2 = len(lay_calls)
 
-        # ④ 缩放/平移 → 必须重建
+        # ④ 缩放 → 播放中也不重建(先按比例贴旧层), 停手后才重建一次
         view._zoom = 3.0
         view.render(canvas)
-        assert len(lay_calls) > n2, "缩放后必须重建累加层"
+        assert len(lay_calls) == n2, "缩放过程中不该重建累加层(先按比例贴旧层)"
+        view._geom_at = 0.0
+        view._geom_settle()
+        view.render(canvas)
+        assert len(lay_calls) > n2, "停手后应重建累加层(变清晰)"
         n3 = len(lay_calls)
+        assert n3 > 0
 
         # ⑤ 退出回放(切回预览层)再重新进入 → 累加层必须重建
         #    (否则会拿着退出前那张残留画面继续画)
@@ -2681,6 +2692,135 @@ def test_global_hotkey():
     results.append("全局快捷键(默认 F5/F6/F7 + 组合键 + 绑定存取) OK")
 
 
+def test_zoom_reuses_layer(tmpdir: str):
+    """滚轮缩放**不许每一格都重建轨迹层**; 停手后才重建一次变清晰。
+
+    回归(2026-10-21 用户反馈“不播放时缩放也卡”): 以前 `_tracks_key()` 里含几何指纹,
+    于是每滚动一格都要把所有轨迹重新栅格化一遍 —— 实测 1920×1040 / 20 条线
+    (1.7 万点)重建一次 20~50ms, 滚轮连发 6 格就是 250~500ms, 手感就是“卡”。
+    现在改成: 几何变了就先按比例贴旧层(1~2ms), 停手 GEOM_SETTLE_MS 后再重建。
+    """
+    from PyQt6.QtGui import QWheelEvent
+
+    store = RouteStore(os.path.join(tmpdir, "zoomlayer.json"))
+    recs = []
+    for k in range(3):
+        rec = store.new_route("AAA", "地图 A", "T", 0.1, 0.2 + k * 0.2)
+        rec.points = [RoutePoint(0.1 + i * 0.05, 0.2 + k * 0.2 + 0.02 * (i % 2),
+                                 i * 0.5, 30.0) for i in range(16)]
+        rec.duration = 7.5
+        recs.append(rec)
+    other = store.new_route("AAA", "地图 A", "T", 0.5, 0.5)
+    other.points = [RoutePoint(0.5, 0.5, 0.0, 10.0), RoutePoint(0.6, 0.6, 1.0, 20.0)]
+    other.duration = 1.0
+
+    view = RouteMapView()
+    view.resize(600, 400)
+    view.set_map_bytes(png_solid("#303030"))
+    view.set_visible_tracks(recs)
+    canvas = QImage(600, 400, QImage.Format.Format_ARGB32)
+    view.render(canvas)
+    layer = view._track_layer
+    assert layer is not None
+    assert view._track_geom == view._geom_key(), "建层时应记下几何指纹"
+    built_size = view._track_size
+    spare = view._spare_img
+
+    # 连续滚 3 格: 层必须一直是同一张图(不重建), 但要按比例贴
+    for _ in range(3):
+        pos = QPointF(300.0, 200.0)
+        view.wheelEvent(QWheelEvent(pos, QPointF(pos.x(), pos.y()), QPoint(0, 0),
+                                    QPoint(0, 120), Qt.MouseButton.NoButton,
+                                    Qt.KeyboardModifier.NoModifier,
+                                    Qt.ScrollPhase.NoScrollPhase, False))
+        got = view._layer_tracks()
+        assert got is not None
+        assert got[0] is layer, "缩放过程中不应重建轨迹层(每格重建一次就是卡顿的来源)"
+        assert got[1] != (1.0, 1.0), "应按比例贴旧层"
+        view.render(canvas)
+    assert view._track_layer is layer
+    assert view._track_geom != view._geom_key(), "几何已变, 应与建层时不同"
+    assert view._track_size == built_size, "贴图期间仍按建层时的尺寸算比例"
+
+    # 停手 → 延迟重建一次变清晰(把“最后一次几何变化”往前推, 免得测试要等 200ms)
+    view._geom_at = 0.0
+    view._geom_settle()
+    assert view._track_layer is None, "停手后应丢掉按比例顶着的旧层"
+    assert view._spare_img is not None, "旧层图像应被回收(省掉每次 20MB 级的分配)"
+    view.render(canvas)
+    assert view._track_layer is not None
+    assert view._spare_img is None, "重建时应把回收的那张图用掉(不再新分配)"
+    assert view._track_geom == view._geom_key(), "重建后的层应对应当前几何"
+    assert view._track_size == view._map_size()
+
+    # 内容变了(眼睛开关) → 必须立刻重建, 不能等
+    view.set_visible_tracks([*recs, other])
+    view.render(canvas)
+    assert view._track_size == view._map_size(), "内容变化应立即重建"
+    results.append("滚轮缩放复用轨迹层(按比例贴/停手重建/图像回收) OK")
+
+
+def test_zoom_scaled_blit_offset(tmpdir: str):
+    """按比例贴旧层时内容必须落在 **q×scale** 处, 不能多出偏移。
+
+    回归: 以前用 `p.scale()` 后再贴图层, 会多出 `(余量+锚点)×(scale-1)` 的偏移
+    —— 1920 宽、余量 0.35 时放大 2 倍能偏两百多像素。
+    """
+    store = RouteStore(os.path.join(tmpdir, "zoomoff.json"))
+    rec = store.new_route("AAA", "地图 A", "T", 0.05, 0.5)
+    # 一条横线, 正好压在地图竖直中线 y=0.5 上
+    rec.points = [RoutePoint(0.05 + i * 0.05, 0.5, i * 0.2, 30.0) for i in range(19)]
+    rec.duration = 3.6
+
+    view = RouteMapView()
+    view.resize(600, 400)
+    view.set_map_bytes(png_solid("#202020"))
+    view.set_visible_tracks([rec])
+    canvas = QImage(600, 400, QImage.Format.Format_ARGB32)
+    view.render(canvas)                         # 建层(zoom=1)
+
+    def color_at(nx: float, ny: float) -> tuple[int, int, int]:
+        c = view.map_pos(nx, ny)
+        px = canvas.pixelColor(int(round(c.x())), int(round(c.y())))
+        return (px.red(), px.green(), px.blue())
+
+    def is_line(nx: float, ny: float) -> bool:
+        r, g, b = color_at(nx, ny)
+        return abs(r - 0x20) + abs(g - 0x20) + abs(b - 0x20) > 60
+
+    assert is_line(0.5, 0.5), "缩放前: 中线处应有轨迹"
+    assert not is_line(0.5, 0.45), "缩放前: 0.45 处不应有轨迹"
+
+    # 放大 2 倍(几何变了 → 走“按比例贴旧层”这条路径, 不重建)
+    view._zoom = 2.0
+    view._clamp_pan()
+    assert view._layer_tracks()[1] != (1.0, 1.0)
+    canvas.fill(0)
+    view.render(canvas)
+    assert is_line(0.5, 0.5), "按比例贴图时轨迹必须仍落在 y=0.5(否则就是偏移 bug)"
+    r, g, b = color_at(0.5, 0.42)
+    assert abs(r - 0x20) + abs(g - 0x20) + abs(b - 0x20) < 40, \
+        f"0.42 处不该有轨迹(实际 {r:#04x},{g:#04x},{b:#04x})"
+    # 轨迹层确实是被贴上的那张(没重建)
+    assert view._track_geom != view._geom_key()
+
+    # 改窗口大小 → 同样“按比例贴”, 并且必须用**建层时**的余量算偏移
+    # (余量 = 控件尺寸×LAYER_MARGIN, 改大小后变了; 用错就会整体错位)
+    view._geom_at = 0.0
+    view._geom_settle()
+    view.render(canvas)                       # 先重建一次(此时余量属于 600×400)
+    assert view._track_margin == view._margin()
+    built_margin = view._track_margin
+    view.resize(500, 360)
+    canvas = QImage(500, 360, QImage.Format.Format_ARGB32)
+    assert view._layer_tracks()[1] != (1.0, 1.0), "改窗口应走按比例贴"
+    view.render(canvas)
+    assert view._track_margin == built_margin
+    assert is_line(0.5, 0.5), "改窗口大小后轨迹必须仍在 y=0.5(余量要用建层时那份)"
+    assert not is_line(0.5, 0.4), "改窗口大小后轨迹不该整体偏移"
+    results.append("按比例贴旧层不产生偏移(q×scale) OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -2716,6 +2856,8 @@ def main() -> int:
     test_map_resolution_alias(tmpdir)
     test_map_merge_old_duplicates(tmpdir)
     test_map_smooth_zoom(tmpdir)
+    test_zoom_reuses_layer(tmpdir)
+    test_zoom_scaled_blit_offset(tmpdir)
     test_map_sharpest(tmpdir)
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)
