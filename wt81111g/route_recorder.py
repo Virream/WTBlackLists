@@ -571,9 +571,18 @@ class RouteRecorder(QObject):
         w, h = hi[0] - lo[0], hi[1] - lo[1]
         if w <= 0 or h <= 0:
             return
+        tracker = self._tracker
+        if tracker is not None:
+            fit = tracker.aligner.fit
+            if fit is not None and not fit.same_as_reference:
+                # 观战中的玩家上了飞机: 8111 切成空战图, 连 map_min/map_max 都变了。
+                # 但单位坐标已经被换算回**地面坐标系**(见 FrameAligner), 所以速度必须
+                # 继续按地面图的边长算 —— 这里直接不动。
+                log.debug("全局录制: 当前是换算过的坐标系, 忽略 map_info 的边长更新")
+                return
         self._map_size = (w, h)
-        if self._tracker is not None:
-            self._tracker.set_map_size(w, h)
+        if tracker is not None:
+            tracker.set_map_size(w, h)
 
     def _do_global_start(self, side: str, target: GlobalRecord | None) -> None:
         """开始全局录制。

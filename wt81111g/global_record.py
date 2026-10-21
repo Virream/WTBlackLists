@@ -158,6 +158,255 @@ class Unit:
     y: float
 
 
+# ------------------------------------------------------------ 坐标系对齐
+# 8111 的 `/map_obj.json` 坐标是相对**当前观战视角那张地图**的: 观战中的玩家上了
+# 固定翼(如 Su-25)时, 8111 会把地图切成空战图, 同一批地面单位的坐标整体被
+# 缩放/平移, 于是帧间最近邻匹配对不上 —— 正在画的线会突然断掉、换个地方重新开始
+# (2026-10-21 用户实测)。
+#
+# 解法: 用**静态地物当锚点**把坐标换算回“录制开始时的地面坐标系”。
+# `respawn_base_tank` / `capture_zone` 在两个视角里都会上报, 是**同一批点**,
+# 只是坐标整体做了相似变换(等比缩放 + 平移, 可能还有 90° 的整数倍旋转);
+# 用质心 + 半径解出变换, 再用最近邻核对, 对不上就不认。
+ANCHOR_TYPES = frozenset({"respawn_base_tank", "capture_zone"})
+# 拟合后允许的平均残差(归一化坐标 = 地图边长的倍数); 超了就认为不是同一个坐标系
+FRAME_FIT_TOL = 0.01
+# 初步配对时允许的距离(初始尺度可能略有偏差, 给宽一点)
+FRAME_MATCH_TOL = 0.02
+# 判定“两边坐标系其实一样”的门槛: 尺度差 < 1% 且质心偏移 < 0.2%
+FRAME_SAME_SCALE = 0.01
+FRAME_SAME_SHIFT = 0.002
+# 换视角(坐标系变化)后这么多秒内**不判“被击毁”**:
+# 那段时间里单位消失更可能是“视角换了看不见了”, 不是被打死
+VIEW_CHANGE_GRACE = 5.0
+
+
+def frame_anchors(objects) -> list[tuple[float, float]]:
+    """取这一帧的**静态锚点**(重生点 + 战区中心)的坐标, 用来判断坐标系有没有变。
+
+    这些点在陆战图/空战图里都会上报, 而且位置固定 —— 坐标系一变, 它们的
+    相对布局就会被整体缩放/平移, 正好可以反解出变换。
+    """
+    out: list[tuple[float, float]] = []
+    for obj in objects or []:
+        if not isinstance(obj, dict):
+            continue
+        if str(obj.get("type") or "") not in ANCHOR_TYPES:
+            continue
+        x, y = _f(obj.get("x")), _f(obj.get("y"))
+        if x is None or y is None:
+            continue
+        out.append((x, y))
+    return out
+
+
+def _centroid(pts) -> tuple[float, float]:
+    n = float(len(pts))
+    return (sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n)
+
+
+def _rms(pts, c: tuple[float, float]) -> float:
+    """到质心的均方根半径(与旋转无关, 用来解缩放比)。"""
+    n = float(len(pts))
+    return math.sqrt(sum((p[0] - c[0]) ** 2 + (p[1] - c[1]) ** 2 for p in pts) / n)
+
+
+def _nn_median(pts, cap: int = 64) -> float:
+    """最近邻距离的**中位数**(抗离群点) —— 用来估初始缩放比。
+
+    质心/bbox 那两个估计会被少数“孤零零”的点(如 3 个战区中心)拽偏;
+    最近邻距离看的是点集的**密集程度**, 只要两个视角报的是同一批重生点,
+    即使一边多报/少报了几个, 这个比值仍然准。
+    """
+    sub = list(pts)[:: max(1, len(pts) // cap)] if len(pts) > cap else list(pts)
+    ds: list[float] = []
+    for i, p in enumerate(sub):
+        best = None
+        for j, q in enumerate(sub):
+            if i == j:
+                continue
+            d = (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2
+            if best is None or d < best:
+                best = d
+        if best is not None:
+            ds.append(math.sqrt(best))
+    ds.sort()
+    return ds[len(ds) // 2] if ds else 0.0
+
+
+def _rot(dx: float, dy: float, k: int) -> tuple[float, float]:
+    for _ in range(k % 4):
+        dx, dy = -dy, dx
+    return (dx, dy)
+
+
+@dataclass(frozen=True)
+class FrameFit:
+    """一层坐标变换: `p' = scale × R_rot(p − c) + o`(相似变换)。
+
+    * `c` = **当前帧**锚点的质心, `o` = 变换后的落点(参考帧里),
+    * `rot` = 90° 的整数倍(0~3), 正常情况是 0;
+    * `error` = 拟合后“当前锚点 → 参考锚点”的平均最近邻距离(归一化坐标)。
+    """
+    scale: float = 1.0
+    rot: int = 0
+    cx: float = 0.0
+    cy: float = 0.0
+    ox: float = 0.0
+    oy: float = 0.0
+    error: float = 0.0
+
+    def apply(self, x: float, y: float) -> tuple[float, float]:
+        dx, dy = _rot(x - self.cx, y - self.cy, self.rot)
+        return (self.ox + dx * self.scale, self.oy + dy * self.scale)
+
+    @property
+    def same_as_reference(self) -> bool:
+        """当前坐标系和参考坐标系是否其实一样(变换可忽略)。"""
+        return (self.rot == 0
+                and abs(self.scale - 1.0) < FRAME_SAME_SCALE
+                and math.hypot(self.ox - self.cx, self.oy - self.cy) < FRAME_SAME_SHIFT)
+
+    def describe(self) -> str:
+        if self.same_as_reference:
+            return "同坐标系"
+        px, py = self.apply(0.0, 0.0)
+        return (f"scale={self.scale:.4f} rot={self.rot * 90}° "
+                f"原点→({px:+.4f},{py:+.4f}) 残差={self.error:.5f}")
+
+
+def fit_frame(reference, current) -> FrameFit | None:
+    """求“当前帧坐标 → 参考帧坐标”的相似变换(解不出来就返回 None)。
+
+    做法: 质心对齐 + 均方根半径定尺度(与旋转无关) → 4 个 90° 旋转各试一次,
+    每次用最近邻找配对、再对配对做**最小二乘**(只解缩放 + 平移, 旋转已定) →
+    取残差最小的那个; 残差仍太大就拒绝(宁可这一帧不换算, 也不能乱画)。
+    """
+    if len(reference) < 4 or len(current) < 4:
+        return None
+    cr = _centroid(reference)
+    cc = _centroid(current)
+    rr = _rms(reference, cr)
+    rc = _rms(current, cc)
+    if rr <= 0.0 or rc <= 0.0:
+        return None
+    # 初始尺度**多给几个候选**: 两个视角报的锚点数量/构成可能略有差别(例如空战图
+    # 少报了几个重生点), 单靠质心半径会被那几个“孤零零”的点拽偏 → 配对失败。
+    # 质心半径 / bbox 长边 / bbox 短边 各算一个, 谁配上的点多就用谁。
+    ext_r = (max(p[0] for p in reference) - min(p[0] for p in reference),
+             max(p[1] for p in reference) - min(p[1] for p in reference))
+    ext_c = (max(p[0] for p in current) - min(p[0] for p in current),
+             max(p[1] for p in current) - min(p[1] for p in current))
+    cands = [rr / rc]
+    for a_ref, a_cur in ((ext_r[0], ext_c[0]), (ext_r[1], ext_c[1]),
+                         (max(ext_r), max(ext_c)), (min(ext_r), min(ext_c))):
+        if a_ref > 0.0 and a_cur > 0.0:
+            cands.append(a_ref / a_cur)
+    nn_r, nn_c = _nn_median(reference), _nn_median(current)
+    if nn_r > 0.0 and nn_c > 0.0:
+        cands.append(nn_r / nn_c)
+    scale_cands = sorted({round(c, 6) for c in cands if c > 0.0})
+    step = max(1, len(current) // 32)         # 只拿约 32 个点核对
+    sample = list(current)[::step]
+    best: FrameFit | None = None
+    for k in range(4):
+        # ① 只做旋转(绕当前质心) —— 之后只剩“缩放 + 平移”要解
+        rotated = [_rot(p[0] - cc[0], p[1] - cc[1], k) for p in sample]
+        for scale0 in scale_cands:
+            pairs: list[tuple[tuple[float, float], tuple[float, float]]] = []
+            for qx, qy in rotated:
+                # 用这个候选尺度投到参考坐标系里找最近的锚点
+                tx, ty = cr[0] + scale0 * qx, cr[1] + scale0 * qy
+                nd = None
+                near = None
+                for rx, ry in reference:
+                    d = (tx - rx) ** 2 + (ty - ry) ** 2
+                    if nd is None or d < nd:
+                        nd, near = d, (rx, ry)
+                if near is not None and nd is not None and nd <= FRAME_MATCH_TOL ** 2:
+                    pairs.append(((qx, qy), near))
+            if len(pairs) < 4:
+                continue
+            # ② 最小二乘: p' = s·q + t
+            cq = _centroid([q for q, _ in pairs])
+            cm = _centroid([r for _, r in pairs])
+            num = sum((q[0] - cq[0]) * (r[0] - cm[0]) + (q[1] - cq[1]) * (r[1] - cm[1])
+                      for q, r in pairs)
+            den = sum((q[0] - cq[0]) ** 2 + (q[1] - cq[1]) ** 2 for q, _ in pairs)
+            scale = scale0 if den <= 0 else max(0.01, num / den)
+            fit = FrameFit(scale=scale, rot=k, cx=cc[0], cy=cc[1],
+                           ox=cm[0] - scale * cq[0], oy=cm[1] - scale * cq[1])
+            # ③ 量残差(平均最近邻距离); 没配上的点会把残差拉大 → 自然淘汰
+            tot = 0.0
+            for px, py in sample:
+                qx, qy = fit.apply(px, py)
+                tot += math.sqrt(min((qx - rx) ** 2 + (qy - ry) ** 2
+                                     for rx, ry in reference))
+            fit = FrameFit(scale=scale, rot=k, cx=cc[0], cy=cc[1],
+                           ox=fit.ox, oy=fit.oy, error=tot / len(sample))
+            if best is None or fit.error < best.error:
+                best = fit
+    if best is None or best.error > FRAME_FIT_TOL:
+        return None
+    return best
+
+
+class FrameAligner:
+    """记住“参考坐标系”(录制开始时的地面图)并给出每一帧的换算方式。"""
+
+    def __init__(self) -> None:
+        self.reference: list[tuple[float, float]] = []
+        self._cache: dict[tuple, FrameFit | None] = {}
+        self.fit: FrameFit | None = None        # 当前帧用的变换(None = 还没算出来)
+
+    @property
+    def ready(self) -> bool:
+        return len(self.reference) >= 4
+
+    def set_reference(self, anchors) -> bool:
+        """把这一帧的锚点当作参考坐标系(录制开始时调用一次)。"""
+        pts = list(anchors or [])
+        if len(pts) < 4:
+            return False
+        self.reference = pts
+        self._cache.clear()
+        self.fit = FrameFit()                   # 参考坐标系 = 恒等变换
+        return True
+
+    @staticmethod
+    def signature(anchors) -> tuple:
+        """锚点布局的**廉价**指纹: bbox + 质心 + 点数。
+
+        坐标系一变(被缩放/平移)这几个数就变 → 只有变了才重新拟合,
+        稳态下每帧只花几十微秒。
+        """
+        if not anchors:
+            return ()
+        xs = [p[0] for p in anchors]
+        ys = [p[1] for p in anchors]
+        n = float(len(anchors))
+        return (len(anchors), round(min(xs), 4), round(max(xs), 4),
+                round(min(ys), 4), round(max(ys), 4),
+                round(sum(xs) / n, 4), round(sum(ys) / n, 4))
+
+    def update(self, anchors) -> FrameFit | None:
+        """按这一帧的锚点给出变换(参考坐标系没建立时返回 None)。"""
+        if not self.ready:
+            return None
+        sig = self.signature(anchors)
+        if not sig:
+            return self.fit                 # 这帧没有锚点 → 沿用上一帧的变换
+        got = self._cache.get(sig, "miss")
+        if got == "miss":
+            got = fit_frame(self.reference, anchors)
+            self._cache[sig] = got
+            if len(self._cache) > 64:       # 防御: 缓存不要无限长
+                self._cache.clear()
+        if got is not None:
+            self.fit = got
+        return self.fit
+
+
 def extract_units(objects) -> tuple[list[Unit], dict[tuple[str, str], int]]:
     """从 `/map_obj.json` 里挑出可录单位; 同时统计“见过但没录”的 type/icon 组合。
 
@@ -220,6 +469,10 @@ class GlobalTracker:
         self._seq = 0
         self._empty_since: float | None = None
         self.seen_skipped: dict[tuple[str, str], int] = {}
+        # 坐标系对齐(陆战图 ↔ 空战图): 参考坐标系 = 录制开始时那一帧的静态锚点
+        self.aligner = FrameAligner()
+        self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
+        self.frame_changes = 0                          # 换算过多少个不同坐标系(日志用)
 
     def set_map_size(self, width_m: float, height_m: float) -> None:
         """更新地图边长(米)。轮询线程每次拿到 /map_info 都会调一次。"""
@@ -250,15 +503,58 @@ class GlobalTracker:
         units, skipped = extract_units(objects)
         for key, n in skipped.items():
             self.seen_skipped[key] = self.seen_skipped.get(key, 0) + n
+        self._align(t, objects, units)
         self._match(t, units)
         # 这一帧还有可录单位 → 此时断掉的线是“被击毁”; 全场空 → 是回到车库/录制结束
-        self._expire(t, alive=bool(units))
+        self._expire(t, alive=bool(units), allow_dead=self._dead_allowed(t))
         if not units:
             if self._empty_since is None:
                 self._empty_since = t
             return (t - self._empty_since) >= EMPTY_STOP
         self._empty_since = None
         return False
+
+    # ---------------------------------------------------------- 坐标系对齐
+    def _align(self, t: float, objects, units: list[Unit]) -> None:
+        """把这一帧的单位坐标换算回**录制开始时的地面坐标系**。
+
+        观战中的玩家上了固定翼时 8111 会切成空战图, 同一批地面单位的坐标整体被
+        缩放/平移 —— 不换算的话, 帧间最近邻会全部脱靶, 正在画的线会突然断掉、
+        换个位置重新开始(2026-10-21 用户实测)。
+        """
+        anchors = frame_anchors(objects)
+        if not self.aligner.ready:
+            if self.aligner.set_reference(anchors):
+                log.info("全局录制: 坐标系基准已建立(%d 个静态锚点)", len(anchors))
+            return
+        before = self.aligner.fit
+        fit = self.aligner.update(anchors)
+        if fit is None:
+            return                          # 拟合不出来 → 这一帧先不动(保持上一帧的变换)
+        if before is not None and fit is not before and not fit.same_as_reference:
+            self._view_changed_at = t
+            self.frame_changes += 1
+            log.info("全局录制: 坐标系变化(视野切到空中单位?) → %s", fit.describe())
+        elif before is not None and before is not fit and fit.same_as_reference \
+                and not before.same_as_reference:
+            self._view_changed_at = t
+            log.info("全局录制: 坐标系已恢复(%s)", fit.describe())
+        if fit.same_as_reference:
+            return
+        for u in units:
+            u.x, u.y = fit.apply(u.x, u.y)
+        # 换算后再按参考坐标系判一次范围(空战图里机场 AI 防空的坐标在 2.9~3.4)
+        units[:] = [u for u in units if 0.0 <= u.x <= 1.0 and 0.0 <= u.y <= 1.0]
+
+    def _dead_allowed(self, t: float) -> bool:
+        """现在这个时刻能不能判“被击毁”。
+
+        刚换过视角(坐标系变了)的几秒内**不判** —— 那段时间单位消失更可能是
+        “从这个视角看不见了”, 不是被打死(否则会满屏错误红叉)。
+        """
+        if self._view_changed_at is None:
+            return True
+        return (t - self._view_changed_at) > VIEW_CHANGE_GRACE
 
     def finish(self) -> list[UnitLife]:
         """结束跟踪: 把还活着的线收尾(不再等 end_gap), 返回本队的全部线路。
@@ -340,16 +636,17 @@ class GlobalTracker:
             lv.last_x, lv.last_y = u.x, u.y
             lv.last_store = t
 
-    def _expire(self, t: float, alive: bool = False) -> None:
+    def _expire(self, t: float, alive: bool = False, allow_dead: bool = True) -> None:
         """连续 `end_gap` 秒没接上的线 → 结束。
 
         `alive` = 这一帧场上还有别的可录单位 → 断掉的线判为**被击毁**;
         全场为空(回到车库/录制结束) 则只算“线到此为止”, 不标击毁。
+        `allow_dead` = 现在能不能判击毁(刚换过视角的那几秒不能, 见 `_dead_allowed`)。
         """
         keep: list[_Live] = []
         for lv in self._live:
             if (t - lv.last_seen) > self.end_gap:
-                self._close(lv, dead=alive)
+                self._close(lv, dead=alive and allow_dead)
             else:
                 keep.append(lv)
         self._live = keep

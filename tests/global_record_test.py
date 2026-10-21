@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """全局录制(整局所有玩家的线路)的针对性用例。
 
 只覆盖本次新增的逻辑:
@@ -22,7 +22,8 @@ from PyQt6.QtWidgets import QApplication
 
 import wt81111g.route_window as rw
 from wt81111g.global_record import (
-    EMPTY_STOP, GlobalTracker, extract_units, is_drone, recordable,
+    EMPTY_STOP, VIEW_CHANGE_GRACE, GlobalTracker, extract_units, fit_frame,
+    frame_anchors, is_drone, recordable,
 )
 from wt81111g.map_cache import MapCache
 from wt81111g.route_store import (
@@ -169,6 +170,102 @@ def test_tracker_empty_stop():
     assert not tr.feed(1.0 + EMPTY_STOP * 0.5, [])
     assert tr.feed(1.0 + EMPTY_STOP + 0.1, []), "空场超过阈值应返回 True"
     results.append("全局跟踪: 全场无单位超时 → 自动停止 OK")
+
+
+def test_frame_align():
+    """观战玩家上了固定翼 → 8111 切成空战图, 单位坐标整体被缩放/平移。
+
+    回归(2026-10-21 用户实测): 不换算的话帧间最近邻全部脱靶, 正在画的线路会
+    **突然断开、然后在别的地方重新开始**。用静态地物(respawn_base_tank /
+    capture_zone)当锚点把坐标换回录制开始时的地面坐标系。
+    """
+    # 地锚(参考坐标系): 32 个重生点 + 3 个战区
+    ground = [(0.10 + (i % 8) * 0.02, 0.15 + (i // 8) * 0.03) for i in range(32)]
+    ground += [(0.35, 0.55), (0.66, 0.55), (0.50, 0.32)]
+    AIR_SCALE, AIR_OFF = 0.4, (0.06, 0.10)
+
+    def to_air(p):
+        """地面坐标 → 空战图坐标(缩放 + 平移, 与实测一致)。"""
+        return (p[0] * AIR_SCALE + AIR_OFF[0], p[1] * AIR_SCALE + AIR_OFF[1])
+
+    air = [to_air(p) for p in ground]
+
+    # ① 拟合本身: 从空战图坐标能反解出缩放/平移, 且能原样还原回来
+    fit = fit_frame(ground, air)
+    assert fit is not None, "应该能拟合出变换"
+    # 方向是“空战图 → 地面图”, 所以尺度是 1/0.4 = 2.5
+    assert abs(fit.scale - 1.0 / AIR_SCALE) < 1e-6, fit.describe()
+    assert not fit.same_as_reference
+    for g, a in zip(ground, air):
+        back = fit.apply(a[0], a[1])
+        assert abs(back[0] - g[0]) < 1e-6 and abs(back[1] - g[1]) < 1e-6, \
+            f"{a} 应换算回 {g}, 实际 {back}"
+    # 同一个坐标系 → 判为“同坐标系”, 不做换算
+    same = fit_frame(ground, ground)
+    assert same is not None and same.same_as_reference
+    # 少几个锚点(某视角少报了一些重生点)也照样能拟合
+    partial = fit_frame(ground, air[:-3])
+    assert partial is not None and abs(partial.scale - 1.0 / AIR_SCALE) < 0.05, \
+        partial.describe() if partial else "None"
+    # 锚点太少 → 拒绝拟合(宁可这一帧不动, 也不乱换算)
+    assert fit_frame(ground, air[:3]) is None
+    assert frame_anchors([{"type": "airfield", "icon": "none", "sx": 0.1},
+                          tank(0.5, 0.5)] + [
+                             {"type": "respawn_base_tank", "x": 0.2, "y": 0.3}]) == [(0.2, 0.3)]
+
+    # ② 跟踪: 前半段在地面视角, 后半段切到空战图 → **线路不能断**
+    rec = GlobalRecord(route_id="g7", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A")
+    t = 0.0
+
+    def frame(scale_points, units):
+        return units + [{"type": "respawn_base_tank", "icon": "respawn_base_tank",
+                         "x": p[0], "y": p[1]} for p in scale_points]
+
+    for i in range(20):                       # 地面视角
+        tr.feed(t, frame(ground, [tank(0.30 + 0.002 * i, 0.40),
+                                  tank(0.70 - 0.002 * i, 0.60, icon="IFV")]))
+        t += 0.05
+    for i in range(20, 40):                   # 换成空战图(坐标整体缩放/平移)
+        tr.feed(t, frame(air, [tank(*to_air((0.30 + 0.002 * i, 0.40))),
+                               tank(*to_air((0.70 - 0.002 * i, 0.60)), icon="IFV")]))
+        t += 0.05
+    assert tr.frame_changes == 1, f"应识别出一次坐标系变化, 实际 {tr.frame_changes}"
+    lives = tr.finish()
+    assert len(lives) == 2, f"坐标系变化不该把线路拆开, 实际 {len(lives)} 条"
+    assert all(not lf.dead for lf in lives), "没人消失, 不该判击毁"
+    for lf in lives:
+        assert lf.points[-1].t > 1.5, "空战图那段也应该继续录到点"
+        assert 0.0 <= lf.points[-1].x <= 1.0 and 0.0 <= lf.points[-1].y <= 1.0, \
+            "换算后必须回到地面坐标系内"
+    by_y = sorted(lives, key=lambda lf: lf.points[0].y)
+    assert abs(by_y[0].points[-1].x - (0.30 + 0.002 * 39)) < 0.01, by_y[0].points[-1]
+    assert abs(by_y[1].points[-1].x - (0.70 - 0.002 * 39)) < 0.01, by_y[1].points[-1]
+
+    # ③ 换视角的那几秒**不判击毁**(单位消失更可能是“看不见了”)
+    rec2 = GlobalRecord(route_id="g8", map_key="M", map_name="地图", created_at="")
+    tr2 = GlobalTracker(rec2, "A")
+    t = 0.0
+    for i in range(20):                       # A/B/C 三辆都在
+        tr2.feed(t, frame(ground, [tank(0.30 + 0.002 * i, 0.40),
+                                   tank(0.50, 0.50, icon="IFV"),
+                                   tank(0.70, 0.70, icon="LightTank")]))
+        t += 0.05
+    for i in range(20, 60):                   # 切到空战图: B 看不见了
+        tr2.feed(t, frame(air, [tank(*to_air((0.30 + 0.002 * i, 0.40))),
+                               tank(*to_air((0.70, 0.70)), icon="LightTank")]))
+        t += 0.05
+    gone = [lf for lf in tr2.lives if abs(lf.points[0].y - 0.50) < 1e-6]
+    assert gone, "B 那条线应该已经结束"
+    assert gone[0].dead is False, "刚换视角就消失, 不能判成被击毁"
+    # 换成空战图 5 秒后 C 也消失了(视野里真的没了) → 这时才允许判击毁
+    t += VIEW_CHANGE_GRACE + 1.0
+    for k in range(30):
+        tr2.feed(t, frame(air, [tank(*to_air((0.30, 0.40)))]))
+        t += 0.05
+    killed = [lf for lf in tr2.lives if abs(lf.points[0].y - 0.70) < 1e-6]
+    assert killed and killed[0].dead is True, "过了宽限期再消失 → 应判为击毁"
+    results.append("全局录制: 空战图坐标换算(线路不断/换视角不误判击毁) OK")
 
 
 def test_tracker_dead_flag():
@@ -670,6 +767,7 @@ def main() -> int:
     test_tracker_speed()
     test_tracker_empty_stop()
     test_tracker_dead_flag()
+    test_frame_align()
     test_store(tmpdir)
     test_map_paint()
     test_live_layer_no_rebuild()
@@ -685,3 +783,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
