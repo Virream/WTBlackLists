@@ -509,7 +509,23 @@ def test_player_heading():
 
     rec_old = playback_rec(0.0, 0.0)           # 旧轨迹: 点里没有朝向
     view.set_playback(rec_old, 2.0)
-    assert cursor_bright(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画圈和点"
+    assert cursor_bright(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画点"
+
+    # 光标**只留实心圆**(2026-10-21 用户要求): 外圈半径 9 那一圈不该有白像素
+    img = render_now()
+    cur = point_at(rec_old.points, 2.0)
+    c = view.map_pos(cur.x, cur.y)
+    ring = 0
+    for deg in range(0, 360, 10):
+        x = int(c.x() + 9 * math.cos(math.radians(deg)))
+        y = int(c.y() + 9 * math.sin(math.radians(deg)))
+        col = img.pixelColor(x, y)
+        if col.red() > 150 and col.green() > 150 and col.blue() > 150:
+            ring += 1
+    assert ring == 0, f"回放光标不该再有外环(半径 9 上有 {ring} 个白像素)"
+    core = img.pixelColor(int(c.x()), int(c.y()))
+    assert core.red() > 200 and core.green() > 200 and core.blue() > 200, (
+        f"光标中心应是一个实心白点, 实际 {core.name()}")
     view.set_playback(None)
 
     view.set_player(None)

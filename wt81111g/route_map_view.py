@@ -39,11 +39,12 @@ PLAYER_DOT_R = 4.0            # 圆心实心点半径
 PLAYER_DIR_BACK = 4.0         # 两只脚相对圆心的前进量(越小越贴近圆心)
 PLAYER_DIR_W = 5.0            # 两只脚相对中轴的横向半宽(越大越岔开)
 PLAYER_DIR_H = 4.5            # 尖点比两只脚连线再往前多少
-# 回放光标**不画 ^**, 而是沿车头方向的一根**白线**(车头朝上时就是竖线);
-# 两头分别贴住光标的白点(半径 3)与白圈(描边内沿≈6.9) → 看着连成一体
+# 回放光标 = **一个实心白点**(多条一起回放时环太乱, 2026-10-21 用户要求去掉环);
+# 朝向仍用一根白线表示, 线起点贴住这个点(半径 PLAY_CURSOR_R)
+PLAY_CURSOR_R = 3.0           # 回放光标白点半径
 CURSOR_DIR_BACK = 3.0         # 线起点到光标中心的距离
 CURSOR_DIR_LEN = 3.8          # 线长
-COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放白圈同色系)
+COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光标同色)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
 # 回放时**尚未播放**的轨迹段: 半透明淡色 —— 半透明只用在这里
@@ -1131,20 +1132,19 @@ class RouteMapView(QWidget):
                 self._draw_time_label(p, center, fmt_time(mk.t), color)
 
     def _draw_play_cursor(self, p: QPainter, rec: RouteRecord, head: float) -> None:
-        """回放光标: 白色圆环 + 中心点(位置由时间插值得到, 移动才平滑)。"""
+        """回放光标: **只有一个实心白点**(位置由时间插值得到, 移动才平滑)。
+
+        以前是“一个环套一个小实心圆”, 多条轨迹一起回放时十几个环挤在一起太乱
+        (2026-10-21 用户要求) —— 现在只保留实心圆, 朝向仍用那根白线表示。
+        """
         cur = point_at(rec.points, head)
         if cur is None:
             return
         c = self._to_px(cur.x, cur.y)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(15, 23, 42, 180), 4.5))
-        p.drawEllipse(c, 8.0, 8.0)
-        p.setPen(QPen(QColor("#f8fafc"), 2.2))
-        p.drawEllipse(c, 8.0, 8.0)
         p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QBrush(QColor("#f8fafc")))
-        p.drawEllipse(c, 3.0, 3.0)
-        # 录制时存过朝向就一起画出来(旧轨迹的点没有朝向 → 只画圈和点)
+        p.drawEllipse(c, PLAY_CURSOR_R, PLAY_CURSOR_R)
+        # 录制时存过朝向就一起画出来(旧轨迹的点没有朝向 → 只画那个点)
         self._draw_cursor_dir(p, c, cur.dx, cur.dy)
 
     def _draw_playback(self, p: QPainter, rec: RouteRecord, head: float,
