@@ -1036,9 +1036,10 @@ class RouteTesterWindow(QMainWindow):
         """当前视图(回放中的 / 眼睛点亮的轨迹)对应的模式指纹(取不到就空串)。
 
         多条轨迹时只在它们指纹一致时才返回 —— 否则无法决定画哪套战区。
+        全局线路(UnitLife)**没有** `zone_signature`, 直接跳过(它们不影响战区选择)。
         """
         recs = self.map_view.playback_records or self.map_view.visible_tracks
-        sigs = {r.zone_signature for r in recs if r.zone_signature}
+        sigs = {s for r in recs if (s := getattr(r, "zone_signature", ""))}
         return sigs.pop() if len(sigs) == 1 else ""
 
     def _apply_zones(self, info: dict | None = None) -> None:

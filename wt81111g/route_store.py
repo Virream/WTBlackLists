@@ -41,6 +41,7 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
+from typing import ClassVar
 
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
@@ -184,6 +185,19 @@ class UnitLife:
     def marks(self) -> list:
         """全局线路没有标记点 ⇒ 回放时“到下一标记暂停”会直接播到底。"""
         return []
+
+    # ---- 下面两个只为了让绘制/悬停那套代码把它当成普通轨迹(鸭子类型)
+    @property
+    def vehicle(self) -> str:
+        return self.icon or self.obj_type or "未知单位"
+
+    @property
+    def created_at(self) -> str:
+        return ""                  # 全局线路没有独立的录制时刻(它属于整局)
+
+    # 速度配色的基准固定 120 km/h: 这样“红=快”在所有玩家之间可比,
+    # 而且实时预览的分桶索引不会随最高速变化(增量缓存才成立)。
+    speed_scale: ClassVar[float] = 120.0
 
     @property
     def t0(self) -> float:
@@ -380,12 +394,13 @@ def point_at(points: list[RoutePoint], t: float) -> RoutePoint | None:
     k = 0.0 if span <= 0 else (t - a.t) / span
     # 朝向取**更近那一端**的采样值: 单位向量做线性插值在掉头时会退化成零向量
     # (方向丢失), 而采样间隔只有几十 ms, 取端点肉眼看不出跳变。
+    # 全局线路的 TrackPoint **没有朝向**(用户要求忽略朝向) → getattr 兜成 0,0。
     src = a if k < 0.5 else b
     return RoutePoint(x=a.x + (b.x - a.x) * k,
                       y=a.y + (b.y - a.y) * k,
                       t=t,
                       speed=a.speed + (b.speed - a.speed) * k,
-                      dx=src.dx, dy=src.dy)
+                      dx=getattr(src, "dx", 0.0), dy=getattr(src, "dy", 0.0))
 
 
 def split_points(points: list[RoutePoint],

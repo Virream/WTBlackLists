@@ -100,6 +100,44 @@ def _normalized(x: float, y: float) -> QPointF:
     return QPointF(x, y)
 
 
+class _LiveGeom:
+    """一条全局线路的**增量**分桶几何。
+
+    把“按线段中点速度分桶 + 每桶一个 QPolygonF”做成可增量更新的版本:
+    调用方每次只喂**完整点列表**, 本对象只处理新增的那几段, 并且只把“这帧加过点”的
+    桶重新构造成 `QPolygonF`(其他桶直接用缓存)。
+
+    为什么不用 `_seg_cache` 那套: 那套在点数变化时**整条重算**(O(点数)),
+    录制时每 0.2 秒每条线都变 → 40 条线一起重算, 直接把 25Hz 拖到 8Hz。
+    """
+    __slots__ = ("n", "pts", "polys", "dirty")
+
+    def __init__(self) -> None:
+        self.n = 0                                   # 已处理的点数
+        self.pts: dict[int, list[QPointF]] = {}      # 桶 -> 点对列表
+        self.polys: dict[int, QPolygonF] = {}        # 桶 -> 缓存的画笔几何
+        self.dirty: set[int] = set()
+
+    def feed(self, points, vmax: float) -> dict[int, list[QPointF]]:
+        """处理新增的点。返回**本次新增**的线段(按速度桶分组), 供“只补新段”的增量绘制用。"""
+        n = len(points)
+        if n < self.n:                               # 点数变少(不该发生) → 从头来
+            self.n, self.pts, self.polys, self.dirty = 0, {}, {}, set()
+        added: dict[int, list[QPointF]] = {}
+        for i in range(max(1, self.n), n):
+            a, b = points[i - 1], points[i]
+            idx = bucket_index((a.speed + b.speed) / 2.0, vmax)
+            pair = (QPointF(a.x, a.y), QPointF(b.x, b.y))
+            self.pts.setdefault(idx, []).extend(pair)
+            added.setdefault(idx, []).extend(pair)
+            self.dirty.add(idx)
+        self.n = n
+        for idx in self.dirty:
+            self.polys[idx] = QPolygonF(self.pts[idx])
+        self.dirty.clear()
+        return added
+
+
 def speed_color(speed: float, vmax: float) -> QColor:
     """速度 → 颜色: 慢(蓝) → 快(红)。"""
     ratio = 0.0 if vmax <= 0 else max(0.0, min(1.0, speed / vmax))
@@ -185,6 +223,8 @@ class RouteMapView(QWidget):
         self._highlight: list[RouteRecord] = []
         # 全局录制“边录边画”的线路(与单条录制的 _live 同一套画法: 速度配色)
         self._live_multi: list = []
+        # 逐条增量累加的分桶几何: route_id -> _LiveGeom(见 _draw_live_multi)
+        self._live_seg: dict[str, _LiveGeom] = {}
         self._player: tuple[float, float] | None = None
         # 车头朝向(归一化单位方向向量 dx/dy, 与 /map.img 同坐标系); None = 只画点不画方向
         self._player_dir: tuple[float, float] | None = None
@@ -223,6 +263,12 @@ class RouteMapView(QWidget):
         self._play_key: tuple | None = None
         self._play_anchor: tuple[float, float] | None = None
         self._play_drawn: dict[str, int] = {}       # route_id -> 已画进累加层的点数
+        # 全局录制“边录边画”的累加层(见 _layer_live)
+        self._live_layer: QImage | None = None
+        self._live_ids: tuple | None = None
+        self._live_anchor: tuple[float, float] | None = None
+        self._live_size: tuple[float, float] = (0.0, 0.0)
+        self._live_timer: QTimer | None = None
         # 闪烁动画(只在有战区 blink>0 时跑, 不给静止画面白耗 CPU)
         self._blink_t = 0.0
         self._blink_timer = QTimer(self)
@@ -412,10 +458,18 @@ class RouteMapView(QWidget):
     def set_live_multi(self, recs: list | None) -> None:
         """全局录制期间“边录边画”的线路(一次几十条, 都用速度配色)。
 
-        它们与单条录制的 `_live` 走同一条绘制路径(`_draw_route`),
-        所以元素只需具备 `.points`(带 x/y/t/speed) 与 `.route_id`(缓存键)。
+        它们**不进缓存层**: 录制时几乎每帧都有新点, 层指纹一直在变, 那样每帧都要把
+        全部轨迹重画一遍 —— 实测把 25Hz 轮询拖到 8Hz。改成每帧直接画, 并且分桶几何
+        **增量累积**(见 `_draw_live_multi`)。
         """
         self._live_multi = list(recs or [])
+        ids = {getattr(r, "route_id", "") for r in self._live_multi}
+        for rid in [k for k in self._live_seg if k not in ids]:
+            self._live_seg.pop(rid, None)      # 录制已结束/被清掉 → 丢掉它的缓存
+        if not self._live_multi:               # 录完了 → 释放累加层(省一张窗口大小的图)
+            self._live_layer = None
+            self._live_ids = None
+            self._live_seg.clear()
         self.update()
 
     @property
@@ -470,6 +524,10 @@ class RouteMapView(QWidget):
     def clear(self) -> None:
         self._live = None
         self._live_multi = []
+        self._live_seg.clear()
+        self._live_layer = None
+        self._live_ids = None
+        self._live_size = (0.0, 0.0)
         self._visible = []
         self._highlight = []
         self._player = None
@@ -594,6 +652,12 @@ class RouteMapView(QWidget):
                     self._blit_layer(p, top, self._track_anchor)
                 else:
                     self._draw_tracks(p)
+            # 全局录制“边录边画”: 走累加层(每帧只补新段; 缩放时先缩放贴图)
+            if self._live_multi:
+                got = self._layer_live()
+                if got is not None:
+                    layer_live, live_scale = got
+                    self._blit_layer_scaled(p, layer_live, self._live_anchor, live_scale)
             self._draw_player(p)
 
             if self._hover_text:
@@ -627,9 +691,6 @@ class RouteMapView(QWidget):
         hi = list(self._highlight)
         if self._live is not None and all(r is not self._live for r in hi):
             hi.append(self._live)
-        for rec in self._live_multi:
-            if all(r is not rec for r in hi):
-                hi.append(rec)        # 全局录制“边录边画”的线路也是高亮层
         hi_ids = {id(r) for r in hi}
         total = len(self._visible) + len(hi)
         labels = total <= 1      # 多条时时间标签会完全重叠、无法阅读
@@ -640,10 +701,116 @@ class RouteMapView(QWidget):
         for rec in hi:
             self._draw_route(p, rec, history=False, vmax=self._vmax(rec), labels=labels)
 
+    def _draw_live_segments(self, p: QPainter, only_new: bool) -> None:
+        """把全局线路画到画笔 `p` 上。
+
+        `only_new=True` 时只画“这帧新增的段”(增量层用), 否则画全部(建层时用)。
+        坐标是归一化的, 靠 `_scaled()` 把画笔缩放成“地图本地像素”。
+        """
+        if not self._scaled(p):
+            return
+        s = self._px_scale()
+        try:
+            for rec in self._live_multi:
+                geom = self._live_seg.get(rec.route_id)
+                if geom is None:
+                    geom = _LiveGeom()
+                    self._live_seg[rec.route_id] = geom
+                vmax = self._vmax(rec)
+                added = geom.feed(rec.points, vmax)
+                buckets = added if only_new else geom.polys
+                for idx, poly in buckets.items():
+                    speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
+                    p.setPen(QPen(speed_color(speed, vmax), TRACK_PEN / s,
+                                  Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                  Qt.PenJoinStyle.RoundJoin))
+                    p.drawLines(QPolygonF(poly) if only_new else poly)
+        finally:
+            p.restore()
+
+    def _draw_live_layer(self, lp: QPainter) -> None:
+        """建层时: 把全部已有段画一遍(之后每帧只补新段)。"""
+        self._draw_live_segments(lp, only_new=False)
+
+    def _build_live_layer(self, ids: tuple) -> QImage | None:
+        """从头重建实时层(缩放停下后 / 录制重开时)。"""
+        self._live_ids = ids
+        self._live_size = self._map_size()
+        self._live_anchor = (self._map_rect().left(), self._map_rect().top())
+        self._live_layer = self._make_layer(self._draw_live_layer, self._live_anchor)
+        return self._live_layer
+
+    def _schedule_live_rebuild(self) -> None:
+        """缩放过程中不重建(一次重建实测 270 ms), 停手 200ms 后再重建。"""
+        if self._live_timer is None:
+            self._live_timer = QTimer(self)
+            self._live_timer.setSingleShot(True)
+            self._live_timer.timeout.connect(self._rebuild_live_now)
+        self._live_timer.start(200)
+
+    def _rebuild_live_now(self) -> None:
+        if not self._live_multi:
+            return
+        self._live_layer = None
+        self._live_ids = None
+        self.update()
+
+    def _layer_live(self) -> tuple[QImage, tuple[float, float]] | None:
+        """全局录制的**累加层**: 返回 (图层, 缩放比), 由调用方负责贴图。
+
+        三条实测过的坑(别改回去):
+
+        1. 放进静态轨迹层 → 每帧都有新点 → 层指纹每帧变 → 每帧把全部轨迹重画一遍,
+           25Hz 轮询被拖到 8Hz;
+        2. 每帧直接画全部线路 → **240 ms/帧**(4.8 万个抗锯齿线段);
+        3. 因此做成累加层: 每帧只补“这 0.04 秒新增的几段”, 稳态 **3.5 ms/帧**。
+
+        缩放时几何全变, 重建一次要 **270 ms**(40 条线 × 1200 点) → 缩放过程中先按比例
+        把旧图层贴上去(立即有反馈), 停手 200ms 后再重建。
+        """
+        ids = tuple(getattr(r, "route_id", "") for r in self._live_multi)
+        size = self._map_size()
+        if self._live_layer is None or self._live_ids != ids:
+            layer = self._build_live_layer(ids)
+            return (layer, (1.0, 1.0)) if layer is not None else None
+        if size != self._live_size and self._live_size[0] > 0 and self._live_size[1] > 0:
+            # 缩放/改窗口 → 旧图层按比例贴(即时反馈), 稍后重建
+            self._schedule_live_rebuild()
+            return (self._live_layer,
+                    (size[0] / self._live_size[0], size[1] / self._live_size[1]))
+        # 稳态: 只补新段
+        mx, my = self._margin()
+        p = QPainter(self._live_layer)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            p.translate(self._live_anchor[0] + mx, self._live_anchor[1] + my)
+            self._draw_live_segments(p, only_new=True)
+        except Exception:  # noqa: BLE001
+            log.exception("补画全局线路失败")
+        finally:
+            p.end()
+        return self._live_layer, (1.0, 1.0)
+
+    def _blit_layer_scaled(self, p: QPainter, layer: QImage,
+                           anchor: tuple[float, float], scale: tuple[float, float]) -> None:
+        """按 scale 贴图(缩放过程中的临时显示)。
+
+        画笔已在“地图本地坐标”里: 先按比例缩放画笔, 再按**建层时**的锚点贴 ——
+        这样图层内容 c 会落在 c×scale 处, 正好与新的地图尺寸对得上。
+        """
+        if scale == (1.0, 1.0):
+            self._blit_layer(p, layer, anchor)
+            return
+        p.save()
+        try:
+            p.scale(scale[0], scale[1])
+            self._blit_layer(p, layer, anchor)
+        finally:
+            p.restore()
+
     def _margin(self) -> tuple[float, float]:
         """缓存层四周的余量(像素): 拖动地图时靠偏移贴图复用, 不必重建。"""
         return (self.width() * LAYER_MARGIN, self.height() * LAYER_MARGIN)
-
     def _make_layer(self, draw, anchor: tuple[float, float]) -> QImage | None:
         """把一次绘制结果渲进离屏图像(拿不到就返回 None, 上层退回直接绘制)。
 
@@ -704,7 +871,6 @@ class RouteMapView(QWidget):
 
         return (self._geom_key(), sig(self._visible), sig(self._highlight),
                 (live.route_id, len(live.points), len(live.marks)) if live else None,
-                sig(self._live_multi),
                 sig(self._playback_recs),
                 round(self._playhead, 3) if self._playback_recs else None,
                 self._show_spawns, self._spawns_ver)
@@ -805,11 +971,23 @@ class RouteMapView(QWidget):
         return True
 
     def _vmax(self, rec: RouteRecord) -> float:
-        """该轨迹的峰值速度(速度配色的基准), 按记录 + 点数缓存。"""
+        """该轨迹的峰值速度(速度配色的基准), 按记录 + 点数缓存。
+
+        全局线路(UnitLife)自带 `speed_scale`(固定 120 km/h) —— 因为它们**边录边长**,
+        若用“当前最高速”做基准, 分桶索引会跟着变、增量缓存就失效了。
+        """
+        fixed = getattr(rec, "speed_scale", 0.0)
+        if fixed:
+            return float(fixed)
         n = len(rec.points)
         got = self._vmax_cache.get(rec.route_id)
         if got is not None and got[0] == n:
             return got[1]
+        if got is not None and got[0] < n:
+            # 增量: 只看新来的点(单条录制时点数也在涨)
+            value = max(got[1], max((p.speed for p in rec.points[got[0]:]), default=0.0))
+            self._vmax_cache[rec.route_id] = (n, value)
+            return value
         value = max(max((pt.speed for pt in rec.points), default=0.0), 1.0)
         self._vmax_cache[rec.route_id] = (n, value)
         return value
@@ -1302,7 +1480,11 @@ class RouteMapView(QWidget):
         best: tuple[RouteRecord, RoutePoint] | None = None
         best_d2 = HOVER_RADIUS ** 2
         for rec in self._hover_candidates():
-            for pt in rec.points:
+            pts = rec.points
+            # 全局线路可能几千个点、一次几十条 → 抽样命中(每帧扫几万个点会卡)
+            step = 1 if len(pts) <= 400 else len(pts) // 400
+            for i in range(0, len(pts), step):
+                pt = pts[i]
                 px = self._to_px(pt.x, pt.y)
                 d2 = (px.x() - mx) ** 2 + (px.y() - my) ** 2
                 if d2 < best_d2:
@@ -1316,10 +1498,11 @@ class RouteMapView(QWidget):
         第二行 = 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差)。
         """
         if rec is self._live:
-            head = f"录制中 | 车型 {rec.vehicle}"
+            head = f"录制中 | 车型 {getattr(rec, 'vehicle', '?')}"
         else:
-            ts = rec.created_at[11:16] if len(rec.created_at) >= 16 else ""
-            head = " | ".join(x for x in (ts, f"车型 {rec.vehicle}",
+            created = getattr(rec, "created_at", "") or ""
+            ts = created[11:16] if len(created) >= 16 else ""
+            head = " | ".join(x for x in (ts, f"车型 {getattr(rec, 'vehicle', '?')}",
                                           f"用时 {fmt_time(rec.duration)}") if x)
         return (f"{head}\n"
                 f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h")

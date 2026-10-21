@@ -17,6 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+from PyQt6.QtGui import QImage
 from PyQt6.QtWidgets import QApplication
 
 import wt81111g.route_window as rw
@@ -309,6 +310,13 @@ def test_window(tmpdir: str):
     app.processEvents()
     assert len(win.player.records) == 4 and win._in_playback()
     assert win.map_view.playback_records, "回放对象没交给地图"
+    # 真渲染一帧: 回放光标/时间轴会读点的朝向, 全局点没有 dx/dy(曾经在这里崩过)
+    win.player.seek(0.5)
+    app.processEvents()
+    img = QImage(win.map_view.size(), QImage.Format.Format_ARGB32)
+    win.map_view.render(img)
+    win.player.seek(0.4)
+    win.map_view.render(img)
     win._end_playback()
     app.processEvents()
     life_items = list(win._iter_life_items())
@@ -472,6 +480,67 @@ def test_only_global(tmpdir: str):
     results.append("全局录制: 只有全局条目的地图也能正常挂在侧栏 OK")
 
 
+def test_live_layer_no_rebuild():
+    """录制中的“边录边画”**不能每帧重建整层**(曾经把 25Hz 拖到 8Hz、缩放卡成幻灯片)。
+
+    断言两件事:
+    * 新增点 → 只在旧图层上补几段, 层对象还是同一个(不重建);
+    * 缩放 → 先按比例贴旧图(返回缩放比 ≠ 1), 稍后才重建。
+    """
+    from wt81111g.route_map_view import RouteMapView
+
+    def png(size=256):
+        from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
+        from PyQt6.QtGui import QColor
+        img = QImage(size, size, QImage.Format.Format_RGB32)
+        img.fill(QColor("#334455"))
+        ba = QByteArray()
+        buf = QBuffer(ba)
+        buf.open(QIODevice.OpenModeFlag.WriteOnly)
+        img.save(buf, "PNG")
+        buf.close()
+        return bytes(ba)
+
+    view = RouteMapView()
+    view.resize(600, 500)
+    view.set_map_bytes(png(), key="M")
+    life = UnitLife(life_id="L1", icon="IFV", obj_type="ground_model", map_key="M",
+                    points=[TrackPoint(0.2 + 0.01 * i, 0.3 + 0.005 * i, i * 0.2, 30.0)
+                            for i in range(20)])
+    view.set_live_multi([life])
+    view.show()
+    app = QApplication.instance()
+    app.processEvents()
+    canvas = QImage(view.size(), QImage.Format.Format_ARGB32)
+    view.render(canvas)
+    layer = view._live_layer
+    assert layer is not None, "没有建出实时层"
+
+    # 新增点 → 只补段, 层对象不变
+    for i in range(20):
+        life.points.append(TrackPoint(0.2 + 0.01 * i, 0.31 + 0.005 * i,
+                                      4.0 + i * 0.2, 35.0))
+    view.render(canvas)
+    assert view._live_layer is layer, "新点不该导致整层重建"
+    got = view._layer_live()
+    assert got is not None and got[1] == (1.0, 1.0)
+
+    # 缩放 → 先缩放贴旧图(立即反馈), 不重建
+    view._zoom *= 1.25
+    view.update()
+    view.render(canvas)
+    got = view._layer_live()
+    assert got is not None and got[0] is layer, "缩放时不该立刻重建"
+    assert abs(got[1][0] - 1.25) < 1e-6, f"应按缩放比贴图, 实际 {got[1]}"
+
+    # 停手后重建(定时器触发)
+    view._rebuild_live_now()
+    app.processEvents()
+    view.render(canvas)
+    assert view._live_layer is not layer, "停手后应重建一次以恢复清晰度"
+    results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -482,6 +551,7 @@ def main() -> int:
     test_tracker_empty_stop()
     test_store(tmpdir)
     test_map_paint()
+    test_live_layer_no_rebuild()
     test_window(tmpdir)
     test_only_global(tmpdir)
     test_buttons_and_map_lock(tmpdir)
