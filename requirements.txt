@@ -1,2 +1,7 @@
 PyQt6>=6.6
 requests>=2.31
+# GPU 地图画布(wt81111g/route_map_gl.py)用；pygfx 会带上 wgpu-py/pylinalg/rendercanvas/numpy。
+# pygfx 还是 0.x、API 会变，所以**锁版本**；升级前先跑 tools/route_map_gl_demo.py 看效果。
+# 注意：Python 3.14 的 numpy 轮子在清华镜像上可能还没同步，装不上时改用官方源
+#   pip install -i https://pypi.org/simple pygfx
+pygfx==0.17.0
