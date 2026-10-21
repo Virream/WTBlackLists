@@ -26,7 +26,7 @@ from wt81111g.global_record import (
 )
 from wt81111g.map_cache import MapCache
 from wt81111g.route_store import (
-    GLOBAL_SIDES, GlobalRecord, RoutePoint, RouteStore, TrackPoint, UnitLife,
+    GLOBAL_SIDES, GlobalRecord, RoutePoint, RouteRecord, RouteStore, TrackPoint, UnitLife,
 )
 
 rw.play_sound = lambda action: None
@@ -443,6 +443,17 @@ def test_map_paint():
                     n += 1
         return n
 
+    # 配色基准必须与单条轨迹**完全一致**: 同样的速度 → 同样的颜色
+    rec = RouteRecord(route_id="R1", map_key="M", map_name="M", vehicle="T",
+                      created_at="", duration=2.0, start_x=0.2, start_y=0.3,
+                      points=[RoutePoint(p.x, p.y, p.t, p.speed) for p in life.points])
+    assert view._vmax(rec) == view._vmax(life), (
+        f"速度基准不一致: 单条 {view._vmax(rec)} vs 全局 {view._vmax(life)}")
+    for speed in (10.0, 37.5, 80.0):
+        a = bucket_index(speed, view._vmax(rec))
+        b = bucket_index(speed, view._vmax(life))
+        assert a == b, f"{speed} km/h 在两边的颜色档不同: {a} vs {b}"
+
     # 选中层(与单条轨迹一样): 按速度分档上色
     view.set_highlight([life])
     idx = bucket_index(25.0, 100.0)
@@ -515,10 +526,10 @@ def test_live_layer_no_rebuild():
     layer = view._live_layer
     assert layer is not None, "没有建出实时层"
 
-    # 新增点 → 只补段, 层对象不变
+    # 新增点 → 只补段, 层对象不变(速度基准没变)
     for i in range(20):
         life.points.append(TrackPoint(0.2 + 0.01 * i, 0.31 + 0.005 * i,
-                                      4.0 + i * 0.2, 35.0))
+                                      4.0 + i * 0.2, 30.0))
     view.render(canvas)
     assert view._live_layer is layer, "新点不该导致整层重建"
     got = view._layer_live()
@@ -543,16 +554,22 @@ def test_live_layer_no_rebuild():
     layer2 = view._live_layer
     for i in range(10):
         life.points.append(TrackPoint(0.2 + 0.01 * i, 0.32 + 0.005 * i,
-                                      6.0 + i * 0.2, 40.0))
+                                      6.0 + i * 0.2, 30.0))
     view.render(canvas)
     assert view._live_layer is layer2, "重建后新增点不该再触发重建"
     n_before = view._live_seg[life.route_id].n
     for i in range(10):
         life.points.append(TrackPoint(0.2 + 0.01 * i, 0.33 + 0.005 * i,
-                                      8.0 + i * 0.2, 45.0))
+                                      8.0 + i * 0.2, 30.0))
     view.render(canvas)
     assert view._live_seg[life.route_id].n > n_before, "缩放后线路不再增长(实时显示卡住)"
-    results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 + 缩放后仍能继续增长 OK")
+
+    # 速度基准(这条线的最高速)涨了 → 桶索引/颜色全变 → 必须整层重建
+    before_vmax = view._live_seg[life.route_id].vmax
+    life.points.append(TrackPoint(0.55, 0.55, 30.0, before_vmax * 2))
+    view.render(canvas)
+    assert view._live_seg[life.route_id].vmax > before_vmax, "速度基准应跟着最高速走"
+    results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 + 缩放后仍能增长 OK")
 
 
 def main() -> int:

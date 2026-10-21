@@ -41,7 +41,6 @@ import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
-from typing import ClassVar
 
 from .config import data_dir
 from .garage import GARAGE_MAP_SHA1
@@ -197,10 +196,6 @@ class UnitLife:
     @property
     def created_at(self) -> str:
         return ""                  # 全局线路没有独立的录制时刻(它属于整局)
-
-    # 速度配色的基准固定 120 km/h: 这样“红=快”在所有玩家之间可比,
-    # 而且实时预览的分桶索引不会随最高速变化(增量缓存才成立)。
-    speed_scale: ClassVar[float] = 120.0
 
     @property
     def t0(self) -> float:

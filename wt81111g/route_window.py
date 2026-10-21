@@ -931,20 +931,28 @@ class RouteTesterWindow(QMainWindow):
                 self._set_status("回放中无法修改轨迹显示, 请先点「■ 结束播放」", sticky=2.0)
                 return
             ids = self._life_ids_of(item)
-            self._set_lives_visible(ids, not any(i in self._visible_lives for i in ids))
+            label = item.text(_COL_NAME)
+            # 判断“这一层当前亮不亮”只算真实存在的线路(残留 id 会让点一下全灭)
+            live_ids = [gid for gid in ids if self._life_by_id(gid) is not None]
+            shown = not any(gid in self._visible_lives for gid in live_ids)
+            self._set_lives_visible(ids, shown, what=f"「{label}」")
 
-    def _set_lives_visible(self, ids: list[str], shown: bool) -> None:
+    def _set_lives_visible(self, ids: list[str], shown: bool, what: str = "") -> None:
         """统一控制“全局录制里的线路”在地图上的显示/隐藏。
 
         只点亮本条的线路时**不清掉别人**: 全局线路之间不冲突(它们同属一张地图,
         本来就是整局所有玩家的轨迹, 叠在一起才有意义)。
+
+        **只认真正存在的线路**: `_visible_lives` 里万一残留了已重录/删除的 id,
+        会让“点一下眼睛”的判断(any in ...)全错 —— 所以先过滤。
         """
-        if not ids:
+        existing = {gid for gid in ids if self._life_by_id(gid) is not None}
+        if not existing:
             return
         if shown:
-            self._visible_lives.update(ids)
+            self._visible_lives.update(existing)
         else:
-            self._visible_lives -= set(ids)
+            self._visible_lives -= existing
         self._refresh_eye_icons()
         self._refresh_map_tracks()
         if shown:
@@ -954,9 +962,10 @@ class RouteTesterWindow(QMainWindow):
                        for life in g.lives(side)):
                     self._ensure_map_for([g])
                     break
+        tail = f" {what}" if what else ""
         self._set_status(
-            f"{'已显示' if shown else '已隐藏'} {len(ids)} 条全局线路"
-            f"(当前共 {len(self._visible_lives)} 条)", sticky=2.0)
+            f"{'已显示' if shown else '已隐藏'}{tail} {len(existing)} 条全局线路"
+            f"(当前共 {len(self._visible_lives)} 条)", sticky=2.5)
 
 
     def _visible_route_ids(self) -> list[str]:
@@ -992,6 +1001,12 @@ class RouteTesterWindow(QMainWindow):
         高亮层**不会**把眼睛没点亮的轨迹画出来: 点眼睛时该行会先被选中,
         若高亮层又把它画回去, 就会看起来像“点了眼睛没反应”(2026-10-07 修的)。
         """
+        # 重录/删除后可能残留已经不存在的线路 id → 先剪掉（否则眼睛与显示会错位）
+        alive_lives = {life.life_id for g in self.store.globals
+                       for side in GLOBAL_SIDES for life in g.lives(side)}
+        if not self._visible_lives <= alive_lives:
+            self._visible_lives &= alive_lives
+            self._refresh_eye_icons()
         recs = [r for rid in self._visible_route_ids()
                 if (r := self.store.get(rid)) is not None]
         # 眼睛点亮的全局线路也当成普通轨迹画(灰色层)

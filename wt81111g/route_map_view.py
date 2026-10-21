@@ -96,6 +96,12 @@ TRACK_PEN = 2.4          # 选中的/正在录的(速度配色)
 PLAY_PEN = 2.6           # 回放中已播放的段
 
 
+# 全局线路的速度配色基准 = 这条线自己的最高速(**与单条轨迹完全一致**)。
+# 基准涨超过这个比例就整条重算(否则桶索引/颜色全是旧的)。取 4%: 颜色差肉眼看不出来,
+# 又能避免每涨 1 km/h 就重建一次。
+VMAX_REBUILD_RATIO = 0.04
+
+
 def _normalized(x: float, y: float) -> QPointF:
     """`build_speed_segments` 用的“坐标变换”: 原样返回归一化坐标。"""
     return QPointF(x, y)
@@ -108,22 +114,27 @@ class _LiveGeom:
     调用方每次只喂**完整点列表**, 本对象只处理新增的那几段, 并且只把“这帧加过点”的
     桶重新构造成 `QPolygonF`(其他桶直接用缓存)。
 
-    为什么不用 `_seg_cache` 那套: 那套在点数变化时**整条重算**(O(点数)),
-    录制时每 0.2 秒每条线都变 → 40 条线一起重算, 直接把 25Hz 拖到 8Hz。
+    速度基准(= 这条线的最高速, **与单条轨迹完全一致**)一变, 桶索引就全变了,
+    所以基准变化超过 `VMAX_REBUILD_RATIO` 时整条重算(调用方还得重建整个图层,
+    因为旧颜色已经画进图里了)。
     """
-    __slots__ = ("n", "pts", "polys", "dirty")
+    __slots__ = ("n", "pts", "polys", "dirty", "vmax")
 
     def __init__(self) -> None:
         self.n = 0                                   # 已处理的点数
         self.pts: dict[int, list[QPointF]] = {}      # 桶 -> 点对列表
         self.polys: dict[int, QPolygonF] = {}        # 桶 -> 缓存的画笔几何
         self.dirty: set[int] = set()
+        self.vmax = 0.0                             # 本几何用的速度基准
 
     def feed(self, points, vmax: float) -> dict[int, list[QPointF]]:
         """处理新增的点。返回**本次新增**的线段(按速度桶分组), 供“只补新段”的增量绘制用。"""
         n = len(points)
-        if n < self.n:                               # 点数变少(不该发生) → 从头来
+        changed = (self.vmax <= 0.0
+                   or abs(vmax - self.vmax) > VMAX_REBUILD_RATIO * self.vmax)
+        if n < self.n or changed:                    # 基准变了/点数变少 → 从头来
             self.n, self.pts, self.polys, self.dirty = 0, {}, {}, set()
+            self.vmax = vmax
         added: dict[int, list[QPointF]] = {}
         for i in range(max(1, self.n), n):
             a, b = points[i - 1], points[i]
@@ -795,6 +806,17 @@ class RouteMapView(QWidget):
             return (self._live_layer,
                     (size[0] / self._live_size[0], size[1] / self._live_size[1]))
         # 稳态: 只补新段
+        # 但速度基准(=最高速)涨了的话, 桶索引/颜色全都变 → 整个层重建
+        for rec in self._live_multi:
+            geom = self._live_seg.get(rec.route_id)
+            if geom is None or geom.vmax <= 0.0:
+                continue
+            vmax = self._vmax(rec)
+            if abs(vmax - geom.vmax) > VMAX_REBUILD_RATIO * geom.vmax:
+                self._live_layer = None
+                self._live_ids = None
+                layer = self._build_live_layer(ids)
+                return (layer, (1.0, 1.0)) if layer is not None else None
         mx, my = self._margin()
         p = QPainter(self._live_layer)
         try:
@@ -989,12 +1011,9 @@ class RouteMapView(QWidget):
     def _vmax(self, rec: RouteRecord) -> float:
         """该轨迹的峰值速度(速度配色的基准), 按记录 + 点数缓存。
 
-        全局线路(UnitLife)自带 `speed_scale`(固定 120 km/h) —— 因为它们**边录边长**,
-        若用“当前最高速”做基准, 分桶索引会跟着变、增量缓存就失效了。
+        单条轨迹与全局线路**用同一个规则**(每条线自己的最高速), 所以两边
+        “同样的速度 → 同样的颜色”。全局线路边录边长, 基准上涨时调用方会重建图层。
         """
-        fixed = getattr(rec, "speed_scale", 0.0)
-        if fixed:
-            return float(fixed)
         n = len(rec.points)
         got = self._vmax_cache.get(rec.route_id)
         if got is not None and got[0] == n:
