@@ -342,6 +342,9 @@ class GlobalRecord:
                     continue
                 life = UnitLife.from_json(row)
                 if life is not None:
+                    # 早期版本没存 map_key → 用条目自己的(否则切图后会被当成“别的地图”)
+                    if not life.map_key:
+                        life.map_key = rec.map_key
                     rec.sides[side].append(life)
         return rec
 
