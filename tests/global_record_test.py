@@ -395,6 +395,38 @@ def test_map_paint():
     results.append("地图: 全局线路按 A/B 队分色绘制 + 可清空 OK")
 
 
+def test_only_global(tmpdir: str):
+    """一张地图**只有全局录制**、没有单条路线时, 侧栏也要能正常挂出条目。"""
+    app = QApplication.instance()
+    win = make_window(tmpdir, "globals_only.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    win.show()
+    app.processEvents()
+    win.store.rename_map("MAPONLY", "只有全局")
+    g = win.store.new_global("MAPONLY", "只有全局", zone_count=2,
+                             zone_signature="A@0.2,0.2;B@0.8,0.8", mode_name="战区攻陷")
+    g.sides["A"].append(UnitLife(life_id=f"{g.route_id}:A1", icon="IFV",
+                                 points=[TrackPoint(0.2, 0.2, 0.0),
+                                         TrackPoint(0.3, 0.25, 2.0)]))
+    win.store.add_global(g)
+    win._reload_tree()
+    app.processEvents()
+    top = win.tree.topLevelItem(0)
+    assert top.text(rw._COL_NAME) == "只有全局", top.text(rw._COL_NAME)
+    mid = top.child(0)
+    assert mid.data(0, rw._ROLE_KIND) == "mode"
+    assert mid.text(rw._COL_NAME) == "战区攻陷", mid.text(rw._COL_NAME)
+    var = mid.child(0)
+    assert var.data(0, rw._ROLE_KIND) == "variant"
+    items = _children_kind(var, "global")
+    assert len(items) == 1, "只有全局录制的地图也要挂出条目"
+    # 信息列: “0 条 · 1 局”
+    assert "1 局" in top.text(rw._COL_TIME), top.text(rw._COL_TIME)
+    results.append("全局录制: 只有全局条目的地图也能正常挂在侧栏 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -406,6 +438,7 @@ def main() -> int:
     test_store(tmpdir)
     test_map_paint()
     test_window(tmpdir)
+    test_only_global(tmpdir)
     test_buttons_and_map_lock(tmpdir)
     for line in results:
         print("[OK]", line)
