@@ -478,15 +478,27 @@ class RouteMapGlView(QWidget):
         return super().eventFilter(obj, event)
 
     def _zoom_at(self, steps: float, pos: QPointF) -> None:
-        """以 `pos`(控件坐标)为中心缩放 `steps` 格(鼠标下那个点保持不动)。"""
+        """以 `pos`(控件坐标)为锚点缩放 `steps` 格 —— 鼠标下那一点保持不动。
+
+        坑(2026-10-21 用户反馈“只能在中间缩放”): 不能拿**归一化坐标之差**去改 `_pan`
+        (那是像素量), 两者差着地图尺寸的倍数, 补偿量小到等于没补 → 看着就是“以视图
+        中心缩放”。正确做法与软件版一致: 记下鼠标处的归一化坐标 `n`, 缩放后把 `n`
+        重新对齐回鼠标位置(直接算像素差)。
+        """
         if not steps:
             return
-        before = self._map_pos_at(pos)
-        self._zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * (WHEEL_STEP ** steps)))
-        self._clamp_pan()
-        after = self._map_pos_at(pos)
-        self._pan_x += after.x() - before.x()
-        self._pan_y += after.y() - before.y()
+        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * (WHEEL_STEP ** steps)))
+        if abs(new_zoom - self._zoom) < 1e-6:
+            return
+        r = self._map_rect()
+        if r.width() <= 0 or r.height() <= 0:
+            return
+        nx = (pos.x() - r.left()) / r.width()
+        ny = (pos.y() - r.top()) / r.height()
+        self._zoom = new_zoom
+        r2 = self._map_rect()
+        self._pan_x += pos.x() - (r2.left() + nx * r2.width())
+        self._pan_y += pos.y() - (r2.top() + ny * r2.height())
         self._clamp_pan()
         self.update()
 
