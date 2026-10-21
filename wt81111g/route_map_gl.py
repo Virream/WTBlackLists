@@ -30,6 +30,7 @@ from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QApplication, QVBoxLayout
 
 import pygfx as gfx
+import pylinalg as la
 from pygfx.utils.text import font_manager as _font_manager
 
 from . import route_map_view as rmv
@@ -72,7 +73,7 @@ def create_map_view(parent=None) -> RouteMapView:
         return RouteMapView(parent)
 
 # ---------------------------------------------------------------- 常量
-BG_COLOR = "#0b1220"
+BG_COLOR = rmv.COLOR_BG.name() if isinstance(rmv.COLOR_BG, QColor) else "#0f172a"
 CURSOR_DOT_R = rmv.PLAY_CURSOR_R
 PLAYER_DIR_COLOR = QColor("#f8fafc")
 
@@ -87,7 +88,12 @@ _FONT_CANDIDATES = (
 )
 _fonts_ready = False
 
-# z 层次(归一化地图坐标, 相机看向 -z)
+# z 层次(归一化地图坐标, 相机看向 -z)。
+#
+# **注意: z 不参与排序**。2D 叠加的顺序完全由 `render_order` 决定(见 `_add`),
+# 因为 pygfx 的 `depth_compare` 默认是严格的 "<", 两个对象放在同一 z 上时后画的
+# 那个会被**整个丢掉**(实测: 回放时未播放的灰底衬把彩色的已播放段全盖掉,
+# 画面上只剩一片灰线)。z 值现在只用于保持层次语义、便于排查。
 Z_MAP = -0.02
 Z_TRACK = 0.0
 Z_UNDER = 0.004
@@ -96,6 +102,36 @@ Z_SPAWN = 0.012
 Z_ZONE = 0.016
 Z_MARK = 0.022
 Z_PLAYER = 0.026
+
+# ---------------------------------------------------------------- 绘制顺序
+# pygfx 的排序键是 `(render_queue, group_order, render_order, 距离)`,
+# **render_queue 在 render_order 之前**。所以要让 `render_order` 成为唯一的排序键,
+# 必须把所有制材的 render_queue 统一(并关掉深度测试)。
+# 下面这些常量与软件版 `_paint()` 的调用顺序一一对应 —— 改这里就等于改叠放层次。
+RENDER_QUEUE = 3000
+O_MAP = -100
+O_BORDER = -90
+O_ZONE = -80          # 战区填充(在轨迹**之下**, 与软件版一致)
+O_ZONE_EDGE = -79
+O_ZONE_LABEL = -78
+O_SPAWN = -70         # 重生方块(在轨迹之下)
+O_UNDER = 10          # 回放未播放底衬
+O_TRACK = 20          # 轨迹本体
+O_MARK = 30           # 起/终点圆环
+O_MARK_DOT = 31       # 起点的实心点
+O_LABEL_BOX = 32      # 时间标签的深色底框
+O_LABEL_EDGE = 33     # 时间标签的彩色边框
+O_LABEL_TEXT = 34     # 时间标签文字
+O_DEAD = 40           # 阵亡叉
+O_CURSOR_DOT = 50     # 回放光标白点
+O_CURSOR_DIR = 51     # 光标朝向线
+O_PLAYER_RING = 60
+O_PLAYER_DOT = 61
+O_PLAYER_DIR = 62
+O_HOVER_RING = 70
+O_HOVER_BOX = 80
+O_HOVER_TEXT = 81
+O_STATUS = 90
 
 
 def _register_cjk_font() -> None:
@@ -287,6 +323,10 @@ class RouteMapGlView(RouteMapView):
             self._plane = gfx.Mesh(gfx.plane_geometry(1, 1),
                                    gfx.MeshBasicMaterial(map=self._tex))
             self._plane.local.position = (0.5, 0.5, Z_MAP)
+            # 底图也是 2D 叠加的一层(必须关深度测试, 否则它会和别的层抢 z)
+            self._plane.material.depth_test = False
+            self._plane.material.render_queue = RENDER_QUEUE
+            self._plane.render_order = O_MAP
             self._scene.add(self._plane)
         self.update()
 
@@ -364,7 +404,7 @@ class RouteMapGlView(RouteMapView):
                 getattr(live, "route_id", "") if live else None,
                 sig(self._live_multi), sig(self._playback_recs),
                 self._show_zones, zones, self._show_spawns, self._spawns_ver,
-                self._map_digest)
+                self._map_digest, self._hover_text, self._status)
 
     def _clear_objects(self) -> None:
         for obj in self._gl_objs:
@@ -373,7 +413,26 @@ class RouteMapGlView(RouteMapView):
         self._gl_tracks = []
         self._hover_obj = None
 
-    def _add(self, obj):
+    def _add(self, obj, order: float = 0.0):
+        """加入场景, 并把整个场景统一成“画家算法”的 2D 叠加。
+
+        为什么要这么做(源码依据 `renderers/wgpu/engine/renderer.py`):
+
+        1. 排序键是 `(render_queue, group_order, render_order, 距离)` ——
+           **render_queue 比 render_order 优先**, 所以不同 render_queue 的对象
+           无论怎么设 render_order 都不能按我们的意思叠;
+        2. `Material.depth_compare` 默认是严格的 `"<"`, 同一 z 上后画的对象会被
+           深度测试**整个丢掉**。之前未播放底衬和已播放彩色段共用 `Z_PLAY`,
+           结果灰底衬把彩线全盖了(用户 2026-10-22 截图)。
+
+        因此: 关掉深度测试 + 统一 render_queue, 让 `render_order` 成为唯一排序键,
+        与 QPainter 的调用顺序一一对应。
+        """
+        mat = getattr(obj, "material", None)
+        if mat is not None:
+            mat.depth_test = False
+            mat.render_queue = RENDER_QUEUE
+        obj.render_order = order
         self._scene.add(obj)
         self._gl_objs.append(obj)
         return obj
@@ -406,14 +465,16 @@ class RouteMapGlView(RouteMapView):
         # 3) 全局录制中“边录边画”的线路: 始终画
         for rec in self._live_multi:
             self._make_track(rec, colored=True, under=False)
-        # 4) 重生方块 / 战区 / 阵亡叉 / 玩家 / 光标
+        # 4) 重生方块 / 战区 / 起终点标记 / 阵亡叉 / 玩家 / 光标
         self._build_spawns()
         self._build_zones()
+        self._build_marks()
         self._build_dead_marks()
         self._build_player()
         self._build_cursor()
         self._build_border()
         self._build_hover()
+        self._build_status()
 
     def _make_track(self, rec, *, colored: bool, under: bool) -> None:
         pts = getattr(rec, "points", None)
@@ -433,7 +494,7 @@ class RouteMapGlView(RouteMapView):
             line = self._add(gfx.Line(
                 gfx.Geometry(positions=pos),
                 gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                        color=_rgba(rmv.COLOR_HISTORY))))
+                                        color=_rgba(rmv.COLOR_HISTORY))), O_TRACK)
             self._gl_tracks.append(_Track(rec, pos, None, 0.0, line, None, segs, cap))
             return
         vmax = self._vmax(rec)
@@ -444,8 +505,7 @@ class RouteMapGlView(RouteMapView):
             under_obj = self._add(gfx.Line(
                 gfx.Geometry(positions=pos),
                 gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                        color=_rgba(rmv.COLOR_UNPLAYED)),
-                render_order=-1))
+                                        color=_rgba(rmv.COLOR_UNPLAYED))), O_UNDER)
         play = self._add(gfx.Line(
             # 回放(under=True)的“已播放”从空开始, 由进度逐段填色;
             # 录制/预览的线路本身就整条可见, 直接带着颜色开始
@@ -453,12 +513,9 @@ class RouteMapGlView(RouteMapView):
                          colors=np.zeros_like(colors) if under else colors.copy()),
             gfx.LineSegmentMaterial(thickness=rmv.PLAY_PEN, thickness_space="screen",
                                     color_mode="vertex", aa=True,
-                                    # 必须显式 blend: 顶点 alpha=1 时 auto 会判成 solid,
-                                    # 而半透明的底衬属于 blend 队列 —— pygfx 先画 solid
-                                    # 再画 blend, 底衬就会把彩线整个盖掉(实测画面只剩
-                                    # 蓝灰底衬色)。同类之后才能靠 render_order/z 排序。
-                                    alpha_mode="blend"),
-            render_order=1))
+                                    # 显式 blend: 顶点 alpha 都是 1 时 auto 会把它
+                                    # 当成不透明材质, 排到另一个 render_queue 去
+                                    alpha_mode="blend")), O_TRACK)
         self._gl_tracks.append(_Track(rec, pos, colors, vmax, under_obj, play, segs, cap))
 
     def _extend_tracks(self) -> None:
@@ -499,6 +556,7 @@ class RouteMapGlView(RouteMapView):
 
     # ---------------------------------------------------- 图元: 重生/战区/叉
     def _build_spawns(self) -> None:
+        """重生方块: 深色垫底(粗) + 归属色(细), 与软件版一致。"""
         if not self._show_spawns or not self._spawns:
             return
         dw, dh = self._map_size()
@@ -522,17 +580,26 @@ class RouteMapGlView(RouteMapView):
                 cols += [*col, *col]
         if not pos:
             return
+        arr = np.array(pos, dtype=np.float32).reshape(-1, 3)
+        # 深色垫底: 比方块粗 1.4px(软件版 SPAWN_PEN + 1.4), 浅色底图上也能看清
         self._add(gfx.Line(
-            gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
+            gfx.Geometry(positions=arr.copy()),
+            gfx.LineSegmentMaterial(thickness=rmv.SPAWN_PEN + 1.4,
+                                    thickness_space="screen",
+                                    color=_rgba(QColor(15, 23, 42, 200)))), O_SPAWN)
+        self._add(gfx.Line(
+            gfx.Geometry(positions=arr,
                          colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
             gfx.LineSegmentMaterial(thickness=rmv.SPAWN_PEN, thickness_space="screen",
-                                    color_mode="vertex")))
+                                    color_mode="vertex")), O_SPAWN)
 
     def _build_zones(self) -> None:
-        """战区: 菱形轮廓 + 中心字母。
+        """战区: 菱形**填充** + 深色 3.4px 描边 + 白色 1.6px 描边 + 中心字母。
 
-        注意: pygfx 0.17 + wgpu 0.32 下 **Mesh 的 pipeline 会直接报 shader 校验错**
-        (连一个三角形渲不出来, 实测), 所以填充图形一律用 Line/Points 画。
+        与软件版 `_draw_zones` 逐项对应(颜色/线宽/字体都一样)。
+        填充用**自造 Geometry**: 菱形的四个顶点是屏幕上的上右下左, 而归一化坐标的
+        宽高不等比, 所以不能用“正方形转 45°”(那会把菱形画歪)。
+        注意 `indices` 必须是 **(N,3)** 形状, 传一维数组会报 shader 校验错误。
         """
         if not self._show_zones or not self._zones:
             return
@@ -548,24 +615,146 @@ class RouteMapGlView(RouteMapView):
                 continue
             side = str(z.get("side") or "neutral")
             color = QColor(rmv.ZONE_SIDE_COLORS.get(side, rmv.ZONE_SIDE_COLORS["neutral"]))
+            label_color = "#0f172a" if side == "neutral" else "#ffffff"
+            quad = np.array([(x, y + ry, Z_ZONE), (x + rx, y, Z_ZONE),
+                             (x, y - ry, Z_ZONE), (x - rx, y, Z_ZONE)], dtype=np.float32)
+            fill = self._add(gfx.Mesh(
+                gfx.Geometry(positions=quad,
+                             indices=np.array([[0, 1, 2], [0, 2, 3]], np.uint32)),
+                gfx.MeshBasicMaterial(color=_rgba(color), side="both")), O_ZONE)
             ring = np.array([(x, y + ry, Z_ZONE), (x + rx, y, Z_ZONE),
                              (x, y - ry, Z_ZONE), (x - rx, y, Z_ZONE),
                              (x, y + ry, Z_ZONE)], dtype=np.float32)
-            line = self._add(gfx.Line(
+            self._add(gfx.Line(  # 深色描边(浅色底图上也看得清)
+                gfx.Geometry(positions=ring.copy()),
+                gfx.LineMaterial(thickness=3.4, thickness_space="screen",
+                                 color=_rgba(QColor(15, 23, 42, 210)))), O_ZONE_EDGE)
+            self._add(gfx.Line(  # 白色描边(COLOR_ZONE)
                 gfx.Geometry(positions=ring),
-                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
-                                 color=_rgba(color))))
+                gfx.LineMaterial(thickness=1.6, thickness_space="screen",
+                                 color=_rgba(rmv.COLOR_ZONE))), O_ZONE_EDGE)
             label = str(z.get("label") or "").strip()
             text = None
-            if label:
+            if label:                        # 软件版: Consolas 9 bold, 区域中心
                 text = self._add(gfx.Text(
-                    text=label[:2], font_size=11, screen_space=True,
-                    family=_CJK_FAMILY,
-                    material=gfx.TextMaterial(color="#ffffff")))
+                    text=label[:2], font_size=9, screen_space=True,
+                    family="Consolas", anchor="middle-center",
+                    material=gfx.TextMaterial(color=label_color)), O_ZONE_LABEL)
                 text.local.position = (x, y, Z_ZONE + 0.002)
-            self._gl_zones.append((z, line, color, text))
+            self._gl_zones.append((z, fill, color, text))
+
+    def _build_marks(self) -> None:
+        """轨迹上的起/终点标记: 圆环(8px) + 起点实心点(2.5px) + 时间数字。
+
+        对应软件版 `_draw_route` 尾部的 marks 循环与 `_draw_play_marks`:
+        所有可见轨迹都画, 回放时未到达的标记 alpha=80。
+        """
+        self._gl_marks = None
+        self._gl_mark_info = []
+        dw, dh = self._map_size()
+        if dw <= 0 or dh <= 0:
+            return
+        recs = self._drawn_records()
+        if not recs:
+            return
+        # 多条轨迹同时显示时时间标签会完全重叠(软件版同一规则:
+        #   labels = len(visible) + len(highlight ∪ live) <= 1)
+        if self._playback_recs:
+            labels = len(self._playback_recs) <= 1
+        else:
+            hi = list(self._highlight)
+            if self._live is not None and all(r is not self._live for r in hi):
+                hi.append(self._live)
+            labels = len(self._visible) + len(hi) <= 1
+        pos: list[float] = []
+        cols: list[float] = []
+        info: list[tuple] = []
+        dots: list[tuple[float, float, float]] = []
+        dot_cols: list[float] = []
+        for rec in recs:
+            for mk in getattr(rec, "marks", None) or []:
+                color = QColor({"start": rmv.COLOR_START,
+                                "stop": rmv.COLOR_STOP}.get(mk.kind, rmv.COLOR_MARK))
+                radius = 8.0 if mk.kind in ("start", "stop") else 6.0
+                x, y = float(mk.x), 1.0 - float(mk.y)
+                ring = self._ring(x, y, radius / dw, radius / dh, Z_MARK)
+                v0 = len(cols)
+                for i in range(len(ring) - 1):
+                    a, b = ring[i], ring[i + 1]
+                    pos += [float(a[0]), float(a[1]), Z_MARK,
+                            float(b[0]), float(b[1]), Z_MARK]
+                rgba = _rgba(color)
+                cols += list(rgba) * (len(ring) - 1) * 2
+                info.append((float(mk.t), v0, len(cols), rgba))
+                if mk.kind == "start":
+                    dots.append((x, y, Z_MARK))
+                    dot_cols += list(rgba)
+                if labels:
+                    self._add_time_label(x, y, mk.t, color, dw, dh)
+        self._gl_mark_info = info
+        if not pos:
+            return
+        self._mark_line = self._add(gfx.Line(
+            gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
+                         colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
+            gfx.LineSegmentMaterial(thickness=2.4, thickness_space="screen",
+                                    color_mode="vertex", alpha_mode="blend")), O_MARK)
+        if dots:
+            # 软件版: 半径 2.5 的实心圆 + 2.4px 同色描边 → 视觉直径 7.4
+            self._add(gfx.Points(
+                gfx.Geometry(positions=np.array(dots, dtype=np.float32),
+                             colors=np.array(dot_cols, dtype=np.float32).reshape(-1, 4)),
+                gfx.PointsMaterial(size=7.4, size_space="screen",
+                                   color_mode="vertex")), O_MARK_DOT)
+
+    def _add_time_label(self, x: float, y: float, t: float, color: QColor,
+                        dw: float, dh: float) -> None:
+        """时间标签: 深色底框 + 彩色 1px 边框 + 白色 Consolas 文字。
+
+        与软件版 `_draw_time_label` 同几何: 框在圆环右侧(距中心 11px), 高 16px,
+        文字左对齐、垂直居中。宽度用 Consolas 10pt 的近似字宽估(数字等宽)。
+        """
+        text = rmv.fmt_time(t)
+        tw = 6.3 * len(text)
+        th = 16.0
+        box_w = tw + 6.0
+        cx = x + (11.0 + box_w / 2.0 - 3.0) / dw
+        cy = y
+        w, h = box_w / dw, th / dh
+        box = self._add(gfx.Mesh(
+            gfx.Geometry(positions=np.array(
+                [(cx - w / 2, cy - h / 2, Z_MARK), (cx + w / 2, cy - h / 2, Z_MARK),
+                 (cx + w / 2, cy + h / 2, Z_MARK), (cx - w / 2, cy + h / 2, Z_MARK)],
+                dtype=np.float32),
+                indices=np.array([[0, 1, 2], [0, 2, 3]], np.uint32)),
+            gfx.MeshBasicMaterial(color=_rgba(QColor(15, 23, 42, 200)), side="both")),
+            O_LABEL_BOX)
+        edge = np.array([(cx - w / 2, cy - h / 2, Z_MARK), (cx + w / 2, cy - h / 2, Z_MARK),
+                         (cx + w / 2, cy + h / 2, Z_MARK), (cx - w / 2, cy + h / 2, Z_MARK),
+                         (cx - w / 2, cy - h / 2, Z_MARK)], dtype=np.float32)
+        segs = np.empty((8, 3), dtype=np.float32)
+        segs[0::2] = edge[:-1]
+        segs[1::2] = edge[1:]
+        self._add(gfx.Line(
+            gfx.Geometry(positions=segs),
+            gfx.LineSegmentMaterial(thickness=1.0, thickness_space="screen",
+                                    color=_rgba(color), alpha_mode="blend")), O_LABEL_EDGE)
+        t_obj = self._add(gfx.Text(
+            text=text, font_size=10, screen_space=True, family="Consolas",
+            anchor="middle-center",
+            material=gfx.TextMaterial(color="#f8fafc")), O_LABEL_TEXT)
+        t_obj.local.position = (cx, cy, Z_MARK)
 
     def _build_dead_marks(self) -> None:
+        """阵亡叉: 画在线路末端, **只有回放越过阵亡时刻后才显示**。
+
+        软件版是在 `_draw_dead_mark` 里逐帧判 `_dead_now()` 的 —— 所以这里也把
+        “什么时候显示”交给 `_apply_anim`(按 alpha 开关), 不能建完就全部显示:
+        否则一回放就把所有阵亡位置提前剧透出来(用户 2026-10-22 截图: 右侧多出
+        一大片红叉)。
+        """
+        self._gl_dead = None
+        self._gl_dead_info = []
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
@@ -578,18 +767,20 @@ class RouteMapGlView(RouteMapView):
             side = getattr(rec, "side", "")
             col = _rgba(rmv.COLOR_DEAD_MARK_A if side == "A" else rmv.COLOR_DEAD_MARK_B)
             x, y = rec.points[-1].x, 1.0 - rec.points[-1].y
+            v0 = len(cols)
             for a, b in (((x - sx, y - sy), (x + sx, y + sy)),
                          ((x - sx, y + sy), (x + sx, y - sy))):
                 pos += [a[0], a[1], Z_MARK, b[0], b[1], Z_MARK]
                 cols += [*col, *col]
+            self._gl_dead_info.append((rec, v0, len(cols)))
         if not pos:
             return
-        self._add(gfx.Line(
+        self._gl_dead = self._add(gfx.Line(
             gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
                          colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
             gfx.LineSegmentMaterial(thickness=rmv.DEAD_MARK_PEN,
-                                    thickness_space="screen", color_mode="vertex"),
-            render_order=2))
+                                    thickness_space="screen", color_mode="vertex",
+                                    alpha_mode="blend")), O_DEAD)
 
     # ---------------------------------------------------- 图元: 玩家/光标/悬停
     def _dot(self, color: QColor, radius_px: float) -> gfx.Points:
@@ -625,18 +816,19 @@ class RouteMapGlView(RouteMapView):
             gfx.Geometry(positions=self._ring(x, y, rmv.PLAYER_RING_R / dw,
                                               rmv.PLAYER_RING_R / dh, Z_PLAYER)),
             gfx.LineMaterial(thickness=1.0, thickness_space="screen",
-                             color=_rgba(QColor(56, 189, 248, 90)))))
-        self._gl_player = self._add(self._dot(rmv.COLOR_PLAYER, rmv.PLAYER_DOT_R))
+                             color=_rgba(QColor(56, 189, 248, 90)))), O_PLAYER_RING)
+        # 软件版: 半径 4 的实心圆 + 2px 同色描边 → 视觉直径 10
+        self._gl_player = self._add(self._dot(rmv.COLOR_PLAYER, 5.0), O_PLAYER_DOT)
         self._gl_player.local.position = (x, y, Z_PLAYER)
         # ^ 是两条线段(4 个顶点): 深色垫底 + 蓝色
         self._gl_player_dir_dark = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((4, 3), dtype=np.float32)),
             gfx.LineSegmentMaterial(thickness=4.0, thickness_space="screen",
-                                    color=_rgba(QColor(15, 23, 42, 220)))))
+                                    color=_rgba(QColor(15, 23, 42, 220)))), O_PLAYER_DIR)
         self._gl_player_dir = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((4, 3), dtype=np.float32)),
             gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                    color=_rgba(rmv.COLOR_PLAYER))))
+                                    color=_rgba(rmv.COLOR_PLAYER))), O_PLAYER_DIR)
 
     def _build_cursor(self) -> None:
         """回放光标: 每条线路一个白点 + 白色朝向线(带深色垫底), 与软件版一致。"""
@@ -647,17 +839,15 @@ class RouteMapGlView(RouteMapView):
         self._gl_cursor = self._add(gfx.Points(
             gfx.Geometry(positions=np.zeros((n, 3), dtype=np.float32)),
             gfx.PointsMaterial(size=CURSOR_DOT_R * 2.0, size_space="screen",
-                               color=_rgba(QColor("#f8fafc")))))
+                               color=_rgba(QColor("#f8fafc")))), O_CURSOR_DOT)
         self._gl_cursor_dir_dark = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
             gfx.LineSegmentMaterial(thickness=4.2, thickness_space="screen",
-                                    color=_rgba(QColor(15, 23, 42, 210))),
-            render_order=3))
+                                    color=_rgba(QColor(15, 23, 42, 210)))), O_CURSOR_DIR)
         self._gl_cursor_dir = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
             gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                    color=_rgba(rmv.COLOR_DIR_LINE)),
-            render_order=4))
+                                    color=_rgba(rmv.COLOR_DIR_LINE))), O_CURSOR_DIR)
 
     def _build_border(self) -> None:
         """地图边框(与软件版 `_draw_base` 末尾那条细框一致)。"""
@@ -668,23 +858,74 @@ class RouteMapGlView(RouteMapView):
         pos[:, 2] = Z_MAP + 0.001
         self._add(gfx.Line(gfx.Geometry(positions=pos),
                            gfx.LineMaterial(thickness=1.0, thickness_space="screen",
-                                            color=_rgba(rmv.COLOR_GRID))))
+                                            color=_rgba(rmv.COLOR_GRID))), O_BORDER)
 
     def _build_hover(self) -> None:
+        """悬停: 命中点上的白环 + 左下角深色浮层(背景框 + 多行文字)。
+
+        对应软件版的 `_draw_hover_mark`(深色 4.0px 底环 + 白色 1.8px 环, 半径 5)
+        与 `_draw_hover`(左下角 alpha=215 的深色框, 内边距 7/4)。
+        """
         self._hover_obj = None
-        if not self._hover_text:
-            return
-        self._hover_obj = self._add(gfx.Text(
-            text=self._hover_text, font_size=13, screen_space=True,
-            family=_CJK_FAMILY,
-            material=gfx.TextMaterial(color="#e2e8f0")))
-        # 贴着可见区域左下角(归一化坐标 → 按当前相机换算)
-        r = self._map_rect()
         dw, dh = self._map_size()
-        w, h = self._canvas.get_logical_size()
-        if dw > 0 and dh > 0:
-            self._hover_obj.local.position = (
-                -r.left() / dw + 6.0 / dw, 1.0 - (h - r.top()) / dh + 6.0 / dh, Z_PLAYER + 0.004)
+        if dw <= 0 or dh <= 0:
+            return
+        # 1) 命中点白环(线条已被隐藏/删除时不画, 与软件版一致)
+        pt, rec = self._hover_pt, self._hover_rec
+        if pt is not None and rec is not None and any(
+                r is rec for r in self._drawn_records()):
+            ring = self._ring(float(pt.x), 1.0 - float(pt.y),
+                              5.0 / dw, 5.0 / dh, Z_PLAYER + 0.006)
+            segs = np.empty((2 * (len(ring) - 1), 3), dtype=np.float32)
+            segs[0::2] = ring[:-1]
+            segs[1::2] = ring[1:]
+            for thick, col in ((4.0, QColor(15, 23, 42, 200)), (1.8, QColor("#f8fafc"))):
+                self._add(gfx.Line(
+                    gfx.Geometry(positions=segs.copy()),
+                    gfx.LineSegmentMaterial(thickness=thick, thickness_space="screen",
+                                            color=_rgba(col), alpha_mode="blend")),
+                    O_HOVER_RING)
+        text = self._hover_text
+        if not text:
+            return
+        # 2) 左下角浮层: 与软件版同尺寸(字号 9, 行高~17, 内边距 7/4)
+        lines = text.split("\n")
+        th = 17.0
+        tw = 0.0
+        for ln in lines:
+            tw = max(tw, sum(9.0 if ord(ch) > 127 else 5.6 for ch in ln))
+        box_w = min(tw + 14.0, max(80.0, float(self.width() - 20.0)))
+        box_h = th * len(lines) + 8.0
+        r = self._map_rect()
+        x, y = 10.0, float(self.height()) - box_h - 12.0
+        # 世界坐标 y 是“向上”的(轨迹用 1-y), 所以控件像素要翻一下
+        nx = (x - r.left()) / dw
+        ny = 1.0 - (y - r.top()) / dh
+        w, h = box_w / dw, box_h / dh
+        z = Z_PLAYER + 0.008
+        box = self._add(gfx.Mesh(
+            gfx.plane_geometry(w, h),
+            gfx.MeshBasicMaterial(color=_rgba(QColor(15, 23, 42, 215)), side="both")),
+            O_HOVER_BOX)
+        box.local.position = (nx + w / 2.0, ny - h / 2.0, z)
+        # 软件版: 文字左对齐、垂直居中, 内边距左 7 / 上 4;
+        # 行高要与 QFontMetrics.height() 一致(9pt ≈ 17px), pygfx 默认 1.2×字号 只有 10.8px
+        self._hover_obj = self._add(gfx.Text(
+            text="\n".join(lines), font_size=9, screen_space=True,
+            family=_CJK_FAMILY, anchor="top-left", line_height=17.0 / 9.0,
+            material=gfx.TextMaterial(color="#e2e8f0")), O_HOVER_TEXT)
+        self._hover_obj.local.position = (nx + 7.0 / dw, ny - 4.0 / dh, z + 0.002)
+
+    def _build_status(self) -> None:
+        """无地图时居中显示提示文字(软件版 `_paint` 里的 `_status`)。"""
+        self._gl_status = None
+        if self._pixmap is not None or not self._status:
+            return
+        self._gl_status = self._add(gfx.Text(
+            text=self._status, font_size=11, screen_space=True,
+            family=_CJK_FAMILY, anchor="middle-center",
+            material=gfx.TextMaterial(color=_rgba(QColor("#64748b")))), O_STATUS)
+        self._gl_status.local.position = (0.5, 0.5, 0.0)
 
     # ---------------------------------------------------- 每帧: 进度/闪烁/位置
     def _apply_progress(self) -> None:
@@ -719,18 +960,34 @@ class RouteMapGlView(RouteMapView):
 
     def _apply_anim(self) -> None:
         """闪烁 / 玩家位置 / 回放光标(每帧都变, 但都只改 uniform 或几个点)。"""
+        if self._gl_marks is not None and self._gl_mark_info and self._playback_recs:
+            # 回放: 未到达的标记淡到 alpha=80(与软件版 _draw_play_marks 一致)
+            arr = self._mark_line.geometry.colors.data
+            head = self._playhead
+            for t, v0, v1, rgba in self._gl_mark_info:
+                a = 80.0 / 255.0 if t > head else rgba[3]
+                arr[v0:v1] = (rgba[0], rgba[1], rgba[2], a)
+            self._mark_line.geometry.colors.update_full()
+
+        # 阵亡叉: 只在“回放已经越过阵亡时刻”后显示(软件版逐帧判 _dead_now)
+        if getattr(self, "_gl_dead", None) is not None and self._gl_dead_info:
+            arr = self._gl_dead.geometry.colors.data
+            for rec, v0, v1 in self._gl_dead_info:
+                show = self._dead_mark and self._dead_now(rec, self._playhead)
+                arr[v0:v1, 3] = 1.0 if show else 0.0
+            self._gl_dead.geometry.colors.update_full()
         if self._zones and self._show_zones and getattr(self, "_gl_zones", None):
-            for z, line, color, _text in self._gl_zones:
+            for z, fill, color, _text in self._gl_zones:
                 blink = int(z.get("blink") or 0)
                 if blink <= 0:
-                    line.material.color = _rgba(color)
+                    fill.material.color = _rgba(color)
                     continue
                 period = rmv.BLINK_PERIODS.get(blink, rmv.BLINK_PERIODS[1])
                 t = self._blink_t % period
                 bv = math.exp(-((5.0 * t - 2.0) ** 4))
                 k = rmv.BLINK_DIM + (1.0 - rmv.BLINK_DIM) * bv
                 c = rmv._blend(rmv.ZONE_DARK, (color.red(), color.green(), color.blue()), k)
-                line.material.color = (c.redF(), c.greenF(), c.blueF(), 1.0)
+                fill.material.color = (c.redF(), c.greenF(), c.blueF(), 1.0)
 
         if getattr(self, "_gl_player", None) is not None and self._player is not None:
             x, y = self._player[0], 1.0 - self._player[1]
@@ -813,17 +1070,8 @@ class RouteMapGlView(RouteMapView):
             if self._gl_cursor_dir_dark is not None:
                 self._gl_cursor_dir_dark.geometry.positions.update_full()
 
-        # 悬停浮层文本(内容随鼠标变, 就地改 Text 即可, 不必重建对象)
-        if self._hover_text != getattr(self, "_gl_hover_text", None):
-            self._gl_hover_text = self._hover_text
-            if self._hover_obj is None:
-                self._build_hover()
-            elif not self._hover_text:
-                self._hover_obj.remove()
-                self._gl_objs = [o for o in self._gl_objs if o is not self._hover_obj]
-                self._hover_obj = None
-            else:
-                self._hover_obj.text = self._hover_text
+        # 悬停浮层的尺寸/内容都随文本变, 而且文本已进 `_content_key`
+        # → 由 `_rebuild_objects` 统一重建(这里不再做就地改字的特例)
 
 
 def _bisect_time(pts, head: float) -> int:
