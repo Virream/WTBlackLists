@@ -30,8 +30,8 @@
 **再没有任何字段能把无人机和战斗机分开**。既然分不开, 就整体不录(否则会把固定翼也画进来);
 无人机本身也贴着释放者飞, 画出来只是一个小抖动, 信息量很低。
 
-`DRONE_HINTS` 保留成一个"备选口": 万一以后某个版本给无人机单独起了 icon 名字,
-把关键字加进去就能立刻恢复录制。
+`DRONE_HINTS` 保留成一个注释级的“备选口”: 万一以后某个版本给无人机单独起了 icon 名字,
+把 `recordable()` 里 `if is_air(typ): return False` 改成 `return is_drone(typ, icon)` 即可。
 """
 from __future__ import annotations
 
@@ -70,9 +70,10 @@ GROUND_TYPES = frozenset({
 AIR_TYPES = frozenset({
     "aircraft", "helicopter", "heli", "plane", "uav",
 })
-# 空中类型里**要保留**的是"微型侦察无人机" —— 但实测(2026-10-21)无人机的 icon 就是
-# `Fighter`, 与固定翼完全一样, 所以这几个关键字目前**不会命中任何东西**,
-# 只是留给以后万一游戏给无人机单独起了名字时直接用。
+# 空中类型里“微型侦察无人机”的关键字 —— **目前故意不用**(见 recordable):
+# 实测(2026-10-21)无人机的 icon 就是 `Fighter`, 与固定翼一字不差,
+# 所以这些关键字永远命中不了任何东西。留着是给将来用的:
+# 万一某版本给无人机单独起了 icon 名字, 把 recordable 里那行改回去即可。
 DRONE_HINTS = ("uav", "drone", "scout", "recon")
 
 
@@ -89,18 +90,25 @@ def is_air(typ: str) -> bool:
 
 
 def is_drone(typ: str, icon: str) -> bool:
-    """是不是“微型侦察无人机”(唯一的例外: 空中单位也要录)。"""
+    """`type`/`icon` 文字里带 uav/drone/scout/recon 字样?
+
+    只在“将来能把无人机单独认出来”时才有用 —— 当前 `recordable()` **不看它**。
+    """
     text = f"{typ} {icon}".lower()
     return any(h in text for h in DRONE_HINTS)
 
 
 def recordable(typ: str, icon: str) -> bool:
-    """这个对象要不要录线路(见模块 docstring 的“用户口径”)。"""
-    if is_ground(typ):
-        return True
+    """这个对象要不要录线路(见模块 docstring 的“用户口径”)。
+
+    **空中单位一律不录**(用户 2026-10-21 决定): 8111 里侦察无人机的 `icon` 就是
+    `Fighter`, 与固定翼分不开, 硬录会把飞机/直升机也画进来。
+    若将来能单独认出无人机, 把 `if is_air(typ):` 那行改成
+    `return is_drone(typ, icon)` 即可, 其余代码不用动。
+    """
     if is_air(typ):
-        return is_drone(typ, icon)
-    return False
+        return False
+    return is_ground(typ)
 
 
 def is_protected(color: str) -> bool:

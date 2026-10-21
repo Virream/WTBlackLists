@@ -51,10 +51,12 @@ def test_filters():
     assert not recordable("aircraft", "Assault")
     assert not recordable("aircraft", "Fighter")
     assert not recordable("helicopter", "AttackHelicopter")
-    # 微型侦察无人机(唯一要录的空中单位)
-    assert recordable("aircraft", "uav")
-    assert recordable("uav", "scout")
+    # 侦察无人机也**不录**(2026-10-21 决定): 它的 icon 就是 Fighter, 与固定翼分不开
+    assert not recordable("aircraft", "Fighter")
+    assert not recordable("uav", "uav")
+    # 但“认无人机”的辅助函数还在(将来要是能单独认出来就用它)
     assert is_drone("aircraft", "ReconDrone")
+    assert is_drone("uav", "scout")
     # 静态地物 / AI 防空 / 机场: 一律不录
     for typ in ("capture_zone", "respawn_base_tank", "airfield", "Airdefence",
                 "bombing_point", "respawn_base_ucav"):
@@ -67,7 +69,7 @@ def test_filters():
     units, skipped = extract_units(objects)
     assert len(units) == 1 and units[0].x == 0.5, [u.x for u in units]
     assert ("Airdefence", "Airdefence") in skipped
-    results.append("全局录制: 单位过滤(地面/空中/无人机/静态/超界坐标) OK")
+    results.append("全局录制: 单位过滤(地面/空中全跳过/静态/超界坐标) OK")
 
 
 # ---------------------------------------------------------------- 跟踪
