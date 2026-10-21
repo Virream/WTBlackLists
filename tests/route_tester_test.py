@@ -691,10 +691,30 @@ def test_map_draw_cache():
         assert len(lay_calls) == n_lay, "拖动不该重建缓存层(余量内只贴图)"
         assert len(seg_calls) == n_seg, "拖动更不该重算分桶几何"
 
-        # 拖出余量 → 必须重建(否则边缘会出现空白/旧内容)
-        view._pan_x += view.width()
+        # 拖出余量 → **不重建**, 改成“把旧内容搬一格 + 只补新露出来的窄边”
+        # (2026-10-21: 64 条线整层重建实测 79 ms, 用户感觉是“拖一下卡一下”)
+        view._pan_x += 300.0                 # 余量 = 0.35×800 = 280, 300 刚好越界
         view.render(canvas)
-        assert len(lay_calls) > n_lay, "拖出余量后必须重建缓存层"
+        assert len(lay_calls) == n_lay, "拖出余量应搬图层, 不该整层重建"
+        r = view._map_rect()
+        mx, _my = view._margin()
+        assert abs(r.left() - view._track_anchor[0]) <= mx + 1e-6, \
+            "搬完图层后锚点必须重新贴近当前地图矩形(否则内容会错位)"
+        px_drag = view.map_pos(recs[0].points[150].x, recs[0].points[150].y)
+        img_drag = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_drag)
+        assert img_drag.pixelColor(int(px_drag.x()), int(px_drag.y())) != \
+            QColor("#334455"), "搬图层后轨迹仍应画在正确位置"
+
+        # 搬不动(露出来的面积太大) → 退回整层重建(把阈值调成 0 模拟)
+        real_ratio = mv.SHIFT_MAX_EXPOSED
+        mv.SHIFT_MAX_EXPOSED = 0.0
+        try:
+            view._pan_x = -168.0             # 向左拖出余量, 且被 _clamp_pan 允许
+            view.render(canvas)
+        finally:
+            mv.SHIFT_MAX_EXPOSED = real_ratio
+        assert len(lay_calls) > n_lay, "搬图层不划算时应退回整层重建"
         view.reset_view()
         view.render(canvas)
         n_lay = len(lay_calls)
@@ -791,6 +811,21 @@ def test_playback_draw_cache():
         view.set_playback([rec], rec.duration * 0.2)
         view.render(canvas)
         assert len(lay_calls) > n, "往回拖拽必须重建累加层"
+        n2 = len(lay_calls)
+
+        # ③b 拖动出余量 → **不重建**(搬图层), 已播放/未播放的画面仍跟着地图走
+        view.set_playback([rec], rec.duration * 0.6)
+        view.render(canvas)
+        n_shift = len(lay_calls)
+        view._pan_x += 300.0                 # 余量 = 0.35×800 = 280
+        img_drag = QImage(800, 600, QImage.Format.Format_ARGB32)
+        view.render(img_drag)
+        assert len(lay_calls) == n_shift, "拖动出余量应搬累加层, 不该整层重建"
+        px_drag = view.map_pos(rec.points[150].x, rec.points[150].y)
+        assert img_drag.pixelColor(int(px_drag.x()), int(px_drag.y())) != \
+            QColor("#334455"), "搬图层后回放画面仍应画在正确位置"
+        view._pan_x = 0.0
+        view.render(canvas)
         n2 = len(lay_calls)
 
         # ④ 缩放 → 播放中也不重建(先按比例贴旧层), 停手后才重建一次

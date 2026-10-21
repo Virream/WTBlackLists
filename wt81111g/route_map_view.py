@@ -101,6 +101,10 @@ HOVER_RADIUS = 18.0
 # 缓存层四周多画的反向余量(占控件尺寸比例): 拖动地图时靠偏移贴图复用整层,
 # 超出余量才重建(见 _layer_tracks / _layer_stale)
 LAYER_MARGIN = 0.35
+# 拖出余量后**搬图层**(而不是整层重画)时, 新露出来的那条边最多占整层的这个比例;
+# 超过就说明一次跳了很远(比如 reset_view / 缩放后), 还是整层重建划算(见 _shift_layer)
+SHIFT_MAX_EXPOSED = 0.5
+
 # 缩放/改窗口后“先用旧层按比例顶着, 停手这么久再重建一次变清晰”的延迟(毫秒)。
 # 重建一次实测 20~50ms(1920×1040, 20 条线 1.7 万点), 滚轮连发时每格都重建就是
 # “缩放卡”的唯一原因; 按比例贴一次只要 1~2ms(2026-10-21)。
@@ -108,6 +112,12 @@ GEOM_SETTLE_MS = 200
 # 轨迹线宽(px): 归一化几何 + 缩放画笔, 实际线宽 = 它们(见 _draw_route)
 TRACK_PEN = 2.4          # 选中的/正在录的(速度配色)
 PLAY_PEN = 2.6           # 回放中已播放的段
+# 逐段描边用的端帽: **平头**。轨迹是每段独立的 `drawLines`(见 build_speed_segments),
+# 而 QPainter 给每段两端各加一个半圆端帽非常贵 —— 同样 2.96 万段实测
+# 圆头 **216.6 ms** vs 平头 **61.2 ms**(3.5×, 且 `setClipRect` 一点都省不掉,
+# 说明卡顿在描边而不在填充)。线宽只有 2.4~2.6 px, 平头在拐弯处留的缺口不到
+# 一个像素(圆/平同屏 2× 放大对比肉眼分不出), 所以逐段绘制一律用平头。2026-10-21。
+SEG_CAP = Qt.PenCapStyle.FlatCap
 
 
 # 全局线路的速度配色基准 = 这条线自己的最高速(**与单条轨迹完全一致**)。
@@ -303,6 +313,10 @@ class RouteMapView(QWidget):
         self._play_size: tuple[float, float] = (0.0, 0.0)
         self._play_margin: tuple[float, float] | None = None
         self._play_drawn: dict[str, int] = {}       # route_id -> 已画进累加层的点数
+        # route_id -> 已播放前缀的分桶几何(和实时线路同一个增量缓存类)。
+        # 搬图层/重建时要**整条重画一遍**, 没这个缓存就每次都在 Python 里重建
+        # 2.9 万段的分桶(实测一次 40 ms, 抵消了搬图层的全部收益)。
+        self._play_seg: dict[str, _LiveGeom] = {}
         # 全局录制“边录边画”的累加层(见 _layer_live)
         self._live_layer: QImage | None = None
         self._live_ids: tuple | None = None
@@ -556,6 +570,7 @@ class RouteMapView(QWidget):
             self._recycle(self._play_layer)
             self._play_layer = None      # 换了回放对象 → 累加层作废(下次重画)
             self._play_drawn = {}
+            self._play_seg = {}
         self._playback_recs = new
         self._playhead = playhead
         self._drop_hover_if_gone()
@@ -776,7 +791,7 @@ class RouteMapView(QWidget):
                 for idx, poly in buckets.items():
                     speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
                     p.setPen(QPen(speed_color(speed, vmax), TRACK_PEN / s,
-                                  Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                  Qt.PenStyle.SolidLine, SEG_CAP,
                                   Qt.PenJoinStyle.RoundJoin))
                     p.drawLines(QPolygonF(poly) if only_new else poly)
         finally:
@@ -794,6 +809,24 @@ class RouteMapView(QWidget):
         self._live_margin = self._margin()
         self._live_layer = self._make_layer(self._draw_live_layer, self._live_anchor)
         return self._live_layer
+
+    def _shift_live_layer(self) -> bool:
+        """拖出余量时**搬**实时层而不是重画; 不划算返回 False。
+
+        顺便修了一个隐患: 以前这里根本不看锚点, 录制中拖动地图会让已经录出来的
+        实时线路**跟着错位**(层还是贴在旧位置)。2026-10-21。
+        """
+        layer, anchor = self._live_layer, self._live_anchor
+        if layer is None or anchor is None:
+            return False
+        got = self._shift_layer(layer, anchor,
+                                self._live_margin or self._margin(),
+                                self._draw_live_layer)
+        if got is None:
+            return False
+        self._recycle(layer)
+        self._live_layer, self._live_anchor = got
+        return True
 
     def _schedule_live_rebuild(self) -> None:
         """缩放过程中不重建(一次重建实测 270 ms), 停手 200ms 后再重建。
@@ -846,6 +879,14 @@ class RouteMapView(QWidget):
             self._schedule_live_rebuild()
             return (self._live_layer,
                     (size[0] / self._live_size[0], size[1] / self._live_size[1]))
+        # 拖出定位余量 → 把旧内容搬一格(与轨迹层/回放层同一套, 见 _shift_layer)
+        if self._layer_stale(self._live_anchor, (1.0, 1.0)):
+            if self._shift_live_layer():
+                return self._live_layer, (1.0, 1.0)
+            self._live_layer = None
+            self._live_ids = None
+            layer = self._build_live_layer(ids)
+            return (layer, (1.0, 1.0)) if layer is not None else None
         # 稳态: 只补新段
         # 但速度基准(=最高速)涨了的话, 桶索引/颜色全都变 → 整个层重建
         for rec in self._live_multi:
@@ -942,6 +983,93 @@ class RouteMapView(QWidget):
                            layer.width() / dpr * sx, layer.height() / dpr * sy),
                     layer, QRectF(0, 0, layer.width(), layer.height()))
 
+    def _shift_layer(self, layer: QImage, anchor: tuple[float, float],
+                     margin: tuple[float, float],
+                     draw) -> tuple[QImage, tuple[float, float]] | None:
+        """把缓存层的内容整体搬一格, 只重画新露出来的那条边 —— 不整层重画。
+
+        拖动地图时图层锚点会越漂越远, 以前一越出余量就整层重画(64 条线 29630 段
+        实测 **79 ms**, 用户感觉就是“同时播放 AB 两队时拖一下卡一下”)。改成三步:
+
+        1. 新锚点直接取**当前地图矩形**(= 建层时的位置), 于是只有一侧那条 ~余量宽
+           的边要重画(约占整层 20%);
+        2. 旧图内容按整数像素偏移贴进一张同样大小的新图(整层一次 `drawImage`,
+           省掉全部矢量栅格化);
+        3. 用 `setClipRect` 只把新露出来的那条边重画一遍(所有绘制函数都是幂等的)。
+
+        锚点必须挪到“偏移 0”而不是“刚好贴住余量边界”: 贴边界的话再拖一格就又越界,
+        40 px 一步的拖动会变成**每帧搬一次图**(实测 60 帧搬 20 次, 比整层重建还慢)。
+
+        位移取整到**设备像素**(小数会让整层被重采样糊掉), 代价是图层与底图最多
+        差半像素。要重画的面积超过 `SHIFT_MAX_EXPOSED` 时返回 None —— 说明一次跳了
+        很远, 让调用方整层重建。
+
+        返回 (新图层, 新锚点)。
+        """
+        dpr = layer.devicePixelRatio() or 1.0
+        dw, dh = layer.width(), layer.height()
+        if dw <= 0 or dh <= 0:
+            return None
+        lw, lh = dw / dpr, dh / dpr
+        r = self._map_rect()
+        mx, my = margin
+
+        def step(cur: float, anc: float, lim: float) -> float:
+            """锚点该跟着走多少。
+
+            直接把锚点挪到**当前地图矩形**上(= 建层时的位置, 偏移 0), 而不是
+            “刚好贴住余量边界”: 贴着边界的话再拖一格就又越界, 40 px 一步的拖动会
+            变成**每帧搬一次图**(实测 60 帧里搬 20 次, 比整层重建还慢)。
+            """
+            d = cur - anc
+            return d if abs(d) > lim else 0.0
+
+        dx = round(step(r.left(), anchor[0], mx) * dpr) / dpr
+        dy = round(step(r.top(), anchor[1], my) * dpr) / dpr
+        if dx == 0.0 and dy == 0.0:
+            return None
+        sx, sy = int(round(dx * dpr)), int(round(dy * dpr))     # 设备像素(整数)
+        new_anchor = (anchor[0] + dx, anchor[1] + dy)
+        # 旧内容搬走后, 新图上没内容的区域(左右两条 + 上下两条, 实际最多各一条)
+        strips: list[QRectF] = []
+        if sx > 0:
+            strips.append(QRectF(0.0, 0.0, sx / dpr, lh))
+        elif sx < 0:
+            strips.append(QRectF(lw + sx / dpr, 0.0, -sx / dpr, lh))
+        x0, x1 = max(0, min(dw, sx)), max(0, min(dw, sx + dw))
+        if x1 > x0:
+            if sy > 0:
+                strips.append(QRectF(x0 / dpr, 0.0, (x1 - x0) / dpr, sy / dpr))
+            elif sy < 0:
+                strips.append(QRectF(x0 / dpr, lh + sy / dpr,
+                                     (x1 - x0) / dpr, -sy / dpr))
+        if sum(s.width() * s.height() for s in strips) > SHIFT_MAX_EXPOSED * lw * lh:
+            return None                     # 露出来的太多 → 整层重建更划算
+        img = self._take_spare(dw, dh, dpr)
+        if img is None:
+            img = QImage(dw, dh, QImage.Format.Format_ARGB32_Premultiplied)
+            if img.isNull():
+                return None
+            img.setDevicePixelRatio(dpr)
+        img.fill(Qt.GlobalColor.transparent)
+        lp = QPainter(img)
+        try:
+            lp.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            lp.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+            lp.drawImage(QPointF(dx, dy), layer)            # 整数偏移 → 1:1 拷贝
+            for strip in strips:
+                lp.save()
+                lp.setClipRect(strip)
+                lp.translate(new_anchor[0] + mx, new_anchor[1] + my)
+                draw(lp)
+                lp.restore()
+        except Exception:  # noqa: BLE001
+            log.exception("平移缓存层失败")
+            return None
+        finally:
+            lp.end()
+        return img, new_anchor
+
     def _layer_stale(self, anchor: tuple[float, float] | None,
                      scale: tuple[float, float] = (1.0, 1.0)) -> bool:
         """层的定位锚点离当前位置太远(超出余量)→ 必须重新渲染。
@@ -984,27 +1112,47 @@ class RouteMapView(QWidget):
         self._track_geom = self._geom_key()
         self._track_size = self._map_size()
 
+    def _shift_track_layer(self) -> bool:
+        """拖出余量时**搬**轨迹层而不是重画; 不划算返回 False(调用方整层重建)。"""
+        layer, anchor = self._track_layer, self._track_anchor
+        if layer is None or anchor is None:
+            return False
+        got = self._shift_layer(layer, anchor,
+                                self._track_margin or self._margin(), self._draw_tracks)
+        if got is None:
+            return False
+        self._recycle(layer)
+        self._track_layer, self._track_anchor = got
+        return True
+
     def _layer_tracks(self) -> tuple[QImage, tuple[float, float]] | None:
         """轨迹层(半透明, 带余量): 返回 (图层, 缩放比)。
 
         三种情况:
 
         1. 没有层 / **内容变了**(眼睛开关、选中、重生位置…) → 立刻重建;
-        2. 拖出余量 → 立刻重建(锚点必须跟着走);
+        2. 拖出余量 → 先把旧内容**搬**一格并只补新露出来的窄边(`_shift_layer`),
+           搬不动(一眼跳很远)才整层重建;
         3. 只是**几何变了**(滚轮缩放、改窗口大小) → 先把旧层按比例贴上顶住
            (1~2ms), 停手 200ms 后再重建一次变清晰。
 
         第 3 条是 2026-10-21 的卡顿修正: 重建一次实测 20~50ms(1920×1040, 20 条线
         1.7 万点), 而滚轮连发 6 格就要重建 6 次 → 一段滚轮要 250~500ms, 手感就是
         “缩放卡”。旧层按比例贴的画质会临时略糊/线宽略变, 停手 200ms 后自动复原。
+        第 2 条是 2026-10-21 晚的拖动卡顿修正: 64 条线整层重建 79ms, 而“搬一格”
+        只有越界的那几像素要重画。
         """
         key = self._tracks_key()
         geom = self._geom_key()
         size = self._map_size()
         scale = self._scale_vs(self._track_size, size)
-        if (self._track_layer is None or self._track_key != key
-                or self._layer_stale(self._track_anchor, scale)):
-            self._build_track_layer()
+        stale = self._layer_stale(self._track_anchor, scale)
+        if self._track_layer is None or self._track_key != key or stale:
+            # 只有“锚点漂了”这一条时, 搬图层就够(内容与几何都没变, 且是 1:1 贴)
+            if not (stale and self._track_layer is not None and self._track_key == key
+                    and scale == (1.0, 1.0) and geom == self._track_geom
+                    and self._shift_track_layer()):
+                self._build_track_layer()
             if self._track_layer is None:
                 return None
             return (self._track_layer, (1.0, 1.0))
@@ -1076,6 +1224,7 @@ class RouteMapView(QWidget):
         self._play_geom = None
         self._play_margin = None
         self._play_drawn = {}
+        self._play_seg = {}
 
     def _play_layer_key(self) -> tuple:
         """回放累加层的内容指纹(**不含几何**: 几何变化走“先缩放贴旧层”)。
@@ -1103,7 +1252,72 @@ class RouteMapView(QWidget):
             if self._dead_dimmed(rec, self._playhead):
                 continue
             k, _mid = self._played_prefix(rec, self._playhead)
-            self._extend_play(p, rec, 0, k)
+            self._draw_play_prefix(p, rec, k)
+
+    def _play_prefix_geom(self, rec, k: int) -> _LiveGeom:
+        """该线路“已播放前缀”的分桶几何(增量缓存, 供重复绘制用)。"""
+        geom = self._play_seg.get(rec.route_id)
+        if geom is None:
+            geom = _LiveGeom()
+            self._play_seg[rec.route_id] = geom
+        pts = rec.points
+        geom.feed(pts if k >= len(pts) else pts[:k], self._vmax(rec))
+        return geom
+
+    def _draw_play_prefix(self, p: QPainter, rec, k: int) -> None:
+        """把前 k 个点的“已播放”着色段画上去(**用缓存的分桶几何**)。
+
+        与 `_extend_play` 的区别: 那个只补 [done, k) 的增量(逐帧快), 这个画全部
+        已播放段(重建/搬图层时要整条重画)。两者共用 `_play_seg` 里的增量缓存,
+        所以重画一条 64 线路的回放层不再需要每次在 Python 里重新分桶。
+        """
+        if k < 2 or not self._scaled(p):
+            return
+        geom = self._play_prefix_geom(rec, k)
+        vmax = self._vmax(rec)
+        s = self._px_scale()
+        try:
+            for idx, poly in geom.polys.items():
+                speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
+                p.setPen(QPen(speed_color(speed, vmax), PLAY_PEN / s,
+                              Qt.PenStyle.SolidLine, SEG_CAP,
+                              Qt.PenJoinStyle.RoundJoin))
+                p.drawLines(poly)
+        finally:
+            p.restore()
+
+    def _rebuild_play_layer(self, key: tuple, geom: tuple,
+                            size: tuple[float, float]) -> None:
+        """从头重建回放累加层(换回放对象 / 往回拖拽 / 重建不划算时)。"""
+        self._play_drawn = {}
+        self._play_anchor = (self._map_rect().left(), self._map_rect().top())
+        self._play_margin = self._margin()
+        self._recycle(self._play_layer)
+        self._play_layer = self._make_layer(self._draw_play_static, self._play_anchor)
+        self._play_key = key
+        self._play_geom = geom
+        self._play_size = size
+        if self._play_layer is not None:
+            for rec in self._playback_recs:          # 记下已经画到哪
+                self._play_drawn[rec.route_id], _ = self._played_prefix(rec, self._playhead)
+
+    def _shift_play_layer(self) -> bool:
+        """拖出余量时**搬**累加层而不是重画; 不划算返回 False。
+
+        已画进去的进度(`_play_drawn`)不受影响 —— 搬的是像素, 数据空间没有变,
+        新露出来的窄边按**当前**进度补画(差几像素宽, 看不出来)。
+        """
+        layer, anchor = self._play_layer, self._play_anchor
+        if layer is None or anchor is None:
+            return False
+        got = self._shift_layer(layer, anchor,
+                                self._play_margin or self._margin(),
+                                self._draw_play_static)
+        if got is None:
+            return False
+        self._recycle(layer)
+        self._play_layer, self._play_anchor = got
+        return True
 
     def _layer_playback(self) -> tuple[QImage, tuple[float, float]] | None:
         """回放**累加层**(半透明): 未播放底衬 + 已播放的着色段。返回 (图层, 缩放比)。
@@ -1120,20 +1334,15 @@ class RouteMapView(QWidget):
         scale = self._scale_vs(self._play_size, size)
         back = any(self._played_prefix(r, self._playhead)[0]
                    < self._play_drawn.get(r.route_id, 0) for r in self._playback_recs)
-        if (self._play_layer is None or self._play_key != key or back
-                or self._layer_stale(self._play_anchor, scale)):
-            self._play_drawn = {}
-            self._play_anchor = (self._map_rect().left(), self._map_rect().top())
-            self._play_margin = self._margin()
-            self._recycle(self._play_layer)
-            self._play_layer = self._make_layer(self._draw_play_static, self._play_anchor)
-            self._play_key = key
-            self._play_geom = geom
-            self._play_size = size
+        stale = self._layer_stale(self._play_anchor, scale)
+        broken = self._play_layer is None or self._play_key != key or back
+        if broken or stale:
+            # 只有“锚点漂了”这一条时, 搬图层就够(拖动时不再整层重画, 见 _shift_layer)
+            if not (stale and not broken and scale == (1.0, 1.0)
+                    and geom == self._play_geom and self._shift_play_layer()):
+                self._rebuild_play_layer(key, geom, size)
             if self._play_layer is None:
                 return None
-            for rec in self._playback_recs:          # 记下已经画到哪
-                self._play_drawn[rec.route_id], _ = self._played_prefix(rec, self._playhead)
         elif geom != self._play_geom:
             # 只是几何变了 → 旧层按比例顶着(播放中滚轮缩放不再一顿一顿)
             self._note_geom_change(geom)
@@ -1298,7 +1507,7 @@ class RouteMapView(QWidget):
             for idx, pts_px in buckets.items():
                 speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
                 p.setPen(QPen(speed_color(speed, vmax), PLAY_PEN / s,
-                              Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                              Qt.PenStyle.SolidLine, SEG_CAP,
                               Qt.PenJoinStyle.RoundJoin))
                 p.drawLines(QPolygonF(pts_px))
         finally:
@@ -1451,7 +1660,7 @@ class RouteMapView(QWidget):
                     for idx, poly in self._speed_segments(rec, vmax).items():
                         speed = (idx + 0.5) / _SPEED_BUCKETS * vmax
                         p.setPen(QPen(speed_color(speed, vmax), TRACK_PEN / s,
-                                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap,
+                                      Qt.PenStyle.SolidLine, SEG_CAP,
                                       Qt.PenJoinStyle.RoundJoin))
                         p.drawLines(poly)
             finally:
