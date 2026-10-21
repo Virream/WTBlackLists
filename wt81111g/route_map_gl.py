@@ -308,7 +308,7 @@ class RouteMapGlView(RouteMapView):
     def _update_texture(self, data: bytes | None) -> None:
         if not data or self._pixmap is None:      # 空数据/占位图 → 不画底图
             if self._plane is not None:
-                self._plane.remove()
+                self._drop_object(self._plane)
                 self._plane = None
             self._tex = None
             self.update()
@@ -321,7 +321,7 @@ class RouteMapGlView(RouteMapView):
             self._tex.update_full()
         else:
             if self._plane is not None:
-                self._plane.remove()
+                self._drop_object(self._plane)
             self._tex = gfx.Texture(arr, dim=2)
             self._plane = gfx.Mesh(gfx.plane_geometry(1, 1),
                                    gfx.MeshBasicMaterial(map=self._tex))
@@ -409,9 +409,21 @@ class RouteMapGlView(RouteMapView):
                 self._show_zones, zones, self._show_spawns, self._spawns_ver,
                 self._map_digest, self._hover_text, self._status)
 
+    def _drop_object(self, obj) -> None:
+        """把对象从场景里**真正**移掉。
+
+        坑: pygfx 的 `WorldObject.remove(*objects)` 是“把 objects 从 **self 的 children**
+        里删掉”, 所以 `obj.remove()` 等于“清空它自己的子对象” —— 对象本身仍然挂在
+        scene 上, 每改一次几何就多叠一层(用户 2026-10-22 截图: 缩放几下后重生方块
+        变成一堆同心方框)。而 `parent` 是只读 property, 必须让父级调用 remove(obj)。
+        """
+        parent = getattr(obj, "parent", None)
+        if parent is not None:
+            parent.remove(obj)
+
     def _clear_objects(self) -> None:
         for obj in self._gl_objs:
-            obj.remove()
+            self._drop_object(obj)
         self._gl_objs = []
         self._gl_icons = []
         self._gl_tracks = []
@@ -422,7 +434,7 @@ class RouteMapGlView(RouteMapView):
     def _clear_icons(self) -> None:
         """只删图标类对象(轨迹保留) —— 缩放时走这条路。"""
         for obj in self._gl_icons:
-            obj.remove()
+            self._drop_object(obj)
         icons = {id(o) for o in self._gl_icons}
         self._gl_objs = [o for o in self._gl_objs if id(o) not in icons]
         self._gl_icons = []
