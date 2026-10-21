@@ -1,19 +1,19 @@
-"""pygfx(WebGPU/wgpu) 版地图画布 —— 高性能替代 `route_map_view.RouteMapView`。
+"""pygfx(WebGPU/wgpu) 渲染的地图画布 —— **继承** `RouteMapView`, 只把“画”换成 GPU。
 
-**最小可用版本**(2026-10-21): 底图 + 多队线路(速度配色) + 回放进度着色 + 阵亡变灰/X +
-缩放平移 + 命中测试用的坐标换算。悬停浮层、战区闪烁、重生方块、时间标签等图元后续补。
+为什么这样接:
+* 软件版 `RouteMapView` 里攒了 4000 多行**状态机与交互**(眼睛开关、回放进度、命中测试、
+  缩放平移、换图清理、占位图识别……), 重写一遍必然是 bug 温床;
+* 所以这里 `class RouteMapGlView(RouteMapView)`, 不覆盖任何状态/交互逻辑, 只覆盖
+  `paintEvent`(不再用 QPainter 画)和 `set_map_bytes`(顺带更新 GPU 纹理),
+  其余全部复用 → 主程序里只要把 `RouteMapView(...)` 换成工厂函数即可, 行为一致。
 
-为什么另起一个模块而不是直接改 `route_map_view.py`:
-* 那一份是**软件渲染**(QPainter), 功能齐全、有像素级回归测试, 留着当回退路径;
-* 这一份只依赖 pygfx/wgpu, 对外接口尽量与它一致, 由 `route_window` 决定用哪一份。
+实测(2026-10-21, 64 条线路 / 29630 段 / 1400×900): 渲染 1.2~2.8 ms/帧,
+没有“重建整层”的尖峰。**必须** `present_method="screen"`: 默认的 bitmap present
+要读回整帧再 QPainter 贴图, 实测 11.9~89 ms/帧, 比软件渲染还差。
 
-实测(spike, 64 条线路 / 29630 段, 1400×900):
-* 渲染 1.2~2.8 ms/帧(`present_method="screen"` 原生 present), 无“重建整层”尖峰;
-* **必须** `present_method="screen"`: 默认的 bitmap present 要读回整帧再 QPainter 贴图,
-  实测 11.9~89 ms/帧, 比软件渲染还慢;
-* 段长 < 线宽时 pygfx 厚线会画成“一颗颗珠子”(接头缩短所致)。按用户要求**接受**这种
-  观感(每个采样点一颗珠子), 因此这里不做 LOD 抽稀;
-* 中文文字要显式注册系统字体(见 `_register_cjk_font`)。
+已知取舍:
+* 段长 < 线宽时 pygfx 厚线会画成“一颗颗珠子”(接头缩短), 用户已确认可接受;
+* 中文字体要显式注册(`_register_cjk_font`)。
 """
 from __future__ import annotations
 
@@ -24,25 +24,57 @@ import time
 
 import numpy as np
 
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt
+# 必须先导入 PyQt6, rendercanvas 靠它判断用哪个 Qt 绑定
+from PyQt6.QtCore import QEvent, QPointF
 from PyQt6.QtGui import QColor, QImage
-from PyQt6.QtWidgets import QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QVBoxLayout
 
 import pygfx as gfx
 from pygfx.utils.text import font_manager as _font_manager
 
-from .route_map_view import (COLOR_DEAD_MARK_A, COLOR_DEAD_MARK_B, COLOR_DEAD_ROUTE,
-                             MIN_ZOOM, MAX_ZOOM, WHEEL_STEP, PAN_MARGIN,
-                             PLAY_PEN, bucket_index, speed_color)
+from . import route_map_view as rmv
+from .route_map_view import RouteMapView, bucket_index, speed_color
 
 log = logging.getLogger("route_map_gl")
 
-# 画布底色(与软件渲染一致)
-COLOR_BG = "#0b1220"
-# 未播放部分的底衬颜色
-COLOR_UNPLAYED = QColor(148, 163, 184, 90)
-# 阵亡标记笔宽 / 半径(屏幕像素)
-DEAD_MARK_PEN = 2.2
+
+def _gpu_usable() -> bool:
+    """能不能安全地创建 GPU 画布。
+
+    **必须在创建 canvas 之前判断**: 在 `QT_QPA_PLATFORM=offscreen`/`minimal` 这类没有
+    真实窗口系统的平台上, wgpu 配置 surface 会在 **Rust 层直接 panic**
+    (`wgpuSurfaceConfigure: Surface does not support the adapter's queue family`),
+    那是 try/except 抓不住的进程级崩溃 —— 所以测试/无头环境一律走软件渲染。
+    """
+    if os.environ.get("WT_MAP_SOFTWARE", "") not in ("", "0"):
+        return False
+    app = QApplication.instance()
+    if app is not None and app.platformName().lower() in ("offscreen", "minimal", "vnc"):
+        return False
+    return True
+
+
+def create_map_view(parent=None) -> RouteMapView:
+    """主程序用的工厂: 优先 GPU 画布, 不行就回退软件渲染。
+
+    环境变量 `WT_MAP_SOFTWARE=1` 可强制走软件渲染(排查显卡/驱动/远程桌面问题时用)。
+    任何异常(没装 pygfx、wgpu 找不到适配器、GL 上下文创建失败…)都回退, 保证程序能开。
+    """
+    if not _gpu_usable():
+        log.info("GPU 画布不可用(环境变量或无头平台) → 软件渲染")
+        return RouteMapView(parent)
+    try:
+        view = RouteMapGlView(parent)
+        log.info("地图画布: GPU (pygfx/wgpu)")
+        return view
+    except Exception:  # noqa: BLE001
+        log.exception("GPU 画布初始化失败, 回退软件渲染")
+        return RouteMapView(parent)
+
+# ---------------------------------------------------------------- 常量
+BG_COLOR = "#0b1220"
+CURSOR_DOT_R = rmv.PLAY_CURSOR_R
+PLAYER_DIR_COLOR = QColor("#f8fafc")
 
 _CJK_FAMILY = "Microsoft YaHei"
 _FONT_CANDIDATES = (
@@ -55,41 +87,42 @@ _FONT_CANDIDATES = (
 )
 _fonts_ready = False
 
+# z 层次(归一化地图坐标, 相机看向 -z)
+Z_MAP = -0.02
+Z_TRACK = 0.0
+Z_UNDER = 0.004
+Z_PLAY = 0.008
+Z_SPAWN = 0.012
+Z_ZONE = 0.016
+Z_MARK = 0.022
+Z_PLAYER = 0.026
+
 
 def _register_cjk_font() -> None:
-    """把系统里的中文字体注册给 pygfx(它自带的字体管理器在 Windows 上扫不到 CJK 字体)。
-
-    优先用程序自带的 `data/fonts/*.otf`(将来打包一份思源黑体), 找不到才用系统字体。
-    没注册成功时 `gfx.Text` 会打印 “Cannot render chars …”, 但线路绘制不受影响。
-    """
+    """把中文字体注册给 pygfx(它自带的字体管理器在 Windows 上扫不到 CJK 字体)。"""
     global _fonts_ready
     if _fonts_ready:
         return
     _fonts_ready = True
-    got = False
     for path in _FONT_CANDIDATES:
         if not os.path.exists(path):
             continue
         try:
             _font_manager.add_font_file(path)
-            got = True
         except Exception:  # noqa: BLE001
             log.warning("注册字体失败: %s", path)
-    if not got:
-        log.warning("没找到可用的中文字体, pygfx 文字可能显示为空白")
 
 
 def _rgba(c: QColor, mul: float = 1.0) -> tuple[float, float, float, float]:
-    """QColor → pygfx 用的 (r,g,b,a) 浮点四元组。"""
     return (c.redF(), c.greenF(), c.blueF(), c.alphaF() * mul)
 
 
 def _img_to_rgb(data: bytes) -> np.ndarray | None:
-    """地图原始字节(jpg/png) → (h, w, 3) uint8 数组, 通道顺序 **RGB**。
+    """地图字节 → (h, w, 3) uint8 RGB。
 
-    坑(2026-10-21): `QImage.Format_RGB32` 是 0xffRRGGBB, 在**小端**内存里字节顺序是
-    **B,G,R,A** —— 直接取 `[:, :3]` 得到的是 BGR, 传给 pygfx 就成了红蓝互换, 底图颜色
-    明显不对(实测源 (110,115,114) 画出来是 (114,115,110))。所以最后要 `[..., ::-1]`。
+    坑: `QImage.Format_RGB32` 是 0xffRRGGBB, 小端内存里字节序是 **B,G,R,A** ——
+    直接取 `[:, :3]` 是 BGR, 送到 GPU 会红蓝互换(实测源 (114,115,110) 画成
+    (110,115,114))。所以最后要 `[..., ::-1]`。
     """
     img = QImage.fromData(data)
     if img.isNull():
@@ -102,13 +135,19 @@ def _img_to_rgb(data: bytes) -> np.ndarray | None:
     return np.ascontiguousarray(bgra[..., ::-1])
 
 
-class _GlRoute:
-    """一条线路在 GPU 上的两个对象: 半透明底衬 + 已播放的着色段。"""
+def _pos3(xy: np.ndarray, z: float) -> np.ndarray:
+    out = np.empty((len(xy), 3), dtype=np.float32)
+    out[:, :2] = xy
+    out[:, 2] = z
+    return out
+
+
+class _Track:
+    """一条线路的 GPU 对象: 单色底衬(可选) + 速度配色线。"""
 
     __slots__ = ("rec", "pos", "colors", "vmax", "under", "play", "drawn", "dead")
 
-    def __init__(self, rec, pos: np.ndarray, colors: np.ndarray, vmax: float,
-                 under, play) -> None:
+    def __init__(self, rec, pos, colors, vmax, under, play) -> None:
         self.rec = rec
         self.pos = pos
         self.colors = colors
@@ -119,19 +158,23 @@ class _GlRoute:
         self.dead = False
 
 
-class RouteMapGlView(QWidget):
-    """pygfx 版地图控件(最小集)。
+class RouteMapGlView(RouteMapView):
+    """GPU 渲染的 RouteMapView(对外接口与软件版完全相同)。"""
 
-    `offscreen=True` 时用离屏画布(测试/截图用, 不弹窗)。
-    """
-
-    def __init__(self, parent=None, *, offscreen: bool = False,
-                 present_method: str = "screen") -> None:
+    def __init__(self, parent=None, *, present_method: str = "screen",
+                 offscreen: bool = False) -> None:
         super().__init__(parent)
-        self.setMinimumSize(420, 300)
-        _register_cjk_font()
-
         self._offscreen = offscreen
+        self._gl_pixels: dict = {}
+        self._gl_objs: list = []
+        self._gl_key: tuple | None = None
+        self._gl_tracks: list[_Track] = []
+        self._gl_anim = 0.0
+        self._fps_n = 0
+        self._fps_t = time.perf_counter()
+        self._fps = 0.0
+
+        _register_cjk_font()
         if offscreen:
             from rendercanvas.offscreen import RenderCanvas
             self._canvas = RenderCanvas(size=(1400, 900), pixel_ratio=1)
@@ -144,299 +187,96 @@ class RouteMapGlView(QWidget):
             lay.setContentsMargins(0, 0, 0, 0)
             if sub is not None:
                 lay.addWidget(sub)
-                # 鼠标/滚轮事件都落在 subwidget 上, 必须由它转发(见 eventFilter 说明)
+                # 鼠标/滚轮事件全落在 canvas 的内嵌控件上, 必须由它转发过来
                 sub.setMouseTracking(True)
                 sub.installEventFilter(self)
 
         self._renderer = gfx.WgpuRenderer(self._canvas)
         self._scene = gfx.Scene()
-        self._scene.add(gfx.Background(None, gfx.BackgroundMaterial(COLOR_BG)))
+        self._scene.add(gfx.Background(None, gfx.BackgroundMaterial(BG_COLOR)))
         self._camera = gfx.OrthographicCamera(1, 1, maintain_aspect=True)
         self._camera.local.position = (0.5, 0.5, 2.0)
         self._scene.add(self._camera)
-
-        self._plane = None            # 底图 Mesh
         self._tex = None
-        self._tex_size = (0, 0)
-        self._routes: list[_GlRoute] = []
-        self._dead_line = None        # 阵亡 X 的 Line(所有叉合成一条)
-        self._dead_key = None         # 阵亡叉内容指纹(避免每帧重建)
-
-        # 视图状态(与软件渲染同一套语义: zoom 相对“适配窗口”, pan 为像素偏移)
-        self._zoom = 1.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-        self._dragging = False
-        self._drag_last = QPointF()
-
-        # 回放
-        self._playhead = 0.0
-        self._playing = False
-        self._dead_dim = True
-        self._dead_mark = True
-
-        # FPS 统计
-        self._fps_n = 0
-        self._fps_t = time.perf_counter()
-        self._fps = 0.0
-        self._title_t = 0.0
-
+        self._plane = None
+        self._hover_obj = None
         self._canvas.request_draw(self._draw)
 
-    # ------------------------------------------------------------ 对外接口
-    @property
-    def fps(self) -> float:
-        """最近一秒的平均帧率(演示窗口标题里用)。"""
-        return self._fps
-
-    def set_map_bytes(self, data: bytes) -> bool:
-        """设置底图(jpg/png 原始字节)。"""
-        arr = _img_to_rgb(data)
-        if arr is None:
-            return False
-        h, w = arr.shape[:2]
-        if self._tex is not None and (w, h) == self._tex_size:
-            self._tex.data[:] = arr
-            self._tex.update_range((0, 0, 0), self._tex.size)
-        else:
-            old = self._plane
-            self._tex = gfx.Texture(arr, dim=2)
-            self._tex_size = (w, h)
-            mat = gfx.MeshBasicMaterial(map=self._tex)
-            self._plane = gfx.Mesh(gfx.plane_geometry(1, 1), mat)
-            self._plane.local.position = (0.5, 0.5, -0.02)
-            self._scene.add(self._plane)
-            if old is not None:
-                old.remove()
-        self._tex_aspect = w / max(1, h)
-        self.reset_view()
-        return True
-
-    def set_routes(self, recs) -> None:
-        """整体替换要画的线路(每条记录画成一条带速度着色的折线)。"""
-        for r in self._routes:
-            r.under.remove()
-            r.play.remove()
-        self._routes = [x for x in (self._make_route(rec) for rec in recs) if x is not None]
-        self._apply_playhead(self._playhead, force=True)
-        self._refresh_dead_line()
-        self.update()
-
-    def set_playback(self, recs=None, playhead: float = 0.0) -> None:
-        """设置回放进度(只改颜色数组, 不重建几何)。"""
-        self._playhead = float(playhead)
-        self._playing = bool(recs)
-        self._apply_playhead(self._playhead)
-        self._refresh_dead_line()
-        self.update()
-
-    def set_dead_style(self, dim: bool | None = None, mark: bool | None = None) -> None:
-        if dim is not None:
-            self._dead_dim = bool(dim)
-        if mark is not None:
-            self._dead_mark = bool(mark)
-        self._apply_playhead(self._playhead, force=True)
-        self._refresh_dead_line()
-        self.update()
-
-    def reset_view(self) -> None:
-        self._zoom = 1.0
-        self._pan_x = 0.0
-        self._pan_y = 0.0
-        self.update()
-
-    def map_pos(self, x: float, y: float) -> QPointF:
-        """归一化坐标 → 控件像素坐标(命中测试用, 与软件渲染一致)。"""
-        r = self._map_rect()
-        dw, dh = self._map_size()
-        return QPointF(r.left() + x * dw, r.top() + y * dh)
-
-    def snapshot(self, srgb: bool = False) -> np.ndarray:
-        """离屏模式下取一帧(测试用)。
-
-        注意 `renderer.snapshot()` 读回的色彩空间与屏幕不一致(实测屏幕上是 (114,115,110),
-        读回却是 (50,50,50)), 所以它只能拿来比对结构/像素位置, **不能**用来判断观感 ——
-        要“眼睛看到的样子”就用 `grab()`(走 Qt 控件抓图)。
-        """
-        arr = np.asarray(self._renderer.snapshot())
-        return _encode_srgb(arr) if srgb else arr
-
-    def grab(self) -> "QImage | None":
-        """抓一张“屏幕上看到的样子”(非离屏模式, 会强制重绘一次)。"""
-        sub = getattr(self._canvas, "_subwidget", None)
-        if sub is None:
-            return None
-        self._draw()
-        return sub.grab().toImage()
+    # -------------------------------------------------------- 覆盖渲染入口
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt 命名
+        """软件绘制不再使用(GPU 画布自己往窗口里画)。"""
 
     def update(self) -> None:  # noqa: N802 - Qt 命名
         super().update()
-        self._canvas.request_draw(self._draw)
+        canvas = getattr(self, "_canvas", None)
+        if canvas is not None:
+            canvas.request_draw(self._draw)
 
-    # ------------------------------------------------------------ 视图几何
-    def _map_size(self) -> tuple[float, float]:
-        if self._tex is None:
-            return (0.0, 0.0)
-        w, h = self._canvas.get_logical_size()
-        s = min(w / self._tex_size[0], h / self._tex_size[1]) * self._zoom
-        return (self._tex_size[0] * s, self._tex_size[1] * s)
+    def set_map_bytes(self, data: bytes | None, key: str | None = None) -> bool:
+        """复用父类的解码/占位图/换图清理逻辑, 另外更新 GPU 纹理。"""
+        changed = super().set_map_bytes(data, key)
+        if changed:
+            self._update_texture(data)
+        return changed
 
-    def _map_rect(self) -> QRectF:
-        dw, dh = self._map_size()
-        w, h = self._canvas.get_logical_size()
-        if dw <= 0 or dh <= 0:
-            return QRectF()
-        cx = w / 2.0 + self._pan_x
-        cy = h / 2.0 + self._pan_y
-        return QRectF(cx - dw / 2.0, cy - dh / 2.0, dw, dh)
-
-    def _clamp_pan(self) -> None:
-        dw, dh = self._map_size()
-        w, h = self._canvas.get_logical_size()
-        if dw <= 0 or dh <= 0:
+    def _update_texture(self, data: bytes | None) -> None:
+        if not data or self._pixmap is None:      # 空数据/占位图 → 不画底图
+            if self._plane is not None:
+                self._plane.remove()
+                self._plane = None
+            self._tex = None
+            self.update()
             return
-        max_x = max(0.0, (dw + w) / 2.0 - PAN_MARGIN)
-        max_y = max(0.0, (dh + h) / 2.0 - PAN_MARGIN)
-        self._pan_x = max(-max_x, min(max_x, self._pan_x))
-        self._pan_y = max(-max_y, min(max_y, self._pan_y))
+        arr = _img_to_rgb(data)
+        if arr is None:
+            return
+        if self._tex is not None and arr.shape[:2] == self._tex.data.shape[:2]:
+            self._tex.data[:] = arr
+            self._tex.update_full()
+        else:
+            if self._plane is not None:
+                self._plane.remove()
+            self._tex = gfx.Texture(arr, dim=2)
+            self._plane = gfx.Mesh(gfx.plane_geometry(1, 1),
+                                   gfx.MeshBasicMaterial(map=self._tex))
+            self._plane.local.position = (0.5, 0.5, Z_MAP)
+            self._scene.add(self._plane)
+        self.update()
 
+    # -------------------------------------------------------- 事件转发
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
+        """把 canvas 内嵌控件上的鼠标/滚轮事件转给**父类**去处理。
+
+        父类的 `wheelEvent` / `mouseMoveEvent` 已经实现了以鼠标为锚点的缩放、
+        中键平移与悬停命中测试 —— 这里直接 sendEvent 给 self, 逻辑一行都不用重写。
+        """
+        t = event.type()
+        if t in (QEvent.Type.Wheel, QEvent.Type.MouseButtonPress,
+                 QEvent.Type.MouseButtonRelease, QEvent.Type.MouseMove,
+                 QEvent.Type.MouseButtonDblClick):
+            QApplication.sendEvent(self, event)
+            return True
+        return super().eventFilter(obj, event)
+
+    # -------------------------------------------------------- 相机
     def _sync_camera(self) -> None:
-        """把 zoom/pan 换算成相机的可见矩形(归一化地图坐标, y 朝上)。"""
         r = self._map_rect()
         dw, dh = self._map_size()
         w, h = self._canvas.get_logical_size()
-        if dw <= 0 or dh <= 0:
+        if dw <= 0 or dh <= 0 or w <= 0 or h <= 0:
             return
-        x0 = -r.left() / dw
-        x1 = (w - r.left()) / dw
-        # 控件 y 是从上往下, pygfx 是从下往上 → 翻转
-        y_lo = 1.0 - (h - r.top()) / dh
-        y_hi = 1.0 + r.top() / dh
-        self._camera.show_rect(x0, x1, y_lo, y_hi)
+        self._camera.show_rect(-r.left() / dw, (w - r.left()) / dw,
+                              1.0 - (h - r.top()) / dh, 1.0 + r.top() / dh)
 
-    # ------------------------------------------------------------ 线路几何
-    def _make_route(self, rec) -> _GlRoute | None:
-        pts = getattr(rec, "points", None)
-        if not pts or len(pts) < 2:
-            return None
-        n = len(pts)
-        pos = np.empty((n, 3), dtype=np.float32)
-        pos[:, 0] = [p.x for p in pts]
-        pos[:, 1] = [1.0 - p.y for p in pts]
-        pos[:, 2] = 0.0
-        vmax = max(max(p.speed for p in pts), 1.0)
-        colors = np.empty((n, 4), dtype=np.float32)
-        cache: dict[int, tuple] = {}
-        for i, p in enumerate(pts):
-            k = bucket_index(p.speed, vmax)
-            c = cache.get(k)
-            if c is None:
-                c = _rgba(speed_color((k + 0.5) / 24 * vmax, vmax))
-                cache[k] = c
-            colors[i] = c
-        # 底衣(半透明灰, 细)在下, 已播放线(速度配色, 粗)在上。
-        # 两者都是半透明物体, 只靠 z 值排序不可靠(同 z 时顺序不确定, 实测灰底衣会
-        # 盖掉彩线 → 整条线看起来发白); 所以显式给 render_order, 并把 play 抬 z=0.01。
-        pos_play = pos.copy()
-        pos_play[:, 2] = 0.01
-        under = gfx.Line(
-            gfx.Geometry(positions=pos),
-            gfx.LineMaterial(thickness=2.0, thickness_space="screen",
-                             color=_rgba(COLOR_UNPLAYED)),
-            render_order=-1)
-        play_colors = np.zeros_like(colors)
-        play = gfx.Line(
-            gfx.Geometry(positions=pos_play, colors=play_colors),
-            gfx.LineMaterial(thickness=PLAY_PEN, thickness_space="screen",
-                             color_mode="vertex", aa=True),
-            render_order=0)
-        self._scene.add(under)
-        self._scene.add(play)
-        return _GlRoute(rec, pos, colors, vmax, under, play)
-
-    def _apply_playhead(self, head: float, force: bool = False) -> None:
-        """按进度改“已播放”那部分的颜色(只动变化的切片, 每帧 1~2 ms)。"""
-        for r in self._routes:
-            pts = r.rec.points
-            end = pts[-1].t if pts else 0.0
-            dead = bool(getattr(r.rec, "dead", False))
-            dim = dead and self._dead_dim and head >= end
-            if dim != r.dead or force:
-                r.dead = dim
-                # 阵亡: 底衬整条改成半透明纯灰, 已播放层全部透明
-                r.under.material.color = _rgba(COLOR_DEAD_ROUTE if dim else COLOR_UNPLAYED)
-            if dim:
-                if force or r.drawn:
-                    r.play.geometry.colors.data[:] = 0.0
-                    r.play.geometry.colors.update_range(0, len(r.colors))
-                    r.drawn = 0
-                continue
-            k = _bisect_time(pts, head)
-            if force:
-                arr = r.play.geometry.colors.data
-                arr[:k] = r.colors[:k]
-                arr[k:] = 0.0
-                r.play.geometry.colors.update_range(0, len(arr))
-                r.drawn = k
-                continue
-            if k > r.drawn:
-                arr = r.play.geometry.colors.data
-                arr[r.drawn:k] = r.colors[r.drawn:k]
-                r.play.geometry.colors.update_range(r.drawn, k - r.drawn)
-                r.drawn = k
-
-    def _refresh_dead_line(self) -> None:
-        """阵亡 X: 所有叉合成**一条** Line(每叉两段, 用逐顶点颜色区分 A 蓝 / B 红)。
-
-        回放时这个函数每帧都会被调 —— 所以先算一个“内容指纹”(哪些叉 + 叉的大小),
-        没变就直接返回, 不能每帧重建 Line(否则每帧都在建 GPU 对象)。
-        """
-        dw, dh = self._map_size()
-        if dw <= 0 or dh <= 0:
-            return
-        size = 5.0
-        dead_now: list = []
-        for r in self._routes:
-            if not self._dead_mark or not bool(getattr(r.rec, "dead", False)):
-                continue
-            pts = r.rec.points
-            if pts and self._playhead >= pts[-1].t:
-                dead_now.append(r)
-        key = (self._dead_mark, round(dw, 2), round(dh, 2),
-               tuple(r.rec.route_id for r in dead_now))
-        if key == self._dead_key:
-            return
-        self._dead_key = key
-
-        pos: list[float] = []
-        cols: list[float] = []
-        sx = size / dw
-        sy = size / dh
-        for r in dead_now:
-            side = getattr(r.rec, "side", "")
-            col = _rgba(COLOR_DEAD_MARK_A if side == "A" else COLOR_DEAD_MARK_B)
-            x, y = r.rec.points[-1].x, 1.0 - r.rec.points[-1].y
-            for a, b in (((x - sx, y - sy), (x + sx, y + sy)),
-                         ((x - sx, y + sy), (x + sx, y - sy))):
-                pos += [a[0], a[1], 0.0, b[0], b[1], 0.0]
-                cols += [*col, *col]
-        if self._dead_line is not None:
-            self._dead_line.remove()
-            self._dead_line = None
-        if not pos:
-            return
-        self._dead_line = gfx.Line(
-            gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
-                         colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
-            gfx.LineSegmentMaterial(thickness=DEAD_MARK_PEN, thickness_space="screen",
-                                    color_mode="vertex"),
-            render_order=1)
-        self._scene.add(self._dead_line)
-
-    # ------------------------------------------------------------ 帧循环
+    # -------------------------------------------------------- 每帧
     def _draw(self) -> None:
-        self._sync_camera()
-        self._renderer.render(self._scene, self._camera)
+        try:
+            self._sync_objects()
+            self._sync_camera()
+            self._renderer.render(self._scene, self._camera)
+        except Exception:  # noqa: BLE001
+            log.exception("GPU 渲染失败")
+            return
         self._fps_n += 1
         now = time.perf_counter()
         dt = now - self._fps_t
@@ -447,102 +287,343 @@ class RouteMapGlView(QWidget):
             if not self._offscreen:
                 self._canvas.set_title(f"路线地图 (GPU)  {self._fps:.0f} fps")
 
-    # ------------------------------------------------------------ 交互
-    # 关键: 鼠标/滚轮事件都发生在 canvas 内嵌的 `_subwidget`(QRenderWidget)上,
-    # **不会**传给我们这个外层 QWidget —— 2026-10-21 用户实测“缩放和拖拽没反应”。
-    # 所以在 subwidget 上装 Qt 事件过滤器, 直接截它的 Wheel/Mouse* 事件。
-    def eventFilter(self, obj, event) -> bool:  # noqa: N802 - Qt 命名
-        t = event.type()
-        if t == QEvent.Type.Wheel:
-            self._zoom_at(event.angleDelta().y() / 120.0, event.position())
-            return True
-        if t == QEvent.Type.MouseButtonDblClick:
-            self.reset_view()
-            return True
-        if t == QEvent.Type.MouseButtonPress:
-            if event.button() == Qt.MouseButton.MiddleButton:
-                self._dragging = True
-                self._drag_last = event.position()
-                self.setCursor(Qt.CursorShape.ClosedHandCursor)
-                return True
-            return False
-        if t == QEvent.Type.MouseButtonRelease:
-            if event.button() == Qt.MouseButton.MiddleButton:
-                self._dragging = False
-                self.setCursor(Qt.CursorShape.ArrowCursor)
-                return True
-            return False
-        if t == QEvent.Type.MouseMove and self._dragging:
-            self._pan_by(event.position())
-            return True
-        return super().eventFilter(obj, event)
+    @property
+    def fps(self) -> float:
+        return self._fps
 
-    def _zoom_at(self, steps: float, pos: QPointF) -> None:
-        """以 `pos`(控件坐标)为锚点缩放 `steps` 格 —— 鼠标下那一点保持不动。
+    def snapshot(self) -> np.ndarray:
+        """离屏取一帧(结构比对用; 色彩空间与屏幕不一致, 观感请看窗口)。"""
+        return np.asarray(self._renderer.snapshot())
 
-        坑(2026-10-21 用户反馈“只能在中间缩放”): 不能拿**归一化坐标之差**去改 `_pan`
-        (那是像素量), 两者差着地图尺寸的倍数, 补偿量小到等于没补 → 看着就是“以视图
-        中心缩放”。正确做法与软件版一致: 记下鼠标处的归一化坐标 `n`, 缩放后把 `n`
-        重新对齐回鼠标位置(直接算像素差)。
-        """
-        if not steps:
+    # -------------------------------------------------------- GPU 内容同步
+    def _content_key(self) -> tuple:
+        """决定要不要**重建 GPU 对象**的指纹(进度/闪烁不在内, 那些每帧只改颜色)。"""
+
+        def sig(recs) -> tuple:
+            return tuple((getattr(r, "route_id", id(r)), len(r.points)) for r in recs)
+
+        live = self._live
+        zones = ()
+        if self._show_zones:
+            zones = tuple((z.get("label"), z.get("side"), round(float(z.get("x", 0)), 6),
+                           round(float(z.get("y", 0)), 6)) for z in self._zones)
+        return (sig(self._visible), sig(self._highlight),
+                (getattr(live, "route_id", ""), len(live.points)) if live else None,
+                sig(self._live_multi), sig(self._playback_recs),
+                self._show_zones, zones, self._show_spawns, self._spawns_ver,
+                self._map_digest)
+
+    def _clear_objects(self) -> None:
+        for obj in self._gl_objs:
+            obj.remove()
+        self._gl_objs = []
+        self._gl_tracks = []
+        self._hover_obj = None
+
+    def _add(self, obj):
+        self._scene.add(obj)
+        self._gl_objs.append(obj)
+        return obj
+
+    def _sync_objects(self) -> None:
+        key = self._content_key()
+        if key != self._gl_key:
+            self._gl_key = key
+            self._rebuild_objects()
+        self._apply_progress()
+        self._apply_anim()
+
+    def _rebuild_objects(self) -> None:
+        self._clear_objects()
+        if self._playback_recs:
+            # 回放模式下**只**画正在回放的那几条(与软件版一致: 眼睛点亮的暂时让位)
+            for rec in self._playback_recs:
+                self._make_track(rec, colored=True, under=True)
+        else:
+            # 1) 眼睛点亮的轨迹: 单色灰蓝
+            for rec in self._visible:
+                self._make_track(rec, colored=False, under=False)
+            # 2) 选中的 / 正在录的: 速度配色
+            for rec in self._highlight:
+                self._make_track(rec, colored=True, under=False)
+            if self._live is not None:
+                self._make_track(self._live, colored=True, under=False)
+        # 3) 全局录制中“边录边画”的线路: 始终画
+        for rec in self._live_multi:
+            self._make_track(rec, colored=True, under=False)
+        # 4) 重生方块 / 战区 / 阵亡叉 / 玩家 / 光标
+        self._build_spawns()
+        self._build_zones()
+        self._build_dead_marks()
+        self._build_player()
+        self._build_cursor()
+        self._build_hover()
+
+    def _make_track(self, rec, *, colored: bool, under: bool) -> None:
+        pts = getattr(rec, "points", None)
+        if not pts or len(pts) < 2:
             return
-        new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self._zoom * (WHEEL_STEP ** steps)))
-        if abs(new_zoom - self._zoom) < 1e-6:
+        n = len(pts)
+        pos = np.empty((n, 3), dtype=np.float32)
+        pos[:, 0] = [p.x for p in pts]
+        pos[:, 1] = [1.0 - p.y for p in pts]
+        pos[:, 2] = Z_TRACK if not under else Z_PLAY
+        if not colored:
+            line = self._add(gfx.Line(
+                gfx.Geometry(positions=pos),
+                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
+                                 color=_rgba(rmv.COLOR_HISTORY))))
+            self._gl_tracks.append(_Track(rec, pos, None, 0.0, line, None))
             return
-        r = self._map_rect()
-        if r.width() <= 0 or r.height() <= 0:
+        vmax = self._vmax(rec)
+        colors = np.empty((n, 4), dtype=np.float32)
+        cache: dict[int, tuple] = {}
+        for i, p in enumerate(pts):
+            k = bucket_index(p.speed, vmax)
+            c = cache.get(k)
+            if c is None:
+                c = _rgba(speed_color((k + 0.5) / 24 * vmax, vmax))
+                cache[k] = c
+            colors[i] = c
+        under_obj = None
+        if under:
+            under_obj = self._add(gfx.Line(
+                gfx.Geometry(positions=_pos3(pos[:, :2], Z_UNDER)),
+                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
+                                 color=_rgba(rmv.COLOR_UNPLAYED)),
+                render_order=-1))
+        play = self._add(gfx.Line(
+            gfx.Geometry(positions=pos, colors=np.zeros_like(colors)),
+            gfx.LineMaterial(thickness=rmv.PLAY_PEN, thickness_space="screen",
+                             color_mode="vertex", aa=True)))
+        self._gl_tracks.append(_Track(rec, pos, colors, vmax, under_obj, play))
+
+    # ---------------------------------------------------- 图元: 重生/战区/叉
+    def _build_spawns(self) -> None:
+        if not self._show_spawns or not self._spawns:
             return
-        nx = (pos.x() - r.left()) / r.width()
-        ny = (pos.y() - r.top()) / r.height()
-        self._zoom = new_zoom
-        r2 = self._map_rect()
-        self._pan_x += pos.x() - (r2.left() + nx * r2.width())
-        self._pan_y += pos.y() - (r2.top() + ny * r2.height())
-        self._clamp_pan()
-        self.update()
-
-    def _pan_by(self, pos: QPointF) -> None:
-        """跟着鼠标平移(delta 由上一次位置算)。"""
-        self._pan_x += pos.x() - self._drag_last.x()
-        self._pan_y += pos.y() - self._drag_last.y()
-        self._drag_last = pos
-        self._clamp_pan()
-        self.update()
-
-    def _map_pos_at(self, pos: QPointF) -> QPointF:
-        """控件坐标 → 归一化地图坐标。"""
-        r = self._map_rect()
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
-            return QPointF()
-        return QPointF((pos.x() - r.left()) / dw, (pos.y() - r.top()) / dh)
+            return
+        sx, sy = rmv.SPAWN_HALF / dw, rmv.SPAWN_HALF / dh
+        pos: list[float] = []
+        cols: list[float] = []
+        for s in self._spawns:
+            try:
+                x, y = float(s["x"]), 1.0 - float(s["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            col = _rgba(rmv.SPAWN_SIDE_COLORS.get(str(s.get("side") or "neutral"),
+                                                  rmv.SPAWN_SIDE_COLORS["neutral"]))
+            for a, b in (((x - sx, y - sy), (x + sx, y - sy)),
+                         ((x + sx, y - sy), (x + sx, y + sy)),
+                         ((x + sx, y + sy), (x - sx, y + sy)),
+                         ((x - sx, y + sy), (x - sx, y - sy))):
+                pos += [a[0], a[1], Z_SPAWN, b[0], b[1], Z_SPAWN]
+                cols += [*col, *col]
+        if not pos:
+            return
+        self._add(gfx.Line(
+            gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
+                         colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
+            gfx.LineSegmentMaterial(thickness=rmv.SPAWN_PEN, thickness_space="screen",
+                                    color_mode="vertex")))
 
-    # 下面四个是“本控件自己拿到事件”时的入口(不带内嵌 canvas 时/测试用)。
-    def wheelEvent(self, event) -> None:  # noqa: N802
-        self._zoom_at(event.angleDelta().y() / 120.0, event.position())
+    def _build_zones(self) -> None:
+        """战区: 菱形轮廓 + 中心字母。
 
-    def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.MiddleButton:
-            self._dragging = True
-            self._drag_last = event.position()
-            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        注意: pygfx 0.17 + wgpu 0.32 下 **Mesh 的 pipeline 会直接报 shader 校验错**
+        (连一个三角形渲不出来, 实测), 所以填充图形一律用 Line/Points 画。
+        """
+        if not self._show_zones or not self._zones:
+            return
+        dw, dh = self._map_size()
+        if dw <= 0 or dh <= 0:
+            return
+        rx, ry = rmv.ZONE_RADIUS / dw, rmv.ZONE_RADIUS / dh
+        self._gl_zones = []
+        for z in self._zones:
+            try:
+                x, y = float(z["x"]), 1.0 - float(z["y"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            side = str(z.get("side") or "neutral")
+            color = QColor(rmv.ZONE_SIDE_COLORS.get(side, rmv.ZONE_SIDE_COLORS["neutral"]))
+            ring = np.array([(x, y + ry, Z_ZONE), (x + rx, y, Z_ZONE),
+                             (x, y - ry, Z_ZONE), (x - rx, y, Z_ZONE),
+                             (x, y + ry, Z_ZONE)], dtype=np.float32)
+            line = self._add(gfx.Line(
+                gfx.Geometry(positions=ring),
+                gfx.LineMaterial(thickness=2.0, thickness_space="screen",
+                                 color=_rgba(color))))
+            label = str(z.get("label") or "").strip()
+            text = None
+            if label:
+                text = self._add(gfx.Text(
+                    text=label[:2], font_size=11, screen_space=True,
+                    family=_CJK_FAMILY,
+                    material=gfx.TextMaterial(color="#ffffff")))
+                text.local.position = (x, y, Z_ZONE + 0.002)
+            self._gl_zones.append((z, line, color, text))
 
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.MiddleButton:
-            self._dragging = False
-            self.setCursor(Qt.CursorShape.ArrowCursor)
+    def _build_dead_marks(self) -> None:
+        dw, dh = self._map_size()
+        if dw <= 0 or dh <= 0:
+            return
+        sx, sy = rmv.DEAD_MARK_HALF / dw, rmv.DEAD_MARK_HALF / dh
+        pos: list[float] = []
+        cols: list[float] = []
+        for rec in self._playback_recs:
+            if not getattr(rec, "dead", False) or not rec.points:
+                continue
+            side = getattr(rec, "side", "")
+            col = _rgba(rmv.COLOR_DEAD_MARK_A if side == "A" else rmv.COLOR_DEAD_MARK_B)
+            x, y = rec.points[-1].x, 1.0 - rec.points[-1].y
+            for a, b in (((x - sx, y - sy), (x + sx, y + sy)),
+                         ((x - sx, y + sy), (x + sx, y - sy))):
+                pos += [a[0], a[1], Z_MARK, b[0], b[1], Z_MARK]
+                cols += [*col, *col]
+        if not pos:
+            return
+        self._add(gfx.Line(
+            gfx.Geometry(positions=np.array(pos, dtype=np.float32).reshape(-1, 3),
+                         colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
+            gfx.LineSegmentMaterial(thickness=rmv.DEAD_MARK_PEN + 1.0,
+                                    thickness_space="screen", color_mode="vertex"),
+            render_order=2))
 
-    def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        if self._dragging:
-            self._pan_by(event.position())
+    # ---------------------------------------------------- 图元: 玩家/光标/悬停
+    def _dot(self, color: QColor, radius_px: float) -> gfx.Points:
+        """屏幕像素大小的实心点(用 Points: Mesh 在当前 wgpu 下不可用)。"""
+        pts = gfx.Points(gfx.Geometry(positions=np.zeros((1, 3), dtype=np.float32)),
+                         gfx.PointsMaterial(size=radius_px * 2.0, size_space="screen",
+                                            color=_rgba(color)))
+        pts.geometry.positions.data[0] = (0.0, 0.0, 0.0)
+        return pts
 
-    def mouseDoubleClickEvent(self, event) -> None:  # noqa: N802
-        self.reset_view()
+    def _build_player(self) -> None:
+        self._gl_player = None
+        self._gl_player_dir = None
+        if self._player is None:
+            return
+        self._gl_player = self._add(self._dot(rmv.COLOR_PLAYER, rmv.PLAYER_DOT_R * 1.6))
+        self._gl_player.local.position = (self._player[0], 1.0 - self._player[1], Z_PLAYER)
+        self._gl_player_dir = self._add(gfx.Line(
+            gfx.Geometry(positions=np.zeros((2, 3), dtype=np.float32)),
+            gfx.LineMaterial(thickness=2.0, thickness_space="screen",
+                             color=_rgba(PLAYER_DIR_COLOR))))
+
+    def _build_cursor(self) -> None:
+        self._gl_cursor = None
+        if not self._playback_recs:
+            return
+        self._gl_cursor = self._add(self._dot(QColor("#f8fafc"), CURSOR_DOT_R))
+
+    def _build_hover(self) -> None:
+        self._hover_obj = None
+        if not self._hover_text:
+            return
+        self._hover_obj = self._add(gfx.Text(
+            text=self._hover_text, font_size=13, screen_space=True,
+            family=_CJK_FAMILY,
+            material=gfx.TextMaterial(color="#e2e8f0")))
+        # 贴着可见区域左下角(归一化坐标 → 按当前相机换算)
+        r = self._map_rect()
+        dw, dh = self._map_size()
+        w, h = self._canvas.get_logical_size()
+        if dw > 0 and dh > 0:
+            self._hover_obj.local.position = (
+                -r.left() / dw + 6.0 / dw, 1.0 - (h - r.top()) / dh + 6.0 / dh, Z_PLAYER + 0.004)
+
+    # ---------------------------------------------------- 每帧: 进度/闪烁/位置
+    def _apply_progress(self) -> None:
+        """回放进度: 只改颜色切片(1~2 ms), 不重建几何。"""
+        head = self._playhead
+        playing = {id(r) for r in self._playback_recs}
+        for tr in self._gl_tracks:
+            if tr.colors is None or tr.play is None:
+                continue
+            pts = tr.rec.points
+            end = pts[-1].t if pts else 0.0
+            dead = bool(getattr(tr.rec, "dead", False)) and self._dead_dim and head >= end
+            if dead != tr.dead:
+                tr.dead = dead
+                if tr.under is not None:
+                    tr.under.material.color = _rgba(
+                        rmv.COLOR_DEAD_ROUTE if dead else rmv.COLOR_UNPLAYED)
+            if dead:
+                if tr.drawn:
+                    tr.play.geometry.colors.data[:] = 0.0
+                    tr.play.geometry.colors.update_full()
+                    tr.drawn = 0
+                continue
+            if id(tr.rec) in playing:
+                k = _bisect_time(pts, head)
+                if k > tr.drawn:
+                    arr = tr.play.geometry.colors.data
+                    arr[tr.drawn:k] = tr.colors[tr.drawn:k]
+                    tr.play.geometry.colors.update_range(tr.drawn, k - tr.drawn)
+                    tr.drawn = k
+
+    def _apply_anim(self) -> None:
+        """闪烁 / 玩家位置 / 回放光标(每帧都变, 但都只改 uniform 或几个点)。"""
+        if self._zones and self._show_zones and getattr(self, "_gl_zones", None):
+            for z, line, color, _text in self._gl_zones:
+                blink = int(z.get("blink") or 0)
+                if blink <= 0:
+                    line.material.color = _rgba(color)
+                    continue
+                period = rmv.BLINK_PERIODS.get(blink, rmv.BLINK_PERIODS[1])
+                t = self._blink_t % period
+                bv = math.exp(-((5.0 * t - 2.0) ** 4))
+                k = rmv.BLINK_DIM + (1.0 - rmv.BLINK_DIM) * bv
+                c = rmv._blend(rmv.ZONE_DARK, (color.red(), color.green(), color.blue()), k)
+                line.material.color = (c.redF(), c.greenF(), c.blueF(), 1.0)
+
+        if getattr(self, "_gl_player", None) is not None and self._player is not None:
+            x, y = self._player[0], 1.0 - self._player[1]
+            self._gl_player.local.position = (x, y, Z_PLAYER)
+            line = getattr(self, "_gl_player_dir", None)
+            ang = self._dir_angle(*self._player_dir) if self._player_dir else None
+            if line is not None:
+                if ang is None:
+                    line.visible = False
+                else:
+                    line.visible = True
+                    dw, dh = self._map_size()
+                    ca, sa = math.cos(ang), math.sin(ang)
+                    # 长度是像素量, 换算成归一化单位(x/y 分别除, 角度已在像素空间算好)
+                    ln = (rmv.PLAYER_DIR_BACK + rmv.PLAYER_DIR_H)
+                    tip_x = x + ln * ca / dw if dw else x
+                    tip_y = y + ln * sa / dh if dh else y
+                    arr = line.geometry.positions.data
+                    arr[0] = (x, y, Z_PLAYER)
+                    arr[1] = (tip_x, tip_y, Z_PLAYER)
+                    line.geometry.positions.update_full()
+
+        if getattr(self, "_gl_cursor", None) is not None and self._playback_recs:
+            pt = _point_at(self._playback_recs[0].points, self._playhead)
+            if pt is None:
+                self._gl_cursor.visible = False
+            else:
+                self._gl_cursor.visible = True
+                self._gl_cursor.local.position = (pt.x, 1.0 - pt.y, Z_PLAYER)
+
+        # 悬停浮层文本(内容随鼠标变, 就地改 Text 即可, 不必重建对象)
+        if self._hover_text != getattr(self, "_gl_hover_text", None):
+            self._gl_hover_text = self._hover_text
+            if self._hover_obj is None:
+                self._build_hover()
+            elif not self._hover_text:
+                self._hover_obj.remove()
+                self._gl_objs = [o for o in self._gl_objs if o is not self._hover_obj]
+                self._hover_obj = None
+            else:
+                self._hover_obj.text = self._hover_text
 
 
 def _bisect_time(pts, head: float) -> int:
-    """`t <= head` 的点数(与软件渲染同一个判定, 供进度着色用)。"""
+    """`t <= head` 的点数(与软件版同一判定)。"""
     lo, hi = 0, len(pts)
     while lo < hi:
         mid = (lo + hi) // 2
@@ -553,15 +634,19 @@ def _bisect_time(pts, head: float) -> int:
     return lo
 
 
-def _encode_srgb(arr: np.ndarray) -> np.ndarray:
-    """线性 → sRGB(截图用: 让存出来的图与屏幕观感一致)。"""
-    out = arr.astype(np.float32) / 255.0
-    rgb = out[..., :3]
-    lo = rgb * 12.92
-    hi = 1.055 * np.power(np.clip(rgb, 0.0, None), 1.0 / 2.4) - 0.055
-    out[..., :3] = np.where(rgb <= 0.0031308, lo, hi)
-    res = np.empty_like(arr)
-    res[..., :3] = np.clip(out[..., :3] * 255.0 + 0.5, 0.0, 255.0).astype(np.uint8)
-    if arr.shape[-1] > 3:
-        res[..., 3] = arr[..., 3]
-    return res
+def _point_at(pts, head: float):
+    """回放到 `head` 时刻的插值位置(与软件版 point_at 同义, 这里只要位置)。"""
+    if not pts:
+        return None
+    k = _bisect_time(pts, head)
+    if k <= 0:
+        return pts[0]
+    if k >= len(pts):
+        return pts[-1]
+    a, b = pts[k - 1], pts[k]
+    span = b.t - a.t
+    if span <= 0:
+        return b
+    t = (head - a.t) / span
+    return type(a)(a.x + (b.x - a.x) * t, a.y + (b.y - a.y) * t,
+                   head, a.speed + (b.speed - a.speed) * t)

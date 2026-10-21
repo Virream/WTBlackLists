@@ -52,12 +52,13 @@ class Demo(QWidget):
         self.setWindowTitle("pygfx 地图画布 演示")
         self.resize(1100, 760)
         self._total = total
+        self._lives = lives
         self._head = 0.0
         self._playing = True
 
         self.view = RouteMapGlView(self)
         self.view.set_map_bytes(img)
-        self.view.set_routes(lives)
+        self.view.set_playback(lives, 0.0)
 
         self.lbl = QLabel("0.0 / %.1f s" % total)
         self.slider = QSlider(Qt.Orientation.Horizontal)
@@ -96,7 +97,7 @@ class Demo(QWidget):
 
     def _on_slider(self, v: int) -> None:
         self._head = v / 100.0
-        self.view.set_playback(None, self._head)
+        self.view.set_playback(self._lives, self._head)
         self.lbl.setText("%.1f / %.1f s" % (self._head, self._total))
 
     def _tick(self) -> None:
@@ -108,7 +109,7 @@ class Demo(QWidget):
         self.slider.blockSignals(True)
         self.slider.setValue(int(self._head * 100))
         self.slider.blockSignals(False)
-        self.view.set_playback(None, self._head)
+        self.view.set_playback(self._lives, self._head)
         self.lbl.setText("%.1f / %.1f s" % (self._head, self._total))
 
 
@@ -133,8 +134,7 @@ def main() -> int:
         for _ in range(6):
             app.processEvents()
         view.set_map_bytes(img)
-        view.set_routes(lives)
-        view.set_playback(None, total * 0.5 if args.at is None else args.at)
+        view.set_playback(lives, total * 0.5 if args.at is None else args.at)
         for _ in range(6):
             app.processEvents()
         if hasattr(view._canvas, "force_draw"):

@@ -56,6 +56,22 @@ from .zones import spawns_to_json, zones_to_json
 
 log = logging.getLogger("route_window")
 
+
+def _create_map_view(parent) -> RouteMapView:
+    """建地图控件: 优先 GPU(pygfx), 不行就软件渲染。
+
+    这里**必须惰性导入** `route_map_gl`: 它一 import 就会加载 `wgpu-native` 的 DLL,
+    而无头/offscreen 平台下这会和 Qt 冲突(实测整个进程 0xC000041D 崩掉, 连测试都跑不了),
+    而且普通用户也省掉几百毫秒启动时间。`create_map_view` 内部还会判平台与异常回退。
+    """
+    try:
+        from .route_map_gl import create_map_view
+    except Exception:  # noqa: BLE001
+        log.exception("GPU 画布模块导入失败, 使用软件渲染")
+        return RouteMapView(parent)
+    return create_map_view(parent)
+
+
 # 采样间隔选项(毫秒):
 # 40ms(≈25Hz)与 8111 陆战数据更新率匹配; 20ms(≈50Hz)接近 8111 请求上限
 INTERVAL_CHOICES_MS = (20, 25, 30, 40, 50, 75, 100)
@@ -383,7 +399,7 @@ class RouteTesterWindow(QMainWindow):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
-        self.map_view = RouteMapView(right)
+        self.map_view = _create_map_view(right)
         rl.addWidget(self.map_view, 1)
         rl.addWidget(self._build_info_panel(right), 0)
         splitter.addWidget(right)
