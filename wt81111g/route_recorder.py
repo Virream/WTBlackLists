@@ -8,6 +8,17 @@
 
 录制命令(开始/标记/结束)由 GUI 线程投递到队列, 在轮询线程内消费,
 保证录制状态只被单一线程修改, 无需复杂加锁。
+
+两类录制(互斥):
+
+* **单条线路**(`start`/`mark`/`stop`): 只录玩家自己, 起点/标记/终点 + 朝向;
+* **全局录制**(`global_start`/`global_stop`): 录**全场所有玩家**的线路,
+  A / B 两队各录一次(回放只给观战那一方的单位)。逻辑在 `global_record.py`,
+  这里只负责“什么时候开始/结束”:
+  - 点下按钮时通常还在**等待部署**, 8111 没有任何玩家数据 → 先挂着,
+    直到**第一次出现可录单位**才算 0 点;
+  - 到 demo 末尾回到车库时自动停止(8111 换成占位图 / 全场单位消失);
+  - 期间**锁定地面底图**, 不会因为有人上飞机而切成空战地图。
 """
 from __future__ import annotations
 
@@ -23,9 +34,11 @@ from PyQt6.QtCore import QObject, pyqtSignal
 
 from .api8111 import WT8111
 from .config import WT_BASE_URL
+from .global_record import GlobalTracker, extract_units
 from .map_cache import MapCache
 from .route_store import (
-    PLACEHOLDER_MAP_KEY, RouteMark, RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
+    GLOBAL_SIDES, PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, GlobalRecord, RouteMark,
+    RoutePoint, RouteRecord, RouteStore, pretty_vehicle,
 )
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
 from .zones import (Spawn, spawn_state, spawn_summary, spawns_from_objects, zone_state,
@@ -92,6 +105,11 @@ class RouteRecorder(QObject):
     mark_added = pyqtSignal(object)          # RouteMark
     recording_finished = pyqtSignal(object)  # RouteRecord
     notice = pyqtSignal(str)                 # 面向用户的提示
+    # ---- 全局录制(整局所有玩家的线路, 分 A/B 两队)
+    global_armed = pyqtSignal(object, str)     # (GlobalRecord, side) 已建条目, 等第一名玩家重生
+    global_started = pyqtSignal(object, str)   # (GlobalRecord, side) 第一名玩家出现, 已定下 0 点
+    global_finished = pyqtSignal(object, str)  # (GlobalRecord, side)
+    global_cancelled = pyqtSignal()            # 一条线都没录到
 
     def __init__(self, store: RouteStore, base_url: str = WT_BASE_URL,
                  interval: float = DEFAULT_INTERVAL, map_interval: float = 2.0,
@@ -133,6 +151,16 @@ class RouteRecorder(QObject):
         self._recent: deque[tuple[float, float, float, float, tuple | None]] = deque(maxlen=400)
         # 当前车头朝向(归一化单位方向向量); None = 本帧没拿到
         self._dir: tuple[float, float] | None = None
+
+        # ---- 全局录制状态(同样只由轮询线程修改)
+        self._global: GlobalRecord | None = None   # 正在录的条目
+        self._global_side = ""                      # "A" / "B"
+        self._global_created = False                # 条目是不是这次新建的(取消时要删掉)
+        self._global_prev_lives: list = []           # 重录前的旧线路(取消时恢复)
+        self._tracker: GlobalTracker | None = None
+        self._global_waiting = False                # 还没等到第一名玩家重生
+        self._global_t0 = 0.0
+        self._map_lock = False                      # 全局录制期间锁定地面底图
 
         # 地图缓存
         self._map_digest: str | None = None
@@ -178,6 +206,16 @@ class RouteRecorder(QObject):
                 digest = hashlib.sha1(data).hexdigest()
                 if digest != self._map_digest:
                     self._map_digest = digest
+                    if self._map_lock:
+                        # 全局录制期间**锁定地面底图**: 玩家上飞机时 8111 会发空战地图,
+                        # 那种图的坐标系和地面图完全不是一回事, 绝不能跟着换。
+                        # 只有回到车库(占位图)才算“本局结束”, 顺便自动停止录制。
+                        if digest == PLACEHOLDER_MAP_SHA1:
+                            log.info("全局录制: 8111 回到占位图(疑已退回车库), 自动停止")
+                            self._cmds.put("global_stop")
+                        else:
+                            log.info("全局录制中地图图片变化(很可能是空战地图), 已忽略")
+                        continue
                     try:
                         # 注意: 用缓存返回的键, 而不是字节哈希 —— 同一张地图的
                         # 不同分辨率会归到同一个键上(见 MapCache.save)
@@ -208,6 +246,16 @@ class RouteRecorder(QObject):
     def request_stop(self) -> None:
         self._cmds.put("stop")
 
+    def request_global_start(self, side: str, target: GlobalRecord | None = None) -> None:
+        """请求开始全局录制。
+
+        `target` 为侧栏里被标记过的条目(要追加/重录到它), None = 新建一个条目。
+        """
+        self._cmds.put(("global_start", (str(side), target)))
+
+    def request_global_stop(self) -> None:
+        self._cmds.put("global_stop")
+
     def set_interval_ms(self, ms: float) -> None:
         """按毫秒设置轮询间隔(GUI 线程调用), 采样间隔同步跟随。"""
         interval = max(_MIN_INTERVAL, min(_MAX_INTERVAL, float(ms) / 1000.0))
@@ -225,6 +273,24 @@ class RouteRecorder(QObject):
     @property
     def recording(self) -> bool:
         return self._rec is not None
+
+    @property
+    def global_recording(self) -> bool:
+        """是否正在(或正准备)做全局录制。"""
+        return self._global is not None
+
+    @property
+    def global_waiting(self) -> bool:
+        """全局录制已开始但还在等第一名玩家重生(此时 8111 没有玩家数据)。"""
+        return self._global is not None and self._global_waiting
+
+    @property
+    def global_side(self) -> str:
+        return self._global_side
+
+    @property
+    def global_record(self) -> GlobalRecord | None:
+        return self._global
 
     @property
     def armed(self) -> bool:
@@ -317,6 +383,11 @@ class RouteRecorder(QObject):
                 elapsed = now - self._t0
                 self._sample(player, elapsed, speed)
 
+        # 全局录制: 每帧把**全场**的单位喂给跟踪器(与单条录制互斥)
+        global_elapsed = 0.0
+        if self._global is not None:
+            global_elapsed = self._global_feed(now, objects)
+
         self.tick.emit({
             "connected": connected,
             "in_map": player is not None,
@@ -333,6 +404,14 @@ class RouteRecorder(QObject):
             "zones": self._zones,
             "spawns": self._spawns,
             "mode": self.mode_name,
+            # 全局录制状态(None = 没在录)
+            "global": ({
+                "side": self._global_side,
+                "waiting": self._global_waiting,
+                "elapsed": global_elapsed,
+                "lives": self._tracker.total if self._tracker else 0,
+                "active": self._tracker.active if self._tracker else 0,
+            } if self._global is not None else None),
         })
 
     def _current_rate(self) -> float:
@@ -427,9 +506,143 @@ class RouteRecorder(QObject):
                 self._do_mark(player)
             elif name == "stop":
                 self._do_stop(player, speed)
+            elif name == "global_start":
+                side, target = arg
+                self._do_global_start(side, target)
+            elif name == "global_stop":
+                self._do_global_stop()
+
+    # ------------------------------------------------------------ 全局录制
+    def _do_global_start(self, side: str, target: GlobalRecord | None) -> None:
+        """开始全局录制。
+
+        用户点击时正处在**开局等待部署**阶段(8111 还没有任何玩家数据),
+        所以这里只是建条目 + 进入“等待第一名玩家重生”, 真正的 0 点由
+        `_global_feed` 在第一次看到可录单位时定下。
+
+        * `target` 为 None → 新建条目(名字用当前时间), 并在条目上打上该队标记;
+        * `target` 非 None → 追加/重录到已有条目(调用方已确认过“重录要清空”);
+          旧线路**先留着**, 直到新录制成功才整体替换, 中途取消不会丢数据。
+        """
+        if self._global is not None:
+            self.notice.emit("已在全局录制中, 请先停止当前录制")
+            return
+        if self._rec is not None:
+            self.notice.emit("正在录制单条轨迹, 请先结束当前录制")
+            return
+        if self._map_key == PLACEHOLDER_MAP_KEY:
+            self.notice.emit("尚未进入对局/回放(8111 仅返回占位图), 无法开始全局录制")
+            return
+        created = target is None
+        if created:
+            rec = self.store.new_global(
+                map_key=self._map_key,
+                map_name=self.store.display_name(self._map_key),
+                zone_count=len(self._zones),
+                zone_signature=self._zones_sig,
+                mode_name=self.mode_name,
+            )
+        else:
+            rec = target
+            if not rec.zone_signature:      # 条目建立时可能还没拿到战区
+                rec.zone_signature = self._zones_sig
+                rec.zone_count = len(self._zones)
+                rec.mode_name = self.mode_name
+        if side not in rec.marks:
+            rec.marks.append(side)
+            rec.marks.sort(key=GLOBAL_SIDES.index)
+        self._global = rec
+        self._global_side = side
+        self._global_created = created
+        self._global_prev_lives = list(rec.lives(side))
+        self._tracker = GlobalTracker(rec, side)
+        self._global_waiting = True
+        self._global_t0 = 0.0
+        # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
+        self._map_lock = True
+        if created:
+            self.store.add_global(rec)
+        else:
+            self.store.save()
+        log.info("全局录制已就绪: %s %s 队 (条目 %s)", rec.label, side, rec.route_id)
+        self.global_armed.emit(rec, side)
+        self.notice.emit(f"已就绪: 等待第一名玩家重生后开始计时({side} 队)")
+
+    def _global_feed(self, now: float, objects: list) -> float:
+        """每帧喂给跟踪器; 返回已录制的秒数(还没开始时为 0)。
+
+        0 点 = **第一次看到可录单位**的时刻(用户要求: 等待部署期间不算时间)。
+        """
+        rec = self._global
+        tracker = self._tracker
+        if rec is None or tracker is None:
+            return 0.0
+        if self._global_waiting:
+            units, _skipped = extract_units(objects)
+            if not units:
+                return 0.0            # 还在等待部署: 8111 没有任何玩家数据
+            self._global_waiting = False
+            self._global_t0 = now
+            log.info("全局录制开始计时: %s %s 队", rec.label, self._global_side)
+            self.global_started.emit(rec, self._global_side)
+        elapsed = now - self._global_t0
+        if tracker.feed(elapsed, objects):
+            log.info("全局录制: 全场已无可录单位超过阈值, 自动停止")
+            self._do_global_stop()
+            return max(0.0, elapsed)
+        rec.duration = elapsed
+        # 点录制时可能还没拿到战区(进图瞬间) → 一旦知道就把模式/布局补进条目,
+        # 否则它会被归到“未知位置”那个版本组里
+        if not rec.zone_signature and self._zones_sig:
+            rec.zone_signature = self._zones_sig
+            rec.zone_count = len(self._zones)
+            rec.mode_name = self.mode_name
+        return elapsed
+
+    def _do_global_stop(self) -> None:
+        """结束全局录制并落盘。一条线都没录到 → 撤销(新建的删掉/重录的恢复原状)。"""
+        rec = self._global
+        if rec is None:
+            self.notice.emit("当前没有正在进行的全局录制")
+            return
+        side = self._global_side
+        lives = self._tracker.finish() if self._tracker is not None else []
+        skipped = dict(self._tracker.seen_skipped) if self._tracker is not None else {}
+        duration = max(0.0, rec.duration or 0.0)
+        self._global = None
+        self._tracker = None
+        self._global_waiting = False
+        self._map_lock = False
+        self._map_digest = None          # 解锁后重新判断一次当前地图(可能已回到车库)
+        if skipped:
+            top = sorted(skipped.items(), key=lambda kv: -kv[1])[:8]
+            log.info("全局录制: 未录制(%s) 共 %d 种, 数量前 8: %s",
+                     "非地面单位/静态对象", len(skipped),
+                     ", ".join(f"{t}/{i or '-'}×{n}" for (t, i), n in top))
+        if not lives:
+            if self._global_created:
+                self.store.remove_global(rec.route_id)
+            else:
+                rec.sides[side] = self._global_prev_lives
+                self.store.save()
+            self._global_prev_lives = []
+            log.info("全局录制已取消(没有录到任何线路)")
+            self.global_cancelled.emit()
+            self.notice.emit("已取消全局录制: 没有录到任何线路")
+            return
+        rec.sides[side] = lives          # 重录 = 整队替换
+        rec.duration = duration
+        self.store.save()
+        self._global_prev_lives = []
+        log.info("全局录制完成: %s %s 队 %d 条线路, 用时 %.1fs",
+                 rec.label, side, len(lives), duration)
+        self.global_finished.emit(rec, side)
 
     def _do_start(self, now: float, player: tuple[float, float] | None, vehicle: str,
                   start_on_move: bool = False) -> None:
+        if self._global is not None:
+            self.notice.emit("正在全局录制中, 请先停止全局录制")
+            return
         if self._rec is not None:
             self.notice.emit("已在录制中, 请先结束当前录制")
             return

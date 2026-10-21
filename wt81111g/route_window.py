@@ -39,11 +39,12 @@ from .hotkey_dialog import HotkeyDialog
 from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
-from .route_map_view import RouteMapView
+from .route_map_view import COLOR_TEAM_A, COLOR_TEAM_B, GlobalTrack, RouteMapView
 from .route_playback import PLAYBACK_SPEEDS, RoutePlayer
 from .route_recorder import DEFAULT_INTERVAL_MS, RouteRecorder
 from .route_store import (
-    PLACEHOLDER_MAP_KEY, RouteRecord, RouteStore, fmt_speed, fmt_time, fmt_time_ms,
+    GLOBAL_SIDES, GLOBAL_SIDE_LABELS, PLACEHOLDER_MAP_KEY, GlobalRecord, RouteRecord,
+    RouteStore, fmt_speed, fmt_time, fmt_time_ms,
 )
 from .sound import play as play_sound
 from .sound import play_error as play_error_sound
@@ -74,9 +75,9 @@ _COL_EYE = 0
 _COL_NAME = 1
 _COL_TIME = 2
 
-# 眼睛列宽度(px): 轨迹条目在最里层(地图 → 模式 → 轨迹, 缩进 14×3),
-# 图标 18px, 再加一点间距 —— 取小了图标会被列边界裁掉/压到名称列的文字上
-EYE_COLUMN_WIDTH = 4 * 12 + 18 + 8
+# 眼睛列宽度(px): 最深的一条是全局录制里的线路(地图 → 模式 → 版本 → 全局 → 队伍 → 线路,
+# 缩进 12×5), 图标 18px, 再加一点间距 —— 取小了图标会被列边界裁掉/压到名称列的文字上
+EYE_COLUMN_WIDTH = 6 * 12 + 18 + 8
 
 
 class RouteTesterWindow(QMainWindow):
@@ -102,6 +103,11 @@ class RouteTesterWindow(QMainWindow):
         self._last_record: RouteRecord | None = None
         # 眼睛点亮的轨迹 id: 它们会同时显示在地图上(取代了以前 Shift 多选的做法)
         self._visible_ids: set[str] = set()
+        # 全局录制里“眼睛点亮”的线路 id(`<条目 id>:<队><序号>`), 与 _visible_ids 分开存:
+        # 两类记录不是一回事(前者能回放, 后者只是折线), 混在一起容易误判。
+        self._visible_lives: set[str] = set()
+        # 最近一次完成的全局录制条目(用于状态提示/自动展开)
+        self._last_global: GlobalRecord | None = None
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
         # “基准版本”: 双击某条轨迹后, 它的(地图键, 战区指纹)被锁为基准 ——
@@ -168,6 +174,10 @@ class RouteTesterWindow(QMainWindow):
         self.recorder.recording_cancelled.connect(self._on_recording_cancelled)
         self.recorder.mark_added.connect(self._on_mark_added)
         self.recorder.recording_finished.connect(self._on_recording_finished)
+        self.recorder.global_armed.connect(self._on_global_armed)
+        self.recorder.global_started.connect(self._on_global_started)
+        self.recorder.global_finished.connect(self._on_global_finished)
+        self.recorder.global_cancelled.connect(self._on_global_cancelled)
         self.recorder.notice.connect(self._on_notice)
         if start_recorder:
             self.recorder.start()
@@ -542,6 +552,34 @@ class RouteTesterWindow(QMainWindow):
         self.chk_start_on_move.stateChanged.connect(self._on_start_on_move_changed)
         btns.addWidget(self.chk_start_on_move)
         btns.addStretch(1)
+
+        # ---- 竖线分隔: 左边是“单条线路录制”, 右边是“全局录制”(整局所有玩家的线路)
+        sep = QFrame()
+        sep.setFixedWidth(1)
+        sep.setStyleSheet("background-color:#94a3b8; border:none;")
+        sep.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        btns.addSpacing(10)
+        btns.addWidget(sep)
+        btns.addSpacing(10)
+
+        self.btn_rec_a = QPushButton("A 队录制")
+        self.btn_rec_b = QPushButton("B 队录制")
+        self.btn_rec_stop = QPushButton("停止 A/B 队录制")
+        self.btn_rec_a.setToolTip(
+            "全局录制(整局): 把**所有玩家**的线路录到这个条目的 A 队里。\n"
+            "点之前请先回到**刚开局的等待部署**阶段 —— 此时 8111 还没有玩家数据,\n"
+            "软件会挂着等第一名玩家重生, 那一刻才算 0 秒。\n"
+            "回到车库(demo 播完)或点「停止 A/B 队录制」时结束。\n"
+            "规则: 侧栏里**有 A 队标记**的全局条目 → 录到它; 没有任何标记 → 新建一条。")
+        self.btn_rec_b.setToolTip("与「A 队录制」相同, 录到 B 队(回放里换成观战另一方再录一次)。")
+        self.btn_rec_stop.setToolTip("结束当前全局录制并存盘(没有录到线路则丢弃本条)。")
+        self.btn_rec_a.clicked.connect(lambda: self._start_global("A"))
+        self.btn_rec_b.clicked.connect(lambda: self._start_global("B"))
+        self.btn_rec_stop.clicked.connect(self._stop_global)
+        for b in (self.btn_rec_a, self.btn_rec_b, self.btn_rec_stop):
+            b.setMinimumHeight(34)
+            btns.addWidget(b)
+        self.btn_rec_a.setStyleSheet("font-weight:bold;")
         grid.addLayout(btns, 4, 0, 1, 4)
 
         grid.setColumnStretch(0, 0)
@@ -571,6 +609,132 @@ class RouteTesterWindow(QMainWindow):
         root = self.tree.invisibleRootItem()
         yield from walk(root)
 
+    def _iter_life_items(self):
+        """递归遍历全部**全局录制里的线路条目**(全局条目 → A/B 队 → 线路)。"""
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if ch.data(0, _ROLE_KIND) == "glife":
+                    yield ch
+                else:
+                    yield from walk(ch)
+
+        root = self.tree.invisibleRootItem()
+        yield from walk(root)
+
+    def _life_ids_of(self, item: QTreeWidgetItem) -> list[str]:
+        """某个全局条目 / 队伍行下面的全部线路 id。"""
+        if item.data(0, _ROLE_KIND) == "glife":
+            return [item.data(0, _ROLE_ID)]
+        out: list[str] = []
+
+        def walk(node: QTreeWidgetItem) -> None:
+            for i in range(node.childCount()):
+                ch = node.child(i)
+                if ch.data(0, _ROLE_KIND) == "glife":
+                    out.append(ch.data(0, _ROLE_ID))
+                else:
+                    walk(ch)
+
+        walk(item)
+        return out
+
+    def _life_map_keys(self) -> dict[str, str]:
+        """{线路 id: 所属地图键} —— 换图时用它判断哪些全局线路已经不属于当前地图。"""
+        return {life.life_id: g.map_key
+                for g in self.store.globals for side in GLOBAL_SIDES
+                for life in g.lives(side)}
+
+    def _tree_variants(self):
+        """把「单条路线」与「全局录制条目」合并成统一三层结构(地图 → 模式 → 版本)。
+
+        返回 `[(地图键, [(模式名, [(战区指纹, 版本名, [路线...], [全局条目...])])])]`。
+        全局条目按 `(地图键, 战区指纹)` 归到对应版本下; 如果某个版本**只有**全局条目
+        (还没录过单条路线), 也会单独补一组出来, 否则它就没地方可放了。
+        """
+        routes = self.store.grouped_by_variant()
+        glob = self.store.globals_by_group()
+        out: list[tuple[str, list[tuple[str, list[tuple[str, str, list, list]]]]]] = []
+        for key in self.store.ordered_map_keys():
+            modes: list[tuple[str, list[tuple[str, str, list, list]]]] = []
+            used: set[str] = set()
+            for mode_label, variants in routes.get(key, []):
+                rows: list[tuple[str, str, list, list]] = []
+                for sig, vname, recs in variants:
+                    rows.append((sig, vname, list(recs), glob.get((key, sig), [])))
+                    used.add(sig)
+                modes.append((mode_label, rows))
+            for (mk, sig), items in glob.items():
+                if mk != key or sig in used:
+                    continue
+                vname = self.store.layout_display_name(key, sig)
+                mode_label = items[0].mode_label if items else ""
+                modes.append((mode_label, [(sig, vname, [], list(items))]))
+            if modes:
+                out.append((key, modes))
+        return out
+
+    @staticmethod
+    def _count_text(n_route: int, n_global: int) -> str:
+        """分组行的“信息”列: 单条路线条数 + 全局录制局数(没有全局录制就不写)。"""
+        return f"{n_route} 条 · {n_global} 局" if n_global else f"{n_route} 条"
+
+    def _add_global_item(self, parent: QTreeWidgetItem, g: GlobalRecord) -> None:
+        """在版本行下挂一个「全局录制」条目: 条目 → A/B 队 → 每辆车的线路。"""
+        mark = f"  [{g.mark_label}]" if g.mark_label else ""
+        item = QTreeWidgetItem(["", f"全局 {g.label}{mark}", f"{g.count()} 条"])
+        item.setData(0, _ROLE_KIND, "global")
+        item.setData(0, _ROLE_ID, g.route_id)
+        item.setData(0, _ROLE_KEY, f"global|{g.route_id}")
+        item.setIcon(_COL_EYE, eye_icon(any(life.life_id in self._visible_lives
+                                            for side in GLOBAL_SIDES
+                                            for life in g.lives(side))))
+        item.setToolTip(_COL_EYE, "点击显示 / 隐藏整局的全部线路")
+        item.setToolTip(_COL_NAME,
+                        f"全局录制 · {g.map_name} · {g.mode_label}\n"
+                        f"录制时间 {g.created_at.replace('T', ' ')}\n"
+                        f"用时 {fmt_time(g.duration)} · "
+                        f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条\n"
+                        f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}\n"
+                        f"右键可标记为 A/B 队录制目标、清除标记或删除")
+        f = QFont()
+        f.setItalic(True)
+        item.setFont(_COL_NAME, f)
+        parent.addChild(item)
+        for side in GLOBAL_SIDES:
+            lives = g.lives(side)
+            sitem = QTreeWidgetItem(["", GLOBAL_SIDE_LABELS[side], f"{len(lives)} 条"])
+            sitem.setData(0, _ROLE_KIND, "gside")
+            sitem.setData(0, _ROLE_ID, g.route_id)
+            sitem.setData(0, _ROLE_SIG, side)
+            sitem.setData(0, _ROLE_KEY, f"gside|{g.route_id}|{side}")
+            sitem.setFlags(GROUP_ITEM_FLAGS)
+            sitem.setIcon(_COL_EYE, eye_icon(any(l.life_id in self._visible_lives
+                                                for l in lives)))
+            sitem.setToolTip(_COL_EYE, "点击显示 / 隐藏这一队的全部线路")
+            sitem.setToolTip(_COL_NAME,
+                             "回放的 /map_obj.json 只给**观战那一方**的单位,\n"
+                             "所以要分两次录制: 一次观战 A 方, 一次观战 B 方。")
+            item.addChild(sitem)
+            # 组内按开始时间**正序**(越靠前时间越早) —— 与单条路线(倒序)刚好相反
+            for life in sorted(lives, key=lambda x: (x.t0, x.life_id)):
+                mark_prot = "  🛡" if life.protected else ""
+                litem = QTreeWidgetItem(["", life.label + mark_prot,
+                                         fmt_time(life.duration)])
+                litem.setData(0, _ROLE_KIND, "glife")
+                litem.setData(0, _ROLE_ID, life.life_id)
+                litem.setData(0, _ROLE_SIG, side)
+                litem.setData(0, _ROLE_KEY, g.route_id)
+                litem.setIcon(_COL_EYE, eye_icon(life.life_id in self._visible_lives))
+                litem.setToolTip(_COL_EYE, "点击显示 / 隐藏这条线路")
+                litem.setToolTip(_COL_NAME,
+                                 f"{side} 队 · {life.icon or life.obj_type}\n"
+                                 f"出现 {fmt_time(life.t0)} → 消失 {fmt_time(life.t1)}"
+                                 f"(8111 不给玩家名, 这里按载具类别显示)\n"
+                                 f"色标 {life.color or '-'}"
+                                 f"{' · 出生时处于重生保护' if life.protected else ''}")
+                sitem.addChild(litem)
+
     def _reload_tree(self) -> None:
         # 重建前先记住哪些分组是折叠的: 「地图管理」关掉、录完一条轨迹、改名或删除
         # 之后都会走这里重建侧栏, 否则用户刚折起来的分组会被全部重新展开。
@@ -579,11 +743,14 @@ class RouteTesterWindow(QMainWindow):
         self.tree.blockSignals(True)
         self.tree.clear()
         alive: set[str] = set()          # 仍存在于侧栏的轨迹 id(用于修剪显示集合)
-        # 四层: 地图 → 模式(由战区数量推出) → 版本(战区布局) → 轨迹
-        groups = self.store.grouped_by_variant()
-        for map_key, modes in groups.items():
-            total = sum(len(rows) for _m, variants in modes for _s, _n, rows in variants)
-            top = QTreeWidgetItem(["", self.store.display_name(map_key), f"{total} 条"])
+        alive_lives: set[str] = set()    # 仍存在于侧栏的全局线路 id
+        # 四层: 地图 → 模式(由战区数量推出) → 版本(战区布局) → 轨迹/全局条目
+        variants_all = self._tree_variants()
+        for map_key, modes in variants_all:
+            n_route = sum(len(rows) for _m, vs in modes for _s, _n, rows, _g in vs)
+            n_glob = sum(len(g) for _m, vs in modes for _s, _n, _r, g in vs)
+            top = QTreeWidgetItem(["", self.store.display_name(map_key),
+                                   self._count_text(n_route, n_glob)])
             top.setData(0, _ROLE_KIND, "map")
             top.setData(0, _ROLE_ID, map_key)
             top.setData(0, _ROLE_KEY, f"map|{map_key}")
@@ -592,9 +759,11 @@ class RouteTesterWindow(QMainWindow):
             f.setBold(True)
             top.setFont(_COL_NAME, f)
             self.tree.addTopLevelItem(top)
-            for mode_label, variants in modes:
-                n_mode = sum(len(rows) for _s, _n, rows in variants)
-                mid = QTreeWidgetItem(["", mode_label, f"{n_mode} 条"])
+            for mode_label, vs in modes:
+                n_mode = sum(len(rows) for _s, _n, rows, _g in vs)
+                g_mode = sum(len(g) for _s, _n, _r, g in vs)
+                mid = QTreeWidgetItem(["", mode_label,
+                                       self._count_text(n_mode, g_mode)])
                 mid.setData(0, _ROLE_KIND, "mode")
                 mid.setData(0, _ROLE_ID, map_key)
                 mid.setData(0, _ROLE_KEY, f"mode|{map_key}|{mode_label}")
@@ -604,8 +773,9 @@ class RouteTesterWindow(QMainWindow):
                                f"模式由 8111 的战区(capture_zone)数量推出: "
                                f"3 个=战区控制, 2 个=战区攻陷, 1 个=战区争夺")
                 top.addChild(mid)
-                for sig, vname, routes in variants:
-                    var = QTreeWidgetItem(["", vname, f"{len(routes)} 条"])
+                for sig, vname, routes, globs in vs:
+                    var = QTreeWidgetItem(["", vname,
+                                           self._count_text(len(routes), len(globs))])
                     var.setData(0, _ROLE_KIND, "variant")
                     var.setData(0, _ROLE_ID, map_key)
                     var.setData(0, _ROLE_SIG, sig)
@@ -625,13 +795,20 @@ class RouteTesterWindow(QMainWindow):
                                          f"{rec.vehicle} | 用时 {fmt_time(rec.duration)}")
                         var.addChild(child)
                         alive.add(rec.route_id)
+                    # 全局录制条目排在单条路线之后(用户要求: 加在这一级的末尾)
+                    for g in globs:
+                        self._add_global_item(var, g)
+                        alive_lives.update(
+                            life.life_id for side in GLOBAL_SIDES
+                            for life in g.lives(side))
         # 展开/折叠统一放在重建末尾恢复(见 _restore_folded)
         # 已缓存图片、但还没录过轨迹的地图也列出来(灰色, 用时列写“仅缓存”):
         # 否则在「地图管理」里给它们改完名字, 主界面根本看不到任何变化。
         # 顺便把它们**已见过的模式版本**也挂上(0 条) —— 还没录到轨迹时就能右键
         # 把“区域 1/2”改成自己认得的名字(大地图/小地图…)。
+        listed = {key for key, _modes in variants_all}
         for map_key in self.store.ordered_map_keys():
-            if map_key in groups or not self.map_cache.has(map_key):
+            if map_key in listed or not self.map_cache.has(map_key):
                 continue
             top = QTreeWidgetItem(["", self.store.display_name(map_key), "仅缓存"])
             top.setData(0, _ROLE_KIND, "map")
@@ -669,6 +846,7 @@ class RouteTesterWindow(QMainWindow):
         self._tree_built = True
         self.tree.blockSignals(False)
         self._visible_ids &= alive       # 被删除的记录自动从“显示中”移除
+        self._visible_lives &= alive_lives
         if self._anchor is not None and not any(
                 (rec := self.store.get(rid)) is not None and self._group_of(rec) == self._anchor
                 for rid in alive):
@@ -712,30 +890,76 @@ class RouteTesterWindow(QMainWindow):
         for i in range(root.childCount()):
             walk(root.child(i))
 
-    def _expand_to_route(self, route_id: str) -> None:
-        """把某条轨迹的各级分组全部展开(录完一条后至少能看到它自己)。
+    def _expand_item(self, node_id: str) -> None:
+        """把某个条目(单条轨迹 / 全局录制条目)的各级分组全部展开。
 
         启动时分组是折叠的, 新录的这条会藏在里面 —— 不展开的话侧栏看起来几乎没变化。
         """
-        for item in self._iter_route_items():
-            if item.data(0, _ROLE_ID) != route_id:
-                continue
-            parent = item.parent()
-            while parent is not None:
-                parent.setExpanded(True)
-                parent = parent.parent()
-            return
+        found: list[QTreeWidgetItem] = []
+
+        def walk(item: QTreeWidgetItem) -> None:
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                if (ch.data(0, _ROLE_ID) == node_id
+                        and ch.data(0, _ROLE_KIND) in ("route", "global")):
+                    found.append(ch)
+                    return
+                walk(ch)
+
+        walk(self.tree.invisibleRootItem())
+        node = found[0] if found else None
+        while node is not None:
+            node.setExpanded(True)
+            node = node.parent()
+
+    def _expand_to_route(self, route_id: str) -> None:
+        """兼容旧调用点: 展开到某条单条轨迹。"""
+        self._expand_item(route_id)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, col: int) -> None:
-        """点击第一列的**眼睛图标** → 切换该轨迹在地图上的显示/隐藏。"""
-        if col != _COL_EYE or item.data(0, _ROLE_KIND) != "route":
+        """点击第一列的**眼睛图标** → 切换该条目在地图上的显示/隐藏。"""
+        if col != _COL_EYE:
             return
-        if self._in_playback():
-            # 回放绘制优先于轨迹显示, 此时改眼睛没有意义(面板上也已禁用侧栏)
-            self._set_status("回放中无法修改轨迹显示, 请先点「■ 结束播放」", sticky=2.0)
+        kind = item.data(0, _ROLE_KIND)
+        if kind == "route":
+            if self._in_playback():
+                # 回放绘制优先于轨迹显示, 此时改眼睛没有意义(面板上也已禁用侧栏)
+                self._set_status("回放中无法修改轨迹显示, 请先点「■ 结束播放」", sticky=2.0)
+                return
+            route_id = item.data(0, _ROLE_ID)
+            self._set_visible(item, route_id not in self._visible_ids)
+        elif kind in ("glife", "gside", "global"):
+            if self._in_playback():
+                self._set_status("回放中无法修改轨迹显示, 请先点「■ 结束播放」", sticky=2.0)
+                return
+            ids = self._life_ids_of(item)
+            self._set_lives_visible(ids, not any(i in self._visible_lives for i in ids))
+
+    def _set_lives_visible(self, ids: list[str], shown: bool) -> None:
+        """统一控制“全局录制里的线路”在地图上的显示/隐藏。
+
+        只点亮本条的线路时**不清掉别人**: 全局线路之间不冲突(它们同属一张地图,
+        本来就是整局所有玩家的轨迹, 叠在一起才有意义)。
+        """
+        if not ids:
             return
-        route_id = item.data(0, _ROLE_ID)
-        self._set_visible(item, route_id not in self._visible_ids)
+        if shown:
+            self._visible_lives.update(ids)
+        else:
+            self._visible_lives -= set(ids)
+        self._refresh_eye_icons()
+        self._refresh_map_tracks()
+        if shown:
+            # 点在缓存底图上看不到线路时, 自动切到这条全局录制所属的地图
+            for g in self.store.globals:
+                if any(life.life_id in self._visible_lives for side in GLOBAL_SIDES
+                       for life in g.lives(side)):
+                    self._ensure_map_for([g])
+                    break
+        self._set_status(
+            f"{'已显示' if shown else '已隐藏'} {len(ids)} 条全局线路"
+            f"(当前共 {len(self._visible_lives)} 条)", sticky=2.0)
+
 
     def _visible_route_ids(self) -> list[str]:
         """按侧栏顺序列出眼睛点亮的轨迹 id。"""
@@ -772,6 +996,7 @@ class RouteTesterWindow(QMainWindow):
         """
         recs = [r for rid in self._visible_route_ids()
                 if (r := self.store.get(rid)) is not None]
+        gtracks = self._global_map_tracks()
         picked = self._selection_tracks()
         if picked:
             highlight = [r for r in picked if r.route_id in self._visible_ids]
@@ -784,11 +1009,28 @@ class RouteTesterWindow(QMainWindow):
             # 录制中 live 是正在录的那条, 不能被选中/高亮覆盖
             self.map_view.set_visible_tracks(recs)
             self.map_view.set_highlight([])
+            self.map_view.set_global_tracks(gtracks)
             return
         self.map_view.set_visible_tracks(recs)
         self.map_view.set_highlight(highlight)
+        self.map_view.set_global_tracks(gtracks)
         self.map_view.set_live(None)
         self._apply_zones()
+
+    def _global_map_tracks(self) -> list[GlobalTrack]:
+        """眼睛点亮的全局线路 → 地图上要画的折线(A 队青 / B 队品红)。"""
+        if not self._visible_lives:
+            return []
+        out: list[GlobalTrack] = []
+        for g in self.store.globals:
+            for side in GLOBAL_SIDES:
+                color = COLOR_TEAM_A if side == "A" else COLOR_TEAM_B
+                for life in g.lives(side):
+                    if life.life_id in self._visible_lives and len(life.points) >= 2:
+                        out.append(GlobalTrack(points=life.points, color=color,
+                                               label=f"{side} {life.label}"))
+        return out
+
 
     def _zone_signature_for_view(self) -> str:
         """当前视图(回放中的 / 眼睛点亮的轨迹)对应的模式指纹(取不到就空串)。
@@ -898,6 +1140,12 @@ class RouteTesterWindow(QMainWindow):
         双击地图/模式/版本行不做处理(保留 Qt 默认的展开/折叠)。
         """
         if item.data(0, _ROLE_KIND) != "route":
+            if item.data(0, _ROLE_KIND) in ("global", "gside", "glife"):
+                # 双击全局条目/队伍/线路 = 显示它并切到对应地图(不能回放, 只能看)
+                if self._in_playback():
+                    self._set_status("回放中无法切换显示, 请先点「■ 结束播放」", sticky=2.0)
+                    return
+                self._set_lives_visible(self._life_ids_of(item), True)
             return
         if self._in_playback():
             self._set_status("回放中无法切换基准, 请先点「■ 结束播放」", sticky=2.0)
@@ -996,7 +1244,9 @@ class RouteTesterWindow(QMainWindow):
             return
         kind = item.data(0, _ROLE_KIND)
         menu = QMenu(self)
-        if kind == "route":
+        if kind in ("global", "gside", "glife"):
+            self._fill_global_menu(menu, item, kind)
+        elif kind == "route":
             act_show = QAction("在地图上显示", self)
             act_show.triggered.connect(lambda: self._show_on_map(item))
             menu.addAction(act_show)
@@ -1040,6 +1290,90 @@ class RouteTesterWindow(QMainWindow):
             act_expand.triggered.connect(lambda: item.setExpanded(not item.isExpanded()))
             menu.addAction(act_expand)
         menu.exec(self.tree.viewport().mapToGlobal(pos))
+
+    # --------------------------------------------------- 全局录制的右键菜单
+    def _fill_global_menu(self, menu: QMenu, item: QTreeWidgetItem, kind: str) -> None:
+        """全局条目 / A·B 队行 / 单条线路的右键菜单。
+
+        标记只在“全局条目”这一层打: 它表示**下一次点「A/B 队录制」录到哪一条**上。
+        没有任何条目标记时, 点录制按钮会新建一个全局条目。
+        """
+        ids = self._life_ids_of(item)
+        act_show = QAction("在地图上显示", self)
+        act_show.triggered.connect(lambda: self._set_lives_visible(ids, True))
+        menu.addAction(act_show)
+        act_hide = QAction("从地图上隐藏", self)
+        act_hide.triggered.connect(lambda: self._set_lives_visible(ids, False))
+        menu.addAction(act_hide)
+        if kind != "glife":
+            gid = item.data(0, _ROLE_ID)
+            g = self.store.get_global(gid)
+            menu.addSeparator()
+            for side in GLOBAL_SIDES:
+                act = QAction(f"标记为 {GLOBAL_SIDE_LABELS[side]}录制目标", self)
+                act.setCheckable(True)
+                act.setChecked(g is not None and side in g.marks)
+                act.setToolTip(
+                    f"打上标记后, 点「{side} 队录制」会录到这一条(而不是新建一条)。\n"
+                    f"同一队只会有一条记录带标记 —— 打到别处时旧的会自动清掉。")
+                act.toggled.connect(
+                    lambda checked, gid=gid, s=side: self._toggle_mark(gid, s, checked))
+                menu.addAction(act)
+            act_clear = QAction("清除标记", self)
+            act_clear.setEnabled(g is not None and bool(g.marks))
+            act_clear.setToolTip("清除后, 点「A/B 队录制」会新建一个全局录制条目")
+            act_clear.triggered.connect(lambda: self._clear_mark(item.data(0, _ROLE_ID)))
+            menu.addAction(act_clear)
+        menu.addSeparator()
+        act_expand = QAction("展开/折叠", self)
+        act_expand.triggered.connect(lambda: item.setExpanded(not item.isExpanded()))
+        menu.addAction(act_expand)
+        if kind == "global":
+            menu.addSeparator()
+            act_del = QAction("删除该全局录制…", self)
+            act_del.triggered.connect(
+                lambda: self._delete_global(item.data(0, _ROLE_ID)))
+            menu.addAction(act_del)
+
+    def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
+        """打/清“下次录到这一条”的标记。"""
+        g = self.store.get_global(gid)
+        if g is None:
+            return
+        self.store.set_mark(gid, side, on)
+        self._reload_tree()
+        self._set_status(
+            f"已把「{g.label}」标记为 {side} 队录制目标"
+            f"(点「{side} 队录制」就录到这一条)" if on
+            else f"已取消「{g.label}」的 {side} 队标记", sticky=4.0)
+
+    def _clear_mark(self, gid: str) -> None:
+        g = self.store.get_global(gid)
+        if g is None:
+            return
+        self.store.clear_marks(gid)
+        self._reload_tree()
+        self._set_status(
+            f"已清除「{g.label}」的标记 —— 下次点「A/B 队录制」会新建一个全局条目",
+            sticky=4.0)
+
+    def _delete_global(self, gid: str) -> None:
+        g = self.store.get_global(gid)
+        if g is None:
+            return
+        ok = QMessageBox.question(
+            self, "删除全局录制",
+            f"确定删除这条全局录制吗?\n\n"
+            f"{g.label} · {g.map_name} · {g.mode_label}\n"
+            f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条线路\n\n"
+            f"删除后无法恢复(单条线路录制的轨迹不受影响)。")
+        if ok != QMessageBox.StandardButton.Yes:
+            return
+        self.store.remove_global(gid)
+        if self._last_global is not None and self._last_global.route_id == gid:
+            self._last_global = None
+        self._reload_tree()
+        self._set_status("已删除全局录制条目", sticky=3.0)
 
     def _variant_tip(self, map_key: str, signature: str, name: str) -> str:
         """版本行的提示: 战区字母/坐标 + 跨度(辨认“大地图/小地图”)."""
@@ -1149,9 +1483,29 @@ class RouteTesterWindow(QMainWindow):
                  len(self._visible_ids))
 
     def _refresh_eye_icons(self) -> None:
-        """按 _visible_ids 重刷所有条目的眼睛图标(不重建树, 避免调用方持有失效条目)。"""
-        for ch in self._iter_route_items():
-            ch.setIcon(_COL_EYE, eye_icon(ch.data(0, _ROLE_ID) in self._visible_ids))
+        """按 _visible_ids / _visible_lives 重刷所有眼睛图标(不重建树)。
+
+        单条轨迹看自己的 id; 全局线路看 `_visible_lives`; 全局条目行与 A/B 队行
+        是**汇总**: 只要下面有任意一条线亮着, 就点亮。
+        """
+        def walk(item: QTreeWidgetItem) -> None:
+            kind = item.data(0, _ROLE_KIND)
+            if kind == "route":
+                item.setIcon(_COL_EYE,
+                             eye_icon(item.data(0, _ROLE_ID) in self._visible_ids))
+            elif kind == "glife":
+                item.setIcon(_COL_EYE,
+                             eye_icon(item.data(0, _ROLE_ID) in self._visible_lives))
+            elif kind in ("global", "gside"):
+                ids = self._life_ids_of(item)
+                item.setIcon(_COL_EYE,
+                             eye_icon(any(i in self._visible_lives for i in ids)))
+            for i in range(item.childCount()):
+                walk(item.child(i))
+
+        root = self.tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            walk(root.child(i))
 
     def _delete_route(self, item: QTreeWidgetItem) -> None:
         route_id = item.data(0, _ROLE_ID)
@@ -1199,6 +1553,83 @@ class RouteTesterWindow(QMainWindow):
         self._reload_tree()
         shown = self.store.layout_display_name(map_key, signature)
         self._set_status(f"已把该版本命名为「{shown}」", sticky=3.0)
+
+    # ------------------------------------------------------------- 全局录制
+    def _start_global(self, side: str) -> None:
+        """点「A 队录制 / B 队录制」。
+
+        目标条目 = 侧栏里被标记为这一队的全局条目; 没有标记 → 新建一条。
+        如果目标条目这一队**已经录过**, 先问“是否清空重录”(用户要求的确认)。
+        """
+        if self._in_playback():
+            play_error_sound()
+            self._set_status("回放中已暂停录制功能, 请先点「■ 结束播放」", sticky=2.0)
+            return
+        if self.recorder.global_recording:
+            self._set_status(
+                f"已在全局录制中({self.recorder.global_side} 队), 请先点「停止 A/B 队录制」",
+                sticky=2.5)
+            return
+        if self.recorder.recording:
+            self._set_status("正在录制单条轨迹, 请先结束当前录制", sticky=2.5)
+            return
+        target = self.store.marked_global(side)
+        if target is not None and target.lives(side):
+            n = len(target.lives(side))
+            ok = QMessageBox.question(
+                self, f"{side} 队录制",
+                f"「{target.label}」的 {side} 队已经录制了 {n} 条玩家线路。\n\n"
+                f"要清空这 {n} 条, 重新录制本条目 {side} 队的所有玩家路线吗?\n"
+                f"(选“否”则取消, 原有录制保持不变)")
+            if ok != QMessageBox.StandardButton.Yes:
+                self._set_status("已取消: 保留原有的全局录制", sticky=3.0)
+                return
+        play_sound("start")
+        self.recorder.request_global_start(side, target)
+
+    def _stop_global(self) -> None:
+        if not self.recorder.global_recording:
+            self._set_status("当前没有正在进行的全局录制", sticky=2.0)
+            return
+        play_sound("stop")
+        self.recorder.request_global_stop()
+
+    def _on_global_armed(self, rec: GlobalRecord, side: str) -> None:
+        """已建好条目, 正在等第一名玩家重生(只有此时可以点停止/取消)。"""
+        self.player.pause()          # 全局录制与回放互斥
+        self.player.load(None)
+        self.map_view.set_playback(None)
+        self._visible_ids.clear()
+        self._visible_lives.clear()
+        self._reload_tree()
+        self._update_buttons()
+        self._set_status(
+            f"全局录制已就绪({side} 队 → 「{rec.label}」): 等待第一名玩家重生后开始计时…\n"
+            f"现在请让游戏进入开局/回放, 点「停止 A/B 队录制」可取消", sticky=10.0)
+
+    def _on_global_started(self, rec: GlobalRecord, side: str) -> None:
+        """第一次看到可录单位 → 0 点已定。"""
+        self._set_status(
+            f"{side} 队全局录制中: 已捕获第一名玩家, 计时从 0 开始"
+            f"(地图: {rec.map_name})", sticky=6.0)
+
+    def _on_global_finished(self, rec: GlobalRecord, side: str) -> None:
+        self._last_global = rec
+        self._last_duration = rec.duration
+        self._update_buttons()
+        # 刚录完的这一队自动点亮, 否则侧栏看起来“什么都没发生”
+        self._visible_lives = {life.life_id for life in rec.lives(side)}
+        self._reload_tree()
+        self._expand_item(rec.route_id)
+        self._ensure_map_for([rec])
+        self._set_status(
+            f"全局录制完成: {rec.label} · {side} 队 {len(rec.lives(side))} 条线路"
+            f" | 用时 {fmt_time(rec.duration)}", sticky=8.0)
+
+    def _on_global_cancelled(self) -> None:
+        self._update_buttons()
+        self._reload_tree()
+        self._set_status("已取消全局录制(没有录到任何线路, 条目已丢弃)", sticky=4.0)
 
     # ==================================================================== 动作
     def _hotkey_action(self, action: str) -> None:
@@ -1311,22 +1742,29 @@ class RouteTesterWindow(QMainWindow):
             recording = self.recorder.recording
         armed = self.recorder.armed
         in_play = self._in_playback()
-        self.btn_start.setEnabled(not recording and not in_play)
+        g_rec = self.recorder.global_recording
+        busy = recording or g_rec          # 两种录制都算“占用主界面”
+        self.btn_start.setEnabled(not busy and not in_play)
         self.btn_stop.setEnabled(recording)
         # 等待移动期间还没定下起点, 标记没有意义
         self.btn_mark.setEnabled(recording and not armed)
-        self.chk_start_on_move.setEnabled(not recording and not in_play)
-        self.cmb_rate.setEnabled(not recording and not in_play)
-        self.tree.setEnabled(not in_play and not recording)   # 含眼睛点击与右键菜单
+        self.chk_start_on_move.setEnabled(not busy and not in_play)
+        self.cmb_rate.setEnabled(not busy and not in_play)
+        self.tree.setEnabled(not in_play and not busy)   # 含眼睛点击与右键菜单
+        # 全局录制按钮: 自己录制中时两个“录制”按钮禁用, 只留“停止”
+        self.btn_rec_a.setEnabled(not busy and not in_play)
+        self.btn_rec_b.setEnabled(not busy and not in_play)
+        self.btn_rec_stop.setEnabled(g_rec)
+        self.btn_rec_stop.setStyleSheet("font-weight:bold;" if g_rec else "")
         # 录制期间屏蔽会改变“显示/底图”的入口, 避免与录制抢主界面
-        self.act_manage.setEnabled(not recording)
-        self.act_refresh.setEnabled(not recording)
+        self.act_manage.setEnabled(not busy)
+        self.act_refresh.setEnabled(not busy)
         # 回放控制
         has_track = (bool(self.player.records) or self._last_record is not None
                      or bool(self.store.routes))
-        self.btn_play.setEnabled(not recording and has_track)
-        self.btn_play_mark.setEnabled(not recording and has_track)
-        self.cmb_speed.setEnabled(not recording)
+        self.btn_play.setEnabled(not busy and has_track)
+        self.btn_play_mark.setEnabled(not busy and has_track)
+        self.cmb_speed.setEnabled(not busy)
         self.btn_play_stop.setEnabled(in_play)
         self.btn_play_stop.setStyleSheet("font-weight:bold;" if in_play else "")
 
@@ -1447,7 +1885,24 @@ class RouteTesterWindow(QMainWindow):
             if rate:
                 self.lbl_rate.setText(f"实际 {rate:.0f} Hz")
 
-            if now < self._sticky_until:
+            ginfo = info.get("global")
+            if ginfo:
+                # 全局录制期间状态栏只显示录制进度(比“可开始录制”重要得多)
+                side = str(ginfo.get("side") or "?")
+                elapsed = float(ginfo.get("elapsed") or 0.0)
+                lives = int(ginfo.get("lives") or 0)
+                self.lbl_timer.setText(f"计时: {fmt_time(elapsed)}")
+                self.lbl_marks.setText(f"线路: {lives} 条")
+                if ginfo.get("waiting"):
+                    self.lbl_status.setText(
+                        f"全局录制已就绪({side} 队): 等待第一名玩家重生后开始计时…"
+                        f" | 点「停止 A/B 队录制」可取消")
+                else:
+                    self.lbl_status.setText(
+                        f"{side} 队全局录制中 {fmt_time(elapsed)} | 线路 {lives} 条"
+                        f"({int(ginfo.get('active') or 0)} 辆进行中) | "
+                        f"回到车库自动结束")
+            elif now < self._sticky_until:
                 # 刚发生的事(回放开始/结束、显示切换、提示)优先显示, 不被刷掉
                 self.lbl_status.setText(self._sticky_text)
             elif not info.get("connected"):
@@ -1508,6 +1963,11 @@ class RouteTesterWindow(QMainWindow):
             return rec.map_key
         if self._last_record is not None:
             return self._last_record.map_key
+        if self._visible_lives:
+            keys = self._life_map_keys()
+            for lid in self._visible_lives:
+                if lid in keys:
+                    return keys[lid]
         return None
 
     def _show_cached_map(self, key: str) -> bool:
@@ -1575,6 +2035,13 @@ class RouteTesterWindow(QMainWindow):
             if stale:
                 self._visible_ids -= stale
                 self._reload_tree()      # 重建侧栏(顺便刷新眼睛图标与地图)
+        # 全局线路同理: 只保留属于当前地图的那些
+        life_keys = self._life_map_keys()
+        stale_lives = {lid for lid in self._visible_lives
+                       if life_keys.get(lid) != key}
+        if stale_lives:
+            self._visible_lives -= stale_lives
+            self._reload_tree()
         if dropped or recording:
             self._update_buttons()
         if recording:
@@ -1603,8 +2070,9 @@ class RouteTesterWindow(QMainWindow):
         # 录制时先**把主界面切回游戏当前地图**: 用户可能正在预览另一张地图/另一个
         # 版本的轨迹, 不切回去就会“录着这张图、看着那张图”, 两边打架。
         # 同时清掉之前预览的点亮状态(录制期间只显示正在录的这条)。
-        previewed = len(self._visible_ids)
+        previewed = len(self._visible_ids) + len(self._visible_lives)
         self._visible_ids.clear()
+        self._visible_lives.clear()
         self._refresh_eye_icons()
         key = self.recorder.map_key
         switched = False

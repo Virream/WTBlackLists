@@ -22,8 +22,12 @@
   "map_zones": {"<地图指纹>": [{"sig": .., "count": .., "mode": ..,
                                "zones": [{"label": .., "x": .., "y": ..}],
                                "seen_at": ..}, ...]},
-  "routes": [ {路线记录}, ... ]
+  "routes": [ {路线记录}, ... ],
+  "globals": [ {全局录制条目}, ... ]
 }
+
+`globals` 是「全局录制」条目(整局所有玩家的线路, 分 A/B 两队), 与 `routes`
+是两类记录: 前者挂在侧栏**存放路线的那一级**, 但不可当单条轨迹回放。
 """
 from __future__ import annotations
 
@@ -123,6 +127,184 @@ class RouteRecord:
     def mode_label(self) -> str:
         """模式显示名(旧记录没有存过 → 按战区数量现推, 推不出就“未知模式”)。"""
         return self.mode_name or zone_mode_name(self.zone_count)
+
+
+# ====================================================================== 全局录制
+# 「全局录制」= 一局回放里**所有玩家**的线路, 分 A / B 两方各录一次
+# (回放的 `/map_obj.json` 只给观战那一方的单位, 所以要录两遍才拼出整局)。
+#
+# 与单条线路录制的区别:
+# * **不记朝向**(用户要求), 只记 x/y/t —— 点用 TrackPoint, 比 RoutePoint 省一半内存;
+# * 一条全局记录下面是**很多条**线路: 每个单位"从出现(重生)到消失(死亡/换车)"算一条,
+#   按 A/B 两队分组, 组内按开始时间**正序**(越靠前越早);
+# * 8111 的 `/map_obj.json` **没有 id、没有玩家名**, 所以"同一个单位"是录制器按
+#   "上一帧位置最近的那个同类对象"推测出来的(见 route_recorder 里的匹配逻辑),
+#   同一个人中途上飞机/换车会被拆成两条线 —— 这点与用户确认过, 可以接受。
+GLOBAL_SIDES = ("A", "B")
+GLOBAL_SIDE_LABELS = {"A": "A 队", "B": "B 队"}
+
+
+@dataclass(slots=True)
+class TrackPoint:
+    """全局录制的轨迹点: 只有坐标与时间(没有朝向、没有速度)。"""
+    x: float
+    y: float
+    t: float
+
+
+@dataclass
+class UnitLife:
+    """全局录制里的一条线路 = 某个单位从出现(重生)到消失(死亡/换车)的一段轨迹。
+
+    `life_id` 形如 `<全局条目 id>:<序号>` —— 侧栏的眼睛图标/地图缓存都拿它当键。
+    `icon` / `obj_type` 是 8111 原样的字段(如 `MediumTank` / `ground_model`),
+    没有玩家名可用(8111 不给), 所以显示时就用它们当“名字”。
+    """
+    life_id: str
+    icon: str = ""
+    obj_type: str = ""
+    color: str = ""             # 8111 的颜色(仅参考, 不参与分组)
+    protected: bool = False     # 出生时是否处于重生保护(深蓝)
+    points: list[TrackPoint] = field(default_factory=list)
+
+    @property
+    def t0(self) -> float:
+        return self.points[0].t if self.points else 0.0
+
+    @property
+    def t1(self) -> float:
+        return self.points[-1].t if self.points else 0.0
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.t1 - self.t0)
+
+    @property
+    def label(self) -> str:
+        name = self.icon or self.obj_type or "未知单位"
+        return f"{fmt_time(self.t0)}  {name}"
+
+    def to_json(self) -> dict:
+        # 点写成 [t, x, y] 的紧凑数组: 整局几十辆车 → 几十万个点,
+        # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上
+        return {
+            "id": self.life_id,
+            "icon": self.icon,
+            "type": self.obj_type,
+            "color": self.color,
+            "protected": bool(self.protected),
+            "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5)] for p in self.points],
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> UnitLife | None:
+        try:
+            life_id = str(data["id"])
+        except (KeyError, TypeError):
+            return None
+        pts: list[TrackPoint] = []
+        for row in data.get("pts") or []:
+            try:
+                t, x, y = float(row[0]), float(row[1]), float(row[2])
+            except (IndexError, TypeError, ValueError):
+                continue
+            pts.append(TrackPoint(x=x, y=y, t=t))
+        return cls(
+            life_id=life_id,
+            icon=str(data.get("icon") or ""),
+            obj_type=str(data.get("type") or ""),
+            color=str(data.get("color") or ""),
+            protected=bool(data.get("protected")),
+            points=pts,
+        )
+
+
+@dataclass
+class GlobalRecord:
+    """一次“全局录制”条目(侧栏里挂在**存放路线的那一级**, 与单条路线同级)。
+
+    名称直接用录制时间(`label`); 下面分 A / B 两队, 每队若干条 `UnitLife`;
+    组内按开始时间正序(用户要求: 越靠前时间越早)。
+    `marks` 是右键打上的“下次录到哪一队”(可同时有 A 和 B) ——
+    **没有任何条目带标记**时, 点「A/B 队录制」会新建一个全局条目。
+    """
+    route_id: str
+    map_key: str
+    map_name: str
+    created_at: str
+    zone_count: int = 0
+    zone_signature: str = ""
+    mode_name: str = ""
+    duration: float = 0.0
+    marks: list[str] = field(default_factory=list)
+    sides: dict[str, list[UnitLife]] = field(default_factory=lambda: {"A": [], "B": []})
+
+    @property
+    def label(self) -> str:
+        """侧栏显示名 = 录制时间(如 `10-21 21:03`)。"""
+        ts = self.created_at or ""
+        if len(ts) >= 16:
+            return f"{ts[5:10]} {ts[11:16]}"
+        return ts or "全局录制"
+
+    @property
+    def mode_label(self) -> str:
+        return self.mode_name or zone_mode_name(self.zone_count)
+
+    @property
+    def mark_label(self) -> str:
+        """标记的显示文字(没有标记返回空串)。"""
+        return " ".join(s for s in GLOBAL_SIDES if s in self.marks)
+
+    def lives(self, side: str) -> list[UnitLife]:
+        return self.sides.get(side) or []
+
+    def count(self) -> int:
+        return sum(len(v) for v in self.sides.values())
+
+    def to_json(self) -> dict:
+        return {
+            "route_id": self.route_id,
+            "map_key": self.map_key,
+            "map_name": self.map_name,
+            "created_at": self.created_at,
+            "zone_count": self.zone_count,
+            "zone_signature": self.zone_signature,
+            "mode_name": self.mode_name,
+            "duration": self.duration,
+            "marks": list(self.marks),
+            "sides": {side: [life.to_json() for life in self.lives(side)]
+                      for side in GLOBAL_SIDES},
+        }
+
+    @classmethod
+    def from_json(cls, data: dict) -> GlobalRecord | None:
+        try:
+            rec = cls(
+                route_id=str(data["route_id"]),
+                map_key=str(data.get("map_key", "unknown")),
+                map_name=str(data.get("map_name", "未知地图")),
+                created_at=str(data.get("created_at", "")),
+                zone_count=int(data.get("zone_count") or 0),
+                zone_signature=str(data.get("zone_signature") or ""),
+                mode_name=str(data.get("mode_name") or ""),
+                duration=float(data.get("duration") or 0.0),
+                marks=[str(m) for m in (data.get("marks") or [])
+                       if str(m) in GLOBAL_SIDES],
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            log.warning("跳过损坏的全局录制记录: %s", exc)
+            return None
+        for side, rows in (data.get("sides") or {}).items():
+            if side not in GLOBAL_SIDES or not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                life = UnitLife.from_json(row)
+                if life is not None:
+                    rec.sides[side].append(life)
+        return rec
 
 
 def fmt_time(seconds: float) -> str:
@@ -263,6 +445,8 @@ class RouteStore:
         # 存下来才能在战局结束后依旧把 A/B/C 画在地图上
         self.map_zones: dict[str, list[dict]] = {}
         self.routes: list[RouteRecord] = []
+        # 全局录制条目(整局所有玩家的线路, 分 A/B 两队)
+        self.globals: list[GlobalRecord] = []
         self._load()
 
     # ------------------------------------------------------------------
@@ -315,6 +499,11 @@ class RouteStore:
                     ))
                 except (KeyError, TypeError, ValueError) as exc:
                     log.warning("跳过损坏的线路记录: %s", exc)
+            for item in data.get("globals") or []:
+                if isinstance(item, dict):
+                    rec = GlobalRecord.from_json(item)
+                    if rec is not None:
+                        self.globals.append(rec)
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("读取线路数据失败: %s", exc)
         self._recover_layouts()
@@ -329,7 +518,7 @@ class RouteStore:
         known: dict[str, set[str]] = {k: {str(x.get("sig") or "") for x in v}
                                       for k, v in self.map_zones.items()}
         changed = False
-        for rec in self.routes:
+        for rec in [*self.routes, *self.globals]:
             sig = rec.zone_signature
             if not sig or not rec.map_key or sig in known.get(rec.map_key, set()):
                 continue
@@ -367,6 +556,7 @@ class RouteStore:
                     }
                     for r in self.routes
                 ],
+                "globals": [g.to_json() for g in self.globals],
             }
             tmp = self.path + ".tmp"
             try:
@@ -421,6 +611,88 @@ class RouteStore:
                 return r
         return None
 
+    # ------------------------------------------------------------ 全局录制条目
+    def new_global(self, map_key: str, map_name: str, zone_count: int = 0,
+                   zone_signature: str = "", mode_name: str = "") -> GlobalRecord:
+        """创建一个(尚未落盘的)全局录制条目 —— 名字就是录制时间。"""
+        with self._lock:
+            if map_key and map_key not in self.known_maps:
+                self.known_maps.append(map_key)
+        return GlobalRecord(
+            route_id=uuid.uuid4().hex[:12],
+            map_key=map_key,
+            map_name=map_name,
+            created_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
+            zone_count=zone_count,
+            zone_signature=zone_signature,
+            mode_name=mode_name,
+        )
+
+    def add_global(self, rec: GlobalRecord) -> None:
+        with self._lock:
+            self.globals.append(rec)
+        if rec.zone_signature:
+            self._recover_layouts()
+        self.save()
+
+    def remove_global(self, gid: str) -> bool:
+        with self._lock:
+            before = len(self.globals)
+            self.globals = [g for g in self.globals if g.route_id != gid]
+            changed = len(self.globals) != before
+        if changed:
+            self.save()
+        return changed
+
+    def get_global(self, gid: str) -> GlobalRecord | None:
+        for g in self.globals:
+            if g.route_id == gid:
+                return g
+        return None
+
+    def marked_global(self, side: str) -> GlobalRecord | None:
+        """找出被标记为“下次录到 `side` 队”的条目(同一队最多一条, 见 set_mark)。"""
+        for g in self.globals:
+            if side in g.marks:
+                return g
+        return None
+
+    def set_mark(self, gid: str, side: str, on: bool) -> None:
+        """给条目打/清标记。**同一队只会有一条**记录带标记 —— 打新标记时清掉旧条目上的。"""
+        if side not in GLOBAL_SIDES:
+            return
+        with self._lock:
+            for g in self.globals:
+                if g.route_id == gid:
+                    continue
+                if side in g.marks:
+                    g.marks.remove(side)     # 一队只能指向一个条目, 否则不知道该录到哪
+            target = self.get_global(gid)
+            if target is not None:
+                if on and side not in target.marks:
+                    target.marks.append(side)
+                elif not on and side in target.marks:
+                    target.marks.remove(side)
+                target.marks.sort(key=GLOBAL_SIDES.index)
+        self.save()
+
+    def clear_marks(self, gid: str) -> None:
+        """清掉某个条目的全部标记(右键「清除标记」)。"""
+        with self._lock:
+            target = self.get_global(gid)
+            if target is not None:
+                target.marks.clear()
+        self.save()
+
+    def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
+        """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。"""
+        out: dict[tuple[str, str], list[GlobalRecord]] = {}
+        for g in self.globals:
+            out.setdefault((g.map_key or "", g.zone_signature or ""), []).append(g)
+        for rows in out.values():
+            rows.sort(key=lambda g: g.created_at, reverse=True)
+        return out
+
     # ------------------------------------------------------------------
     def display_name(self, map_key: str) -> str:
         """地图显示名: 用户命名优先, 否则按“首次见到”的顺序自动编号。"""
@@ -463,7 +735,9 @@ class RouteStore:
         if not keep or not drop or keep == drop:
             return False
         moved = [r for r in self.routes if r.map_key == drop]
-        has_data = bool(moved) or drop in self.known_maps or bool(self.name_of(drop)) \
+        moved_g = [g for g in self.globals if g.map_key == drop]
+        has_data = bool(moved) or bool(moved_g) or drop in self.known_maps \
+            or bool(self.name_of(drop)) \
             or bool(self.map_zones.get(drop)) or bool(self.layout_names.get(drop))
         if not has_data:
             return False
@@ -477,6 +751,9 @@ class RouteStore:
             for rec in moved:
                 rec.map_key = keep
                 rec.map_name = keep_name
+            for g in moved_g:
+                g.map_key = keep
+                g.map_name = keep_name
             # 见过的地图: drop 的位置换成 keep(保持“首次见到”的顺序), 去掉重复
             self.known_maps = [keep if k == drop else k for k in self.known_maps]
             seen: set[str] = set()
@@ -513,9 +790,9 @@ class RouteStore:
         return True
 
     def ordered_map_keys(self) -> list[str]:
-        """按首次见到顺序返回全部地图键(轨迹里的 + 只缓存了图片的), 保证顺序稳定。"""
+        """按首次见到顺序返回全部地图键(轨迹里的 + 全局录制的 + 只缓存了图片的)。"""
         keys = [k for k in self.known_maps]
-        for r in self.routes:
+        for r in [*self.routes, *self.globals]:
             if r.map_key not in keys:
                 keys.append(r.map_key)
         return keys
