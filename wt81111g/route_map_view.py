@@ -49,6 +49,12 @@ COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光�
 COLOR_HISTORY = QColor("#8fa6c8")
 # 回放时**尚未播放**的轨迹段: 半透明淡色 —— 半透明只用在这里
 COLOR_UNPLAYED = QColor(140, 160, 200, 120)
+# 回放中“这个玩家已经阵亡”的线路: **半透明纯灰**(不带蓝味, 与未播放的底衬区分开)
+COLOR_DEAD_ROUTE = QColor(170, 176, 188, 120)
+# 阵亡位置的红叉: **细而小的两笔**, 平头端点(圆头看起来会发胖/像描边)
+COLOR_DEAD_MARK = QColor("#ff3b30")
+DEAD_MARK_HALF = 2.6          # X 的半臂长(px, 不随缩放变)
+DEAD_MARK_PEN = 1.2           # X 的线宽(px)
 COLOR_PLAYER = QColor("#38bdf8")
 COLOR_BG = QColor("#0f172a")
 COLOR_GRID = QColor(255, 255, 255, 18)
@@ -260,6 +266,9 @@ class RouteMapView(QWidget):
         # 回放状态: 非空时进入回放绘制模式(按 playhead 切分进度, 可多条同时播放)
         self._playback_recs: list[RouteRecord] = []
         self._playhead = 0.0
+        # 回放选项(侧栏两个勾选框, 默认都开): 阵亡后线路变半透明纯灰 / 阵亡处画红叉
+        self._dead_dim = True
+        self._dead_mark = True
         # 战区(A/B/C): [{"label": "A", "x": .., "y": .., "side": .., "blink": 0/1/2}]
         self._zones: list[dict] = []
         self._show_zones = True
@@ -678,7 +687,10 @@ class RouteMapView(QWidget):
                     self._blit_layer(p, layer, self._play_anchor, pscale, self._play_margin)
                     for rec in self._playback_recs:
                         self._draw_play_marks(p, rec, self._playhead, labels=labels)
-                        self._draw_play_cursor(p, rec, self._playhead)
+                        self._draw_dead_mark(p, rec, self._playhead)   # 阵亡的红叉
+                        if not self._dead_now(rec, self._playhead):
+                            self._draw_play_cursor(p, rec, self._playhead)
+                        #   阵亡后没有“当前位置”, 不再画那颗白点(又正好压在 X 上)
                 else:
                     for rec in self._playback_recs:
                         self._draw_playback(p, rec, self._playhead, labels=labels)
@@ -1063,17 +1075,30 @@ class RouteMapView(QWidget):
         self._play_drawn = {}
 
     def _play_layer_key(self) -> tuple:
-        """回放累加层的内容指纹(**不含几何**: 几何变化走“先缩放贴旧层”)。"""
+        """回放累加层的内容指纹(**不含几何**: 几何变化走“先缩放贴旧层”)。
+
+        `dead` 里是**这一刻已经阵亡的线路** —— 越过阵亡时刻时整条线要从“速度配色”
+        换成“半透明纯灰”, 而累加层里已经画上去的彩色像素无法擦掉, 所以让它进指纹:
+        每个玩家只会在阵亡那一刻触发一次重建(与回拖重建同量级)。
+        """
         return (tuple(r0.route_id for r0 in self._playback_recs),
-                self._show_spawns, self._spawns_ver)
+                self._show_spawns, self._spawns_ver,
+                tuple(r.route_id for r in self._playback_recs
+                      if self._dead_dimmed(r, self._playhead)))
 
     def _draw_play_static(self, p: QPainter) -> None:
-        """回放累加层的初始内容: 重生位置 + 未播放底衬 + 当前已播放的前缀。"""
+        """回放累加层的初始内容: 重生位置 + 未播放底衬 + 当前已播放的前缀。
+
+        已阵亡的线路: 整条用**半透明纯灰**画, 不再叠速度配色(用户 2026-10-21)。
+        """
         if self._show_spawns:
             self._draw_spawns(p)
         for rec in self._playback_recs:
-            self._draw_play_underlay(p, rec)
+            dead = self._dead_dimmed(rec, self._playhead)
+            self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE if dead else None)
         for rec in self._playback_recs:
+            if self._dead_dimmed(rec, self._playhead):
+                continue
             k, _mid = self._played_prefix(rec, self._playhead)
             self._extend_play(p, rec, 0, k)
 
@@ -1116,6 +1141,8 @@ class RouteMapView(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.translate(self._play_anchor[0] + mx, self._play_anchor[1] + my)
             for rec in self._playback_recs:
+                if self._dead_dimmed(rec, self._playhead):
+                    continue            # 已阵亡: 整条线在重建时已按纯灰画好
                 k, _mid = self._played_prefix(rec, self._playhead)
                 done = self._play_drawn.get(rec.route_id, 0)
                 if k > done:
@@ -1274,20 +1301,78 @@ class RouteMapView(QWidget):
         finally:
             p.restore()
 
-    def _draw_play_underlay(self, p: QPainter, rec: RouteRecord) -> None:
+    def _draw_play_underlay(self, p: QPainter, rec: RouteRecord,
+                            color: QColor | None = None) -> None:
         """未播放部分的底衬: 整条轨迹的半透明描边。
 
         画的是**整条**(缓存的一条折线, 每帧/每次只贴一次): 已播放部分紧接着会用
         不透明的速度配色盖在上面, 效果与“只画未播放段”一致, 但省掉了每帧构造
         未播放段多边形的开销。
+
+        `color` 不为空时用它 —— 阵亡线路整条改成半透明纯灰走的就是这里。
         """
         if len(rec.points) < 2 or not self._scaled(p):
             return
         try:
-            p.setPen(QPen(COLOR_UNPLAYED, 2.0 / self._px_scale()))
+            p.setPen(QPen(color or COLOR_UNPLAYED, 2.0 / self._px_scale()))
             p.drawPolyline(self._px_line(rec))
         finally:
             p.restore()
+
+    @staticmethod
+    def _is_dead(rec) -> bool:
+        """这条线是不是“单位被击毁”结束的(见 global_record 的判定口径)。
+
+        单个轨迹(RouteRecord)没有这个字段 → `getattr` 兜底成 False。
+        """
+        return bool(getattr(rec, "dead", False)) and bool(rec.points)
+
+    def _dead_now(self, rec, head: float) -> bool:
+        """回放到此刻为止, 这条线的玩家是否已经阵亡(已过掉线时刻)。"""
+        return self._is_dead(rec) and head >= rec.points[-1].t
+
+    def _dead_dimmed(self, rec, head: float) -> bool:
+        """阵亡后整条线路要不要变半透明纯灰(开关 `被击毁后路线变暗`)。"""
+        return self._dead_dim and self._dead_now(rec, head)
+
+    def set_dead_style(self, dim: bool | None = None, mark: bool | None = None) -> None:
+        """回放选项: 阵亡后线路变暗 / 阵亡位置画红叉(两个开关都默认开)。"""
+        changed = False
+        if dim is not None and bool(dim) != self._dead_dim:
+            self._dead_dim = bool(dim)
+            changed = True
+        if mark is not None:
+            self._dead_mark = bool(mark)
+        if changed:
+            # “变暗”会用另一套颜色画整条线 → 累加层里的旧像素没用了
+            self._recycle(self._play_layer)
+            self._play_layer = None
+            self._play_key = None
+        self.update()
+
+    @property
+    def dead_dim(self) -> bool:
+        return self._dead_dim
+
+    @property
+    def dead_mark(self) -> bool:
+        return self._dead_mark
+
+    def _draw_dead_mark(self, p: QPainter, rec, head: float) -> None:
+        """阵亡位置的红叉: 画在线路末端(最后一个采样点), 大小与回放光标白点相当。
+
+        只在“回放已经越过阵亡时刻”后才出现 —— 否则等于提前剧透。
+        """
+        if not self._dead_mark or not self._dead_now(rec, head):
+            return
+        last = rec.points[-1]
+        c = self._to_px(last.x, last.y)
+        h = DEAD_MARK_HALF
+        p.setPen(QPen(COLOR_DEAD_MARK, DEAD_MARK_PEN, Qt.PenStyle.SolidLine,
+                      Qt.PenCapStyle.FlatCap))
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawLine(QPointF(c.x() - h, c.y() - h), QPointF(c.x() + h, c.y() + h))
+        p.drawLine(QPointF(c.x() - h, c.y() + h), QPointF(c.x() + h, c.y() - h))
 
     def _draw_play_marks(self, p: QPainter, rec: RouteRecord, head: float,
                          labels: bool = True) -> None:
@@ -1330,11 +1415,16 @@ class RouteMapView(QWidget):
         多条同时回放时: 每条各自按自己的 playhead 切分(时间轴相同),
         因此较短的那条会自然地“跑完停在终点”。
         """
-        self._draw_play_underlay(p, rec)
-        k, _mid = self._played_prefix(rec, head)
-        self._extend_play(p, rec, 0, k)
+        if self._dead_dimmed(rec, head):
+            self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)   # 已阵亡: 整条纯灰
+        else:
+            self._draw_play_underlay(p, rec)
+            k, _mid = self._played_prefix(rec, head)
+            self._extend_play(p, rec, 0, k)
         self._draw_play_marks(p, rec, head, labels=labels)
-        self._draw_play_cursor(p, rec, head)
+        self._draw_dead_mark(p, rec, head)
+        if not self._dead_now(rec, head):
+            self._draw_play_cursor(p, rec, head)
 
     def _draw_route(self, p: QPainter, rec: RouteRecord, history: bool, vmax: float,
                     labels: bool = True) -> None:

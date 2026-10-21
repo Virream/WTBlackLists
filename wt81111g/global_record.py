@@ -8,6 +8,11 @@
 * 没接上的单位 → 新开一条线(重生 / 刚从视野外进来);
 * 一条线连续 `END_GAP` 秒都没接上 → 结束(死亡 / 换车 / 上飞机)。
 
+**怎么判定“被击毁”** (2026-10-21 用户口径): 不关心是哪个玩家、也不关心是哪条线 ——
+只看 8111: 这条线对应的 icon **突然消失**、而那一刻场上**还有其它可录单位**,
+就算它被击毁(记为 `UnitLife.dead`)。反过来, **全场一起消失**(回到车库/录制自动结束)
+不算 —— 用户特意提过 “pro 能做到整局一次不死”, 那种情况不能画击毁标记。
+
 **已知取舍**(与用户确认过):
 * 同一个人中途上飞机/直升机 → 那条线断开, 落地/再重生后算**新的一条线**;
 * 两个人贴得极近时可能互换身份(位置本来就分不出来), 概率很低, 且不影响“线路形状”;
@@ -235,7 +240,8 @@ class GlobalTracker:
         for key, n in skipped.items():
             self.seen_skipped[key] = self.seen_skipped.get(key, 0) + n
         self._match(t, units)
-        self._expire(t)
+        # 这一帧还有可录单位 → 此时断掉的线是“被击毁”; 全场空 → 是回到车库/录制结束
+        self._expire(t, alive=bool(units))
         if not units:
             if self._empty_since is None:
                 self._empty_since = t
@@ -244,9 +250,13 @@ class GlobalTracker:
         return False
 
     def finish(self) -> list[UnitLife]:
-        """结束跟踪: 把还活着的线收尾(不再等 end_gap), 返回本队的全部线路。"""
+        """结束跟踪: 把还活着的线收尾(不再等 end_gap), 返回本队的全部线路。
+
+        这里收尾的线**一律不算被击毁** —— 它们只是“录制到这里停了”
+        (用户特意提过有人整局不死, 结束时全场 icon 消失不能当成击毁)。
+        """
         for lv in self._live:
-            self._close(lv)
+            self._close(lv, dead=False)
         self._live.clear()
         return self.lives
 
@@ -265,8 +275,9 @@ class GlobalTracker:
         return _Live(life=life, x=u.x, y=u.y, last_seen=t, last_store=t,
                      last_x=u.x, last_y=u.y)
 
-    def _close(self, lv: _Live) -> None:
-        """收尾一条线: 补上最后一个已知位置(若与已存的点不同)。"""
+    def _close(self, lv: _Live, dead: bool = False) -> None:
+        """收尾一条线: 记下“是否被击毁”, 并补上最后一个已知位置(若与已存的点不同)。"""
+        lv.life.dead = bool(dead)
         if lv.life.points:
             last = lv.life.points[-1]
             if math.hypot(lv.x - last.x, lv.y - last.y) > 1e-9:
@@ -318,12 +329,16 @@ class GlobalTracker:
             lv.last_x, lv.last_y = u.x, u.y
             lv.last_store = t
 
-    def _expire(self, t: float) -> None:
-        """连续 `end_gap` 秒没接上的线 → 结束。"""
+    def _expire(self, t: float, alive: bool = False) -> None:
+        """连续 `end_gap` 秒没接上的线 → 结束。
+
+        `alive` = 这一帧场上还有别的可录单位 → 断掉的线判为**被击毁**;
+        全场为空(回到车库/录制结束) 则只算“线到此为止”, 不标击毁。
+        """
         keep: list[_Live] = []
         for lv in self._live:
             if (t - lv.last_seen) > self.end_gap:
-                self._close(lv)
+                self._close(lv, dead=alive)
             else:
                 keep.append(lv)
         self._live = keep

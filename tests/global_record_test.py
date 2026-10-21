@@ -171,6 +171,54 @@ def test_tracker_empty_stop():
     results.append("全局跟踪: 全场无单位超时 → 自动停止 OK")
 
 
+def test_tracker_dead_flag():
+    """“被击毁”判定(用户 2026-10-21 口径): 这条线的 icon 消失时, 场上**还有别的单位**。
+
+    * 有人死了但别人还活着 → `dead=True`(回放时要变灰 + 画红叉);
+    * **全场一起消失**(回到车库/录制结束) → `dead=False` —— 用户特意提过
+      “pro 能做到整局一次不死”, 那种情况绝不能画红叉;
+    * 手动结束录制时还活着的线 → `dead=False`。
+    """
+    # ① 两辆车, 其中一辆中途消失(另一辆还在) → 只有它算阵亡
+    rec = GlobalRecord(route_id="g5", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "A")
+    t = 0.0
+    for i in range(10):
+        tr.feed(t, [tank(0.20 + 0.001 * i, 0.30),
+                    tank(0.20 + 0.001 * i, 0.70, icon="IFV")])
+        t += 0.05
+    for i in range(10, 40):                       # 只有 y=0.30 那辆继续跑
+        tr.feed(t, [tank(0.20 + 0.001 * i, 0.30)])
+        t += 0.05
+    lives = tr.finish()
+    killed = [lf for lf in lives if abs(lf.points[0].y - 0.70) < 1e-9][0]
+    alive = [lf for lf in lives if abs(lf.points[0].y - 0.30) < 1e-9][0]
+    assert killed.dead is True, "中途消失(场上还有别的单位) → 应判为被击毁"
+    assert alive.dead is False, "活到录制结束 → 不算被击毁"
+
+    # ② 全场一起消失(回车库) → 谁都不算阵亡
+    rec2 = GlobalRecord(route_id="g6", map_key="M", map_name="地图", created_at="")
+    tr2 = GlobalTracker(rec2, "A")
+    t = 0.0
+    for i in range(10):
+        tr2.feed(t, [tank(0.3 + 0.001 * i, 0.3), tank(0.6 + 0.001 * i, 0.6, icon="IFV")])
+        t += 0.05
+    for _ in range(int(EMPTY_STOP * 10) + 5):      # 所有 icon 一起消失
+        t += 0.2
+        if tr2.feed(t, []):
+            break
+    assert all(not lf.dead for lf in tr2.finish()), \
+        "全场一起消失(录制结束)不能算被击毁 —— 有人整局一次不死"
+
+    # ③ 落盘往返
+    import json
+    row = json.loads(json.dumps(killed.to_json()))
+    back = type(killed).from_json(row)
+    assert back.dead is True, row
+    assert type(alive).from_json(json.loads(json.dumps(alive.to_json()))).dead is False
+    results.append("全局跟踪: 被击毁判定(icon 中途消失 / 全场消失不算 / 落盘往返) OK")
+
+
 # ---------------------------------------------------------------- 存储
 def test_store(tmpdir: str):
     path = os.path.join(tmpdir, "globals.json")
@@ -621,6 +669,7 @@ def main() -> int:
     test_tracker_two_and_death()
     test_tracker_speed()
     test_tracker_empty_stop()
+    test_tracker_dead_flag()
     test_store(tmpdir)
     test_map_paint()
     test_live_layer_no_rebuild()

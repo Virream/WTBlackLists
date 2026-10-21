@@ -177,6 +177,10 @@ class UnitLife:
     color: str = ""             # 8111 的颜色(仅参考, 不参与分组)
     map_key: str = ""           # 所属地图(回放时用来判断底图对不对)
     points: list[TrackPoint] = field(default_factory=list)
+    # 这条线的单位是**被击毁**结束的(而不是录制结束时还活着)。
+    # 判定只看 8111: 线断了那一刻场上**还有其它可录单位** → 算被击毁;
+    # 全场一起消失(回到车库/录制结束) → 不算(见 global_record.GlobalTracker.feed)。
+    dead: bool = False
 
     @property
     def route_id(self) -> str:
@@ -223,6 +227,7 @@ class UnitLife:
             "type": self.obj_type,
             "color": self.color,
             "map_key": self.map_key,
+            "dead": 1 if self.dead else 0,
             "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
                     for p in self.points],
         }
@@ -253,6 +258,7 @@ class UnitLife:
             color=str(data.get("color") or ""),
             map_key=str(data.get("map_key") or ""),
             points=pts,
+            dead=bool(data.get("dead")),
         )
 
 
@@ -344,7 +350,34 @@ class GlobalRecord:
                     if not life.map_key:
                         life.map_key = rec.map_key
                     rec.sides[side].append(life)
+        _infer_legacy_deaths(rec, data)
         return rec
+
+
+# 旧数据推断“被击毁”的门槛(秒): 线路结束得比**整局末尾**早这么多, 才认为是中途阵亡。
+# 活到最后的那些线会在录制结束前 1~2 秒内陆续收尾(END_GAP), 用 10 秒足够安全。
+LEGACY_DEAD_MARGIN = 10.0
+
+
+def _infer_legacy_deaths(rec: GlobalRecord, data: dict) -> None:
+    """给**旧版本录的**全局条目补上 `dead` 标记(它们当年没存这个信息)。
+
+    判定: 某条线在整局末尾之前 `LEGACY_DEAD_MARGIN` 秒以上就结束了 → 当作中途阵亡。
+    只在“整份数据里没有任何一条线带 `dead` 字段”时推断 —— 新录的数据总会写
+    `dead: 0/1`, 所以不会把“这一局真的没人死”误判成旧数据。
+    """
+    rows: list[dict] = []
+    for side_rows in (data.get("sides") or {}).values():
+        if isinstance(side_rows, list):
+            rows.extend(r for r in side_rows if isinstance(r, dict))
+    if not rows or any("dead" in r for r in rows):
+        return                      # 新数据(或空) → 不推断
+    lives = [lf for side in GLOBAL_SIDES for lf in rec.lives(side) if lf.points]
+    if not lives:
+        return
+    last_t = max(lf.t1 for lf in lives)
+    for lf in lives:
+        lf.dead = lf.t1 < last_t - LEGACY_DEAD_MARGIN
 
 
 def fmt_time(seconds: float) -> str:

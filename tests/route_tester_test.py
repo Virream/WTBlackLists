@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """跑图线路测试器 验证脚本(离屏): 存储 / 录制状态机 / 窗口与侧栏。
 
 用法: python tests/route_tester_test.py
@@ -2890,6 +2890,138 @@ def test_playback_zoom_resumes(tmpdir: str):
     results.append("回放中缩放后自动恢复(延迟重建不会被每帧刷新时间戳顶掉) OK")
 
 
+def test_dead_style(tmpdir: str):
+    """回放的两个“被击毁”选项: 阵亡后线路变半透明纯灰 + 末端红叉。
+
+    判定完全在录制端(见 global_record.GlobalTracker), 这里只测绘制:
+    * 越过阵亡时刻前: 速度配色 + 白点光标, **没有**红叉;
+    * 越过之后: 整条线变灰(饱和度接近 0)、光标消失、末端出现红叉;
+    * 两个开关都能单独关掉(关掉“变暗”仍保留红叉)。
+    """
+    from wt81111g.route_store import TrackPoint, UnitLife
+
+    life = UnitLife(life_id="L1", icon="MediumTank", obj_type="ground_model",
+                    map_key="AAA", dead=True)
+    life.points = [TrackPoint(0.10 + i * 0.05, 0.5, float(i), 40.0) for i in range(10)]
+    plain = UnitLife(life_id="L2", icon="IFV", obj_type="ground_model",
+                     map_key="AAA", dead=False)
+    plain.points = [TrackPoint(0.10 + i * 0.05, 0.7, float(i), 40.0) for i in range(10)]
+
+    view = RouteMapView()
+    view.resize(640, 480)
+    view.set_map_bytes(png_solid("#303030"))
+    canvas = QImage(640, 480, QImage.Format.Format_ARGB32)
+
+    def shot(head: float) -> QImage:
+        view.set_playback([life], head)
+        view._play_layer = None          # 每次都从干净状态画, 避免累加层干扰取色
+        c = QImage(640, 480, QImage.Format.Format_ARGB32)
+        view.render(c)
+        return c
+
+    def at(img: QImage, nx: float, ny: float) -> tuple[int, int, int]:
+        q = view.map_pos(nx, ny)
+        c = img.pixelColor(int(round(q.x())), int(round(q.y())))
+        return (c.red(), c.green(), c.blue())
+
+    def sat(rgb) -> int:
+        return max(rgb) - min(rgb)
+
+    def red_pixels(img: QImage, nx: float, ny: float, half: int = 8) -> int:
+        q = view.map_pos(nx, ny)
+        cx, cy = int(round(q.x())), int(round(q.y()))
+        n = 0
+        for dy in range(-half, half + 1):
+            for dx in range(-half, half + 1):
+                c = img.pixelColor(cx + dx, cy + dy)
+                if c.red() > 170 and c.green() < 110 and c.blue() < 110:
+                    n += 1
+        return n
+
+    # ① 阵亡之前(t=3 < 9): 彩色 + 光标, 没有红叉
+    assert view._dead_now(life, 3.0) is False
+    before = shot(3.0)
+    assert sat(at(before, 0.20, 0.5)) > 60, "阵亡前应按速度着色(高饱和度)"
+    assert red_pixels(before, 0.55, 0.5) == 0, "还没到阵亡时刻, 不该提前画红叉"
+
+    # ② 越过阵亡时刻(t=12 > 9): 整条灰、无光标、末端红叉
+    assert view._dead_now(life, 12.0) is True
+    after = shot(12.0)
+    rgb = at(after, 0.20, 0.5)
+    assert sat(rgb) < 30, f"阵亡后线路应是半透明纯灰(饱和度接近 0), 实际 {rgb}"
+    n_mark = red_pixels(after, 0.55, 0.5)
+    assert n_mark > 3, "阵亡位置应有红叉"
+    # 红叉大小: 与回放光标白点(半径 3)差不多 —— 直径不超过 9px
+    q = view.map_pos(0.55, 0.5)
+    cx, cy = int(round(q.x())), int(round(q.y()))
+    xs = [x for x in range(cx - 12, cx + 13) for y in range(cy - 12, cy + 13)
+          if (lambda c: c.red() > 170 and c.green() < 110 and c.blue() < 110)(
+              after.pixelColor(x, y))]
+    assert xs and max(xs) - min(xs) + 1 <= 9, f"红叉太大了: {max(xs) - min(xs) + 1}px"
+
+    # ③ 关掉“变暗”: 线路重新按速度着色, 红叉仍在
+    #    (速度配色本身就可能是红的, 所以红叉一律用“开关前后的差值”来断言)
+    view.set_dead_style(dim=False)
+    after2 = shot(12.0)
+    assert sat(at(after2, 0.20, 0.5)) > 60, "关掉变暗后应恢复速度配色"
+    view.set_dead_style(dim=False, mark=False)
+    after2b = shot(12.0)
+    assert red_pixels(after2, 0.55, 0.5) > red_pixels(after2b, 0.55, 0.5) + 3, \
+        "“变暗”关掉不影响红叉"
+
+    # ④ 只开“标记”/只开“变暗”都不影响另一个
+    view.set_dead_style(dim=True, mark=False)
+    after3 = shot(12.0)
+    assert sat(at(after3, 0.20, 0.5)) < 30, "“标记”关掉不影响“变暗”"
+    view.set_dead_style(dim=True, mark=True)
+
+    # ⑤ 没有阵亡信息的普通轨迹: 永远不变灰、不画叉
+    view.set_playback([plain], 20.0)
+    assert view._dead_now(plain, 20.0) is False
+    with_x = QImage(640, 480, QImage.Format.Format_ARGB32)
+    view._play_layer = None
+    view.render(with_x)
+    view.set_dead_style(mark=False)
+    without_x = QImage(640, 480, QImage.Format.Format_ARGB32)
+    view._play_layer = None
+    view.render(without_x)
+    view.set_dead_style(mark=True)
+    assert red_pixels(with_x, 0.55, 0.7) == red_pixels(without_x, 0.55, 0.7), \
+        "没有阵亡信息的轨迹不该画红叉"
+    assert sat(at(with_x, 0.20, 0.7)) > 60, "普通轨迹到末尾仍是速度配色"
+
+    view.set_playback(None)
+
+    # ⑥ 窗口层: 两个勾选框**默认都勾上**, 一改就作用到地图并记住设置
+    from PyQt6.QtCore import QSettings
+    conf = QSettings("WTBlackList", "RouteTester")
+    keep = (conf.value("dead_dim"), conf.value("dead_mark"))
+    try:
+        conf.remove("dead_dim")
+        conf.remove("dead_mark")
+        win = make_window(tmpdir, "deadwin.json")
+        win.recorder.stop()
+        win.hotkeys.stop()
+        win.show()
+        assert win.chk_dead_dim.isChecked(), "「被击毁后路线变暗」应默认勾选"
+        assert win.chk_dead_mark.isChecked(), "「被击毁标记」应默认勾选"
+        assert win.map_view.dead_dim is True and win.map_view.dead_mark is True
+        win.chk_dead_dim.setChecked(False)
+        assert win.map_view.dead_dim is False, "取消勾选应立刻作用到地图"
+        win.chk_dead_mark.setChecked(False)
+        assert win.map_view.dead_mark is False
+        assert int(conf.value("dead_dim")) == 0 and int(conf.value("dead_mark")) == 0, \
+            "两个选项都要记住"
+        win.close()
+    finally:
+        for key, val in zip(("dead_dim", "dead_mark"), keep):
+            if val is None:
+                conf.remove(key)
+            else:
+                conf.setValue(key, val)
+    results.append("回放阵亡样式(变灰/红叉/两个开关/无阵亡信息不变灰) OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -2928,6 +3060,7 @@ def main() -> int:
     test_zoom_reuses_layer(tmpdir)
     test_zoom_scaled_blit_offset(tmpdir)
     test_playback_zoom_resumes(tmpdir)
+    test_dead_style(tmpdir)
     test_map_sharpest(tmpdir)
     test_cached_map_switch(tmpdir)
     test_map_manager(tmpdir)
@@ -2943,3 +3076,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

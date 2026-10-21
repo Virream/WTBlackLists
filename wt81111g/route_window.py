@@ -131,6 +131,15 @@ class RouteTesterWindow(QMainWindow):
         self._saved_on_move = False
         if self._settings.contains("start_on_move"):   # 清掉早期版本留下的值
             self._settings.remove("start_on_move")
+        # 回放显示选项: “被击毁后路线变暗” / “被击毁标记” —— **默认都开**, 并记住设置
+        try:
+            self._saved_dead_dim = int(self._settings.value("dead_dim", 1)) != 0
+        except (TypeError, ValueError):
+            self._saved_dead_dim = True
+        try:
+            self._saved_dead_mark = int(self._settings.value("dead_mark", 1)) != 0
+        except (TypeError, ValueError):
+            self._saved_dead_mark = True
         # 「显示战区」(小菱形 + A/B/C 字母)开关: 菜单「设置」里勾选, 记住设置
         try:
             self._show_zones = int(self._settings.value("show_zones", 1)) != 0
@@ -154,6 +163,7 @@ class RouteTesterWindow(QMainWindow):
         self._build_menu()
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
+        self.map_view.set_dead_style(dim=self._saved_dead_dim, mark=self._saved_dead_mark)
         self._reload_tree()
         if self._merged_maps:
             names = []
@@ -458,6 +468,25 @@ class RouteTesterWindow(QMainWindow):
         self.cmb_speed.currentIndexChanged.connect(self._on_speed_changed)
         self.cmb_speed.setToolTip("回放倍速 0.5X ~ 16X")
         play_box.addWidget(self.cmb_speed)
+
+        # ---- 回放显示选项(两个都默认勾选)
+        # “被击毁”判定只看 8111: 线路对应的 icon 突然消失、且当时场上还有别的单位
+        # → 算阵亡; 全场一起消失(回到车库/录制结束) 不算(有人整局不死)。
+        self.chk_dead_dim = QCheckBox("被击毁后路线变暗")
+        self.chk_dead_dim.setChecked(self._saved_dead_dim)
+        self.chk_dead_dim.setToolTip(
+            "回放时, 线路对应的玩家被击毁之后, 这条线路整条变成半透明纯灰\n"
+            "(不再按速度着色), 一眼能看出哪些人已经阵亡。")
+        self.chk_dead_dim.stateChanged.connect(self._on_dead_style_changed)
+        play_box.addWidget(self.chk_dead_dim)
+
+        self.chk_dead_mark = QCheckBox("被击毁标记")
+        self.chk_dead_mark.setChecked(self._saved_dead_mark)
+        self.chk_dead_mark.setToolTip(
+            "在被击毁的位置(线路末端)画一个红色 X, 大小与回放光标白点相当。\n"
+            "回放越过阵亡时刻后才出现。")
+        self.chk_dead_mark.stateChanged.connect(self._on_dead_style_changed)
+        play_box.addWidget(self.chk_dead_mark)
 
         self.lbl_play = QLabel("回放: --")
         self.lbl_play.setStyleSheet("color:#94a3b8; font-size:11px;")
@@ -1760,6 +1789,21 @@ class RouteTesterWindow(QMainWindow):
         self._set_status(
             "已开启: 开始录制后等待载具移动, 以速度从零变化的前一时刻作为计时起点"
             if on else "已关闭: 按点下开始录制的时刻计时", sticky=4.0)
+
+    def _on_dead_style_changed(self) -> None:
+        """回放的两个“被击毁”显示选项: 应用到地图并记住设置。"""
+        dim = self.chk_dead_dim.isChecked()
+        mark = self.chk_dead_mark.isChecked()
+        self._saved_dead_dim, self._saved_dead_mark = dim, mark
+        self._settings.setValue("dead_dim", 1 if dim else 0)
+        self._settings.setValue("dead_mark", 1 if mark else 0)
+        self.map_view.set_dead_style(dim=dim, mark=mark)
+        if dim or mark:
+            self._set_status(
+                f"回放显示: 阵亡变暗{'开' if dim else '关'} · "
+                f"阵亡标记{'开' if mark else '关'}", sticky=3.0)
+        else:
+            self._set_status("回放显示: 不区分阵亡", sticky=3.0)
 
     def _on_rate_changed(self) -> None:
         """采样间隔下拉框变更: 立即应用到轮询线程并记忆。"""
