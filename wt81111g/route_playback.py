@@ -6,6 +6,14 @@
 - 倍速范围 0.5X ~ 16X(0.5 步进)。
 
 设计: 控制器只关心"时间轴", 具体绘制交给 RouteMapView(按 playhead 切分每条轨迹)。
+
+**时间轴是“绝对时刻”**, 不是“从 0 开始的相对秒数”:
+
+* 单条线路录制的点从 0 开始 → 区间就是 [0, 用时];
+* **全局录制的线路**用的是**整局时刻**(某辆车可能从 02:00 才出现), 它们的时间轴
+  就是 [最早出现, 最晚消失]。这样选中整局后能“按真实时间一起播”,
+  而且不会出现“playhead 从 0 走、但点的 t 是 120 → 线永远不动”的 bug
+  (2026-10-21 用户实测到的那一个)。
 """
 from __future__ import annotations
 
@@ -38,6 +46,8 @@ class RoutePlayer(QObject):
         super().__init__(parent)
         self._recs: list[RouteRecord] = []
         self._t = 0.0
+        self._t0 = 0.0          # 时间轴起点 = 所有记录里最早的那个时刻
+        self._t1 = 0.0          # 时间轴终点 = 所有记录里最晚的那个时刻
         self._speed = 1.0
         self._pause_at_mark = False
         self._last = 0.0
@@ -58,8 +68,18 @@ class RoutePlayer(QObject):
 
     @property
     def duration(self) -> float:
-        """回放总时长 = **最长的一条**的时长(多条的结束以它为准)。"""
-        return max((r.duration for r in self._recs), default=0.0)
+        """回放总时长 = 时间轴的**跨度**(最早的开始 → 最晚的结束)。"""
+        return max(0.0, self._t1 - self._t0)
+
+    @property
+    def span(self) -> tuple[float, float]:
+        """时间轴区间 `(起点, 终点)`, 都是记录自己的绝对时刻。"""
+        return (self._t0, self._t1)
+
+    @property
+    def end(self) -> float:
+        """时间轴终点(绝对时刻) —— 进度条显示用它, 对单条线路等于用时。"""
+        return self._t1
 
     @property
     def time(self) -> float:
@@ -77,9 +97,27 @@ class RoutePlayer(QObject):
     def pause_at_mark(self) -> bool:
         return self._pause_at_mark
 
+    def _compute_span(self) -> tuple[float, float]:
+        """算出时间轴区间: 所有记录里**最早的点**与**最晚的点**。
+
+        单条线路的点从 0 开始 → (0, 用时); 全局线路是整局时刻 →
+        (最早出现, 最晚消失)。单位为秒, 与该记录 `points[].t` 同一套坐标系。
+        """
+        starts: list[float] = []
+        ends: list[float] = []
+        for r in self._recs:
+            pts = getattr(r, "points", None) or []
+            if not pts:
+                continue
+            starts.append(pts[0].t)
+            ends.append(pts[-1].t)
+        if not ends:
+            return (0.0, 0.0)
+        return (min(starts), max(ends))
+
     # ------------------------------------------------------------------ 控制
     def load(self, rec: RouteRecord | list[RouteRecord] | None) -> None:
-        """载入要回放的记录(单条或一个列表)并复位到开头。"""
+        """载入要回放的记录(单条或一个列表)并复位到**时间轴起点**。"""
         self.pause()
         if rec is None:
             self._recs = []
@@ -87,7 +125,8 @@ class RoutePlayer(QObject):
             self._recs = [r for r in rec if r is not None]
         else:
             self._recs = [rec]
-        self._t = 0.0
+        self._t0, self._t1 = self._compute_span()
+        self._t = self._t0
         self._pause_at_mark = False
         self.progress.emit(self._t)
 
@@ -95,14 +134,14 @@ class RoutePlayer(QObject):
         self._speed = max(0.1, min(64.0, float(speed)))
 
     def seek(self, t: float) -> None:
-        self._t = max(0.0, min(self.duration, float(t)))
+        self._t = max(self._t0, min(self._t1, float(t)))
         self.progress.emit(self._t)
 
     def start(self) -> None:
         if not self._recs or not any(len(r.points) >= 2 for r in self._recs):
             return
-        if self._t >= self.duration:      # 已播放到末尾 → 从头开始
-            self._t = 0.0
+        if self._t >= self._t1:           # 已播放到末尾 → 从头开始
+            self._t = self._t0
         self._last = time.monotonic()
         self._timer.start()
         self.playing_changed.emit(True)
@@ -153,8 +192,8 @@ class RoutePlayer(QObject):
         """播放并在(所有轨迹中)下一个标记时刻自动暂停。"""
         if not self._recs:
             return
-        if self._t >= self.duration:
-            self._t = 0.0
+        if self._t >= self._t1:
+            self._t = self._t0
         target = self.next_mark_time()
         if target is None:
             # 后面已经没有标记了 → 直接播到底(等同普通播放)
@@ -179,9 +218,8 @@ class RoutePlayer(QObject):
             dt = max(0.0, now - self._last)
         self._last = now
 
-        duration = self.duration
         prev = self._t
-        self._t = min(duration, self._t + dt * self._speed)
+        self._t = min(self._t1, self._t + dt * self._speed)   # 绝对时刻, 不是 0~duration
 
         if self._pause_at_mark:
             # 本帧跨越过的**最近**标记 → 精确停在它上面(不会因为一帧跨度大而冲过去)
@@ -197,6 +235,6 @@ class RoutePlayer(QObject):
                 return
 
         self.progress.emit(self._t)
-        if self._t >= duration:
+        if self._t >= self._t1:
             self.pause()
             self.finished.emit()

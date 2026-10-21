@@ -572,6 +572,47 @@ def test_live_layer_no_rebuild():
     results.append("全局录制: 边录边画不重建整层 + 缩放先缩放贴图 + 缩放后仍能增长 OK")
 
 
+def test_playback_timeline():
+    """全局线路的时间戳是**整局时刻**(可能从 02:00 才开始), 回放必须也按绝对时刻走。
+
+    曾经: 回放器从 0 开始推进, 而点的 t 是 120 → `bisect` 认为“还没到第一个点”,
+    计时器在动、线路一动不动(2026-10-21 用户实测)。
+    """
+    from wt81111g.route_playback import RoutePlayer
+    from wt81111g.route_store import point_at
+
+    def life(lid, t0, n=31):
+        return UnitLife(life_id=lid, icon="IFV", obj_type="ground_model", map_key="M",
+                        points=[TrackPoint(0.2 + 0.01 * i, 0.3, t0 + i, 40.0)
+                                for i in range(n)])
+
+    player = RoutePlayer(tick_ms=10)
+    single = life("L1", 120.0)          # 02:00 出现, 02:30 消失
+    player.load([single])
+    assert player.span == (120.0, 150.0), player.span
+    assert player.time == 120.0, "应复位到时间轴起点(不是 0)"
+    assert player.duration == 30.0 and player.end == 150.0
+    for t, want_x in ((120.0, 0.20), (130.0, 0.30), (145.0, 0.45)):
+        player.seek(t)
+        assert player.time == t
+        assert abs(point_at(single.points, t).x - want_x) < 1e-9, (
+            f"t={t} 光标位置不对")
+
+    # 多条一起播: 时间轴 = 最早开始 → 最晚结束(按真实时刻一起播)
+    a, b = life("A", 100.0, 21), life("B", 200.0, 11)
+    player.load([a, b])
+    assert player.span == (100.0, 210.0), player.span
+    assert player.time == 100.0
+    # 单条线路(点从 0 开始)行为不变
+    rec = RouteRecord(route_id="R", map_key="M", map_name="M", vehicle="T",
+                      created_at="", duration=5.0, start_x=0.3, start_y=0.3,
+                      points=[RoutePoint(0.3, 0.3, 0.0, 0.0),
+                              RoutePoint(0.4, 0.4, 5.0, 40.0)])
+    player.load([rec])
+    assert player.span == (0.0, 5.0) and player.time == 0.0
+    results.append("全局录制回放: 时间轴按绝对时刻(02:00 开始的线路也会动) OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -583,6 +624,7 @@ def main() -> int:
     test_store(tmpdir)
     test_map_paint()
     test_live_layer_no_rebuild()
+    test_playback_timeline()
     test_window(tmpdir)
     test_only_global(tmpdir)
     test_buttons_and_map_lock(tmpdir)

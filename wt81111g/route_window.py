@@ -1912,7 +1912,7 @@ class RouteTesterWindow(QMainWindow):
         if recs:
             n = f"  ({len(recs)} 条)" if len(recs) > 1 else ""
             self.lbl_play.setText(
-                f"回放 {fmt_time_ms(t)} / {fmt_time(self.player.duration)}{n}")
+                f"回放 {fmt_time_ms(t)} / {fmt_time(self.player.end)}{n}")
 
     def _on_playback_state(self, playing: bool) -> None:
         self.btn_play.setText("⏸ 暂停" if playing else "▶ 回放")
