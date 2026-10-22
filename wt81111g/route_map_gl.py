@@ -246,7 +246,10 @@ class RouteMapGlView(RouteMapView):
         self._gl_pixels: dict = {}
         self._gl_objs: list = []
         self._gl_icons: list = []       # 图标类对象(尺寸按屏幕像素算 → 缩放时要重算)
+        self._gl_hover_objs: list = []  # 悬停白环/浮层(随鼠标变, 单独重建)
         self._icon_mode = False
+        self._hover_mode = False
+        self._gl_hover_key: tuple | None = None
         self._gl_key: tuple | None = None
         self._gl_geom: tuple | None = None
         self._gl_tracks: list[_Track] = []
@@ -413,7 +416,7 @@ class RouteMapGlView(RouteMapView):
                 getattr(live, "route_id", "") if live else None,
                 sig(self._live_multi), sig(self._playback_recs),
                 self._show_zones, zones, self._show_spawns, self._spawns_ver,
-                self._map_digest, self._hover_text, self._status)
+                self._map_digest, self._status)
 
     def _drop_object(self, obj) -> None:
         """把对象从场景里**真正**移掉。
@@ -432,6 +435,7 @@ class RouteMapGlView(RouteMapView):
             self._drop_object(obj)
         self._gl_objs = []
         self._gl_icons = []
+        self._gl_hover_objs = []
         self._gl_tracks = []
         self._hover_obj = None
         self._gl_hover_box = None
@@ -470,9 +474,40 @@ class RouteMapGlView(RouteMapView):
         obj.render_order = order
         self._scene.add(obj)
         self._gl_objs.append(obj)
-        if self._icon_mode:
+        if self._hover_mode:
+            self._gl_hover_objs.append(obj)
+        elif self._icon_mode:
             self._gl_icons.append(obj)
         return obj
+
+    def _hover_key(self) -> tuple:
+        """悬停内容的指纹(文本 + 命中那一点)。
+
+        悬停变化**不能**进 `_content_key`: 那会让鼠标在线上移动时每帧重建 64 条轨迹
+        (实测 150 ms 级), 表现就是“鼠标碰到线路卡一下”、播放时拖地图完全不跟手。
+        """
+        pt = self._hover_pt
+        return (self._hover_text,
+                None if pt is None else (round(float(pt.x), 7), round(float(pt.y), 7)),
+                id(self._hover_rec))
+
+    def _rebuild_hover(self) -> None:
+        """只重建悬停相关对象(白环 + 左下角浮层)。"""
+        for obj in self._gl_hover_objs:
+            self._drop_object(obj)
+        ids = {id(o) for o in self._gl_hover_objs}
+        if ids:
+            self._gl_objs = [o for o in self._gl_objs if id(o) not in ids]
+            self._gl_icons = [o for o in self._gl_icons if id(o) not in ids]
+        self._gl_hover_objs = []
+        self._hover_obj = None
+        self._gl_hover_box = None
+        self._gl_hover_px = None
+        self._hover_mode = True
+        try:
+            self._build_hover()
+        finally:
+            self._hover_mode = False
 
     def _rebuild_icons(self) -> None:
         """重建所有**图标**图层(战区/重生方块/标记/标签/阵亡叉/玩家/光标/悬停)。
@@ -493,7 +528,7 @@ class RouteMapGlView(RouteMapView):
             self._build_player()
             self._build_cursor()
             self._build_border()
-            self._build_hover()
+            self._rebuild_hover()
             self._build_status()
         finally:
             self._icon_mode = False
@@ -501,15 +536,22 @@ class RouteMapGlView(RouteMapView):
     def _sync_objects(self) -> None:
         key = self._content_key()
         geom = self._geom_key()
+        hkey = self._hover_key()
         if key != self._gl_key:
             self._gl_key = key
             self._gl_geom = geom
+            self._gl_hover_key = hkey
             self._rebuild_objects()
         elif geom != self._gl_geom:
             # 只缩放了/改了窗口: 轨迹几何不用动(归一化 + 屏幕线宽),
             # 但图标的像素尺寸要按新的地图尺寸重算
             self._gl_geom = geom
+            self._gl_hover_key = hkey
             self._rebuild_icons()
+        elif hkey != self._gl_hover_key:
+            # 鼠标在线路上滑过 → 只换悬停那两三个对象
+            self._gl_hover_key = hkey
+            self._rebuild_hover()
         elif getattr(self, "_gl_tracks", None):
             self._extend_tracks()          # 录制中点涨了 → 只补新段
         self._apply_progress()
@@ -747,7 +789,9 @@ class RouteMapGlView(RouteMapView):
                             float(b[0]), float(b[1]), Z_MARK]
                 rgba = _rgba(color)
                 cols += list(rgba) * (len(ring) - 1) * 2
-                info.append((float(mk.t), v0, len(cols), rgba))
+                # 注意: 必须除以 4（每顶点 4 个分量）—— 写回时用的是 arr[v0:v1, 3]
+                # 这种**顶点索引**切片, 存扁平下标会错位/越界
+                info.append((float(mk.t), v0 // 4, len(cols) // 4, rgba))
                 if mk.kind == "start":
                     dots.append((x, y, Z_MARK))
                     dot_cols += list(rgba)
@@ -838,7 +882,8 @@ class RouteMapGlView(RouteMapView):
                          ((x - sx, y + sy), (x + sx, y - sy))):
                 pos += [a[0], a[1], Z_MARK, b[0], b[1], Z_MARK]
                 cols += [*col, *col]
-            self._gl_dead_info.append((rec, v0, len(cols)))
+            # 同样按**顶点索引**记区间(见 _build_marks 里的说明)
+            self._gl_dead_info.append((rec, v0 // 4, len(cols) // 4))
         if not pos:
             return
         self._gl_dead = self._add(gfx.Line(
