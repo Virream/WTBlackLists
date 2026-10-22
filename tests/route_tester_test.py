@@ -3132,6 +3132,9 @@ def test_record_overlay(tmpdir: str):
                               QSettings.Format.IniFormat)
     win._overlay_settings = win._load_overlay_settings()
     win.overlay.apply_settings(win._overlay_settings)
+    # 菜单勾选状态是构造时按真实设置设的 → 换成隔离设置后要同步一次
+    win.act_overlay.setChecked(win._overlay_settings.enabled)
+    app.processEvents()
     ov = win.overlay
 
     info = {"recording": True, "elapsed": 83.4, "rate": 24.5, "points": 1042,
@@ -3200,13 +3203,37 @@ def test_record_overlay(tmpdir: str):
     app.processEvents()
     assert 80 <= snap().pixelColor(bg_x, bg_y).alpha() <= 120, "40% 不透明度应≈102"
 
-    # 6) 全局录制(A/B 队) → 内容换成队伍/线路数
-    win._update_overlay({"recording": True, "rate": 5.0, "global": {
+    # 6) 全局录制(A/B 队) → 必须显示! 这是用户报的 bug: `info["recording"]` 只表示
+    #    单条录制, 全局录制时它一直是 False, 以前因此 A/B 队录制时叠加层根本不出现。
+    win._update_overlay({"recording": False, "rate": 5.0, "global": {
         "side": "A", "waiting": False, "elapsed": 12.0,
         "lives": 7, "active": 3}})
     app.processEvents()
+    assert ov.isVisible(), "全局录制期间叠加层必须显示(单条 recording=False 不代表没在录)"
     text = "\n".join(t for t, _c in ov._panel._lines)
-    assert "A 队录制中" in text and "线路 7 条" in text and "5.0 Hz" in text, text
+    assert "A 队录制中" in text and "已录线路 7 条" in text, text
+    assert "进行中 3 辆" in text and "5.0 Hz" in text, text
+
+    # 6.1) 换成 B 队 → 队伍名跟着变
+    win._update_overlay({"recording": False, "rate": 6.0, "global": {
+        "side": "B", "waiting": False, "elapsed": 30.0,
+        "lives": 2, "active": 1}})
+    app.processEvents()
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "B 队录制中" in text and "已录线路 2 条" in text, text
+
+    # 6.2) 等待第一名玩家重生的阶段也要显示(此时还没有计时)
+    win._update_overlay({"recording": False, "rate": 4.0, "global": {
+        "side": "A", "waiting": True, "elapsed": 0.0, "lives": 0, "active": 0}})
+    app.processEvents()
+    assert ov.isVisible()
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "等待第一名玩家重生" in text, text
+
+    # 6.3) 全局录制结束(global=None 且 recording=False) → 隐藏
+    win._update_overlay({"recording": False, "global": None})
+    app.processEvents()
+    assert not ov.isVisible(), "全局录制结束后应隐藏"
 
     # 7) 设置落盘
     win._save_overlay_settings()

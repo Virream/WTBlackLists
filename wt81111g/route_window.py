@@ -465,16 +465,23 @@ class RouteTesterWindow(QMainWindow):
           它低于轮询频率是正常的(采样还要过“采样间隔 + 最小位移”两道闸,
           车不动时一个点也不写); 两个数并排显示就能一眼看出是哪一边的问题;
         * 点数 / 标记数 / 当前速度 / 载具。
+
+        注意: 判断"要不要显示"必须看**单条录制与全局录制两个状态** ——
+        `info["recording"]` 只表示单条录制(`recorder._rec is not None`),
+        全局录制时它一直是 False(以前就因此 A/B 队录制时叠加层根本不出现)。
         """
         if not self._overlay_settings.enabled:
             return
-        if not info.get("recording"):
+        g = info.get("global")
+        if not info.get("recording") and not g:
             self.overlay.set_active(False)
             return
         rate = float(info.get("rate") or 0.0)
-        g = info.get("global")
         if g:
+            # 全局录制: 0 点由"第一名玩家重生"定下, 所以等待阶段的用时没有意义
             side = str(g.get("side") or "?")
+            lives = int(g.get("lives") or 0)
+            active = int(g.get("active") or 0)
             if g.get("waiting"):
                 head = f"● {side} 队: 等待第一名玩家重生…"
                 elapsed = 0.0
@@ -483,8 +490,7 @@ class RouteTesterWindow(QMainWindow):
                 elapsed = float(g.get("elapsed") or 0.0)
             lines = [
                 (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
-                (f"线路 {int(g.get('lives') or 0)} 条 · 进行中 "
-                 f"{int(g.get('active') or 0)} 辆", COLOR_TEXT),
+                (f"已录线路 {lives} 条 · 进行中 {active} 辆", COLOR_TEXT),
                 (f"8111 轮询 {rate:.1f} Hz", COLOR_TEXT),
             ]
         else:
