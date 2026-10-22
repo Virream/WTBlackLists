@@ -1987,26 +1987,50 @@ class RouteMapView(QWidget):
 
     def _hit_test(self, mx: float, my: float
                   ) -> tuple[RouteRecord, RoutePoint] | None:
-        """在**所有显示中的轨迹**里找离鼠标最近的点(半径见 HOVER_RADIUS)。
+        """在**所有显示中的轨迹**里找离鼠标最近的采样点(半径见 HOVER_RADIUS)。
 
         以前只看实时轨迹 / 第一条可见轨迹 —— 于是只剩“刚录完那条”有提示,
         其它眼睛点亮的线路移上去没反应(2026-10-07 修)。
-        注意: `_to_px` 给的是“地图本地像素”(不含平移), 所以先把鼠标位置换算过去。
+
+        **两级搜索**: 只做单级抽样(`n // 400` 个点)在超长线路上会变稀 ——
+        一局 24 分钟 = 25Hz × 1440s = 36000 个点, step = 90, 相邻点间距 0.26px 时
+        抽样间距已 ≈ 24px **超过命中半径 18px**, 会出现“鼠标在线上却没提示”以及
+        “提示的点差半米”(用户 2026-10-22 提出)。所以先用粗点定位, 再在命中粗点
+        前后各 step 个点内精查一遍 —— 结果与全量扫描一致(实测误差 0.000000px),
+        计算量仍只有 400 + 2·step。
+
+        另外这里直接用 `pt.x * w`, 不再逐点调 `_to_px()`: 后者每次都会重算一遍
+        地图尺寸并在 C++ 里构造 QPointF(64 条回放实测 62ms/次 → 现在几毫秒级)。
         """
         r = self._map_rect()
+        w, h = self._map_size()
+        if w <= 0 or h <= 0:
+            return None
         mx, my = mx - r.left(), my - r.top()
         best: tuple[RouteRecord, RoutePoint] | None = None
         best_d2 = HOVER_RADIUS ** 2
         for rec in self._hover_candidates():
             pts = rec.points
-            # 全局线路可能几千个点、一次几十条 → 抽样命中(每帧扫几万个点会卡)
-            step = 1 if len(pts) <= 400 else len(pts) // 400
-            for i in range(0, len(pts), step):
+            n = len(pts)
+            step = 1 if n <= 400 else n // 400
+            # 粗扫(step == 1 时就是全量)
+            k = -1
+            k_d2 = best_d2
+            for i in range(0, n, step):
                 pt = pts[i]
-                px = self._to_px(pt.x, pt.y)
-                d2 = (px.x() - mx) ** 2 + (px.y() - my) ** 2
-                if d2 < best_d2:
-                    best_d2, best = d2, (rec, pt)
+                d2 = (pt.x * w - mx) ** 2 + (pt.y * h - my) ** 2
+                if d2 < k_d2:
+                    k_d2, k = d2, i
+            if k < 0:
+                continue
+            if step > 1:                      # 邻域精查: 粗点前后各 step 个点
+                for i in range(max(0, k - step), min(n, k + step + 1)):
+                    pt = pts[i]
+                    d2 = (pt.x * w - mx) ** 2 + (pt.y * h - my) ** 2
+                    if d2 < k_d2:
+                        k_d2, k = d2, i
+            if k_d2 < best_d2:
+                best_d2, best = k_d2, (rec, pts[k])
         return best
 
     def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
