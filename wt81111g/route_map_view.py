@@ -1230,29 +1230,33 @@ class RouteMapView(QWidget):
         """回放累加层的内容指纹(**不含几何**: 几何变化走“先缩放贴旧层”)。
 
         `dead` 里是**这一刻已经阵亡的线路** —— 越过阵亡时刻时整条线要从“速度配色”
-        换成“半透明纯灰”, 而累加层里已经画上去的彩色像素无法擦掉, 所以让它进指纹:
-        每个玩家只会在阵亡那一刻触发一次重建(与回拖重建同量级)。
+        换成“半透明纯灰”(或者直接清除, 看“变暗”开关), 而累加层里已经画上去的彩色
+        像素无法擦掉, 所以让**阵亡**(不是“阵亡且要变暗”)进指纹: 每个玩家只会在
+        阵亡那一刻触发一次重建(与回拖重建同量级)。
         """
         return (tuple(r0.route_id for r0 in self._playback_recs),
                 self._show_spawns, self._spawns_ver,
                 tuple(r.route_id for r in self._playback_recs
-                      if self._dead_dimmed(r, self._playhead)))
+                      if self._dead_now(r, self._playhead)))
 
     def _draw_play_static(self, p: QPainter) -> None:
-        """回放累加层的初始内容: 重生位置 + 未播放底衬 + 当前已播放的前缀。
+        """回放累加层的初始内容: 重生位置 + 已播放前缀(+ 阵亡后要变暗的整条灰)。
 
-        已阵亡的线路: 整条用**半透明纯灰**画, 不再叠速度配色(用户 2026-10-21)。
+        2026-10-22 改动(用户要求): 回放**不再画未播放的全长底衬** —— 以前一按播放
+        就看得到所有线路的整条灰影。现在:
+
+        * 未阵亡: 只画已播放的彩色前缀(未播放部分完全不可见);
+        * 已阵亡且勾了“被击毁后路线变暗”: 整条画成半透明纯灰;
+        * 已阵亡但没勾: 什么都不画(等于直接清除)。
         """
         if self._show_spawns:
             self._draw_spawns(p)
         for rec in self._playback_recs:
-            dead = self._dead_dimmed(rec, self._playhead)
-            self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE if dead else None)
-        for rec in self._playback_recs:
-            if self._dead_dimmed(rec, self._playhead):
-                continue
-            k, _mid = self._played_prefix(rec, self._playhead)
-            self._draw_play_prefix(p, rec, k)
+            if not self._dead_now(rec, self._playhead):
+                k, _mid = self._played_prefix(rec, self._playhead)
+                self._draw_play_prefix(p, rec, k)
+            elif self._dead_dim:
+                self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)
 
     def _play_prefix_geom(self, rec, k: int) -> _LiveGeom:
         """该线路“已播放前缀”的分桶几何(增量缓存, 供重复绘制用)。"""
@@ -1353,8 +1357,8 @@ class RouteMapView(QWidget):
             p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             p.translate(self._play_anchor[0] + mx, self._play_anchor[1] + my)
             for rec in self._playback_recs:
-                if self._dead_dimmed(rec, self._playhead):
-                    continue            # 已阵亡: 整条线在重建时已按纯灰画好
+                if self._dead_now(rec, self._playhead):
+                    continue            # 已阵亡: 整条线在重建时已按“灰/不画”处理完毕
                 k, _mid = self._played_prefix(rec, self._playhead)
                 done = self._play_drawn.get(rec.route_id, 0)
                 if k > done:
@@ -1632,10 +1636,10 @@ class RouteMapView(QWidget):
         多条同时回放时: 每条各自按自己的 playhead 切分(时间轴相同),
         因此较短的那条会自然地“跑完停在终点”。
         """
-        if self._dead_dimmed(rec, head):
-            self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)   # 已阵亡: 整条纯灰
+        if self._dead_now(rec, head):
+            if self._dead_dim:                      # 勾了“变暗”才留整条灰
+                self._draw_play_underlay(p, rec, COLOR_DEAD_ROUTE)
         else:
-            self._draw_play_underlay(p, rec)
             k, _mid = self._played_prefix(rec, head)
             self._extend_play(p, rec, 0, k)
         self._draw_play_marks(p, rec, head, labels=labels)

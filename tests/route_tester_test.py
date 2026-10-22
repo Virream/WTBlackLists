@@ -796,7 +796,7 @@ def test_playback_draw_cache():
             view.render(canvas)
         assert len(lay_calls) == n, "回放推进不该重建累加层(只补新段)"
 
-        # ② 播放到的部分要真的画上去(颜色与未播放的半透明底衬不同)
+        # ② 播放到的部分要真的画上去(playhead=0 时该位置是空的/底图色)
         pt = rec.points[-1]
         px = view.map_pos(pt.x, pt.y)
         img_end = QImage(800, 600, QImage.Format.Format_ARGB32)
@@ -805,7 +805,8 @@ def test_playback_draw_cache():
         img_start = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img_start)
         assert img_end.pixelColor(int(px.x()), int(px.y())) != \
-            img_start.pixelColor(int(px.x()), int(px.y())), "已播放段应覆盖未播放底衬"
+            img_start.pixelColor(int(px.x()), int(px.y())), \
+            "已播放段应该可见, 而未播放时不该画出整条灰线"
 
         # ③ 往回拖拽 → 必须重建(否则已播放的段留在图上擦不掉)
         view.set_playback([rec], rec.duration * 0.2)
@@ -813,7 +814,7 @@ def test_playback_draw_cache():
         assert len(lay_calls) > n, "往回拖拽必须重建累加层"
         n2 = len(lay_calls)
 
-        # ③b 拖动出余量 → **不重建**(搬图层), 已播放/未播放的画面仍跟着地图走
+        # ③b 拖动出余量 → **不重建**(搬图层), 已播放的画面仍跟着地图走
         view.set_playback([rec], rec.duration * 0.6)
         view.render(canvas)
         n_shift = len(lay_calls)
@@ -821,7 +822,8 @@ def test_playback_draw_cache():
         img_drag = QImage(800, 600, QImage.Format.Format_ARGB32)
         view.render(img_drag)
         assert len(lay_calls) == n_shift, "拖动出余量应搬累加层, 不该整层重建"
-        px_drag = view.map_pos(rec.points[150].x, rec.points[150].y)
+        # 取**已播放**范围内的点(60% 进度 ≈ 前 120 点; 未播放段现在不画)
+        px_drag = view.map_pos(rec.points[50].x, rec.points[50].y)
         assert img_drag.pixelColor(int(px_drag.x()), int(px_drag.y())) != \
             QColor("#334455"), "搬图层后回放画面仍应画在正确位置"
         view._pan_x = 0.0
@@ -1452,10 +1454,13 @@ def test_start_on_move(tmpdir: str):
 
 
 def test_eye_visibility_opacity(tmpdir: str):
-    """侧栏眼睛图标控制轨迹显示/隐藏; **轨迹一律不透明, 半透明只用于回放未播放段**。
+    """侧栏眼睛图标控制轨迹显示/隐藏; **轨迹一律不透明**。
 
     透明度用像素级验证: 同一条轨迹分别画在深/浅两种底图上取色 ——
     不透明 → 两次取色完全相同(颜色不随底图变); 半透明 → 取色随底图变。
+
+    2026-10-22: 回放不再画“未播放的全长底衬”(否则一按播放就能看到整条灰影),
+    所以 playhead=0 时该位置应该就是底图色。
     """
     def png(color: str) -> bytes:
         img = QImage(64, 64, QImage.Format.Format_RGB32)
@@ -1484,7 +1489,7 @@ def test_eye_visibility_opacity(tmpdir: str):
         if mode == "visible":
             view.set_visible_tracks([rec])
         elif mode == "playback":
-            view.set_playback(rec, 0.0)      # playhead=0 → 整条都是“未播放”
+            view.set_playback(rec, 0.0)      # playhead=0 → 还没播放任何段
         else:
             view.set_live(rec)
         canvas = QImage(view.width(), view.height(), QImage.Format.Format_ARGB32)
@@ -1499,8 +1504,10 @@ def test_eye_visibility_opacity(tmpdir: str):
         "眼睛点亮的轨迹必须不透明(颜色不应随底图变化)"
     assert track_color("live", dark) == track_color("live", light), \
         "录制中的轨迹必须不透明"
-    assert track_color("playback", dark) != track_color("playback", light), \
-        "回放未播放段应是半透明(颜色随底图变化)"
+    # 回放未播放段不画 → 取到的就是底图色(两种底图各自不同)
+    assert track_color("playback", dark) == (0x28, 0x28, 0x28), \
+        "回放不该提前把未播放的轨迹画出来(会看到整条灰影)"
+    assert track_color("playback", light) == (0xC8, 0xC8, 0xC8)
     # 不透明 ≠ 半透明: 同底图下两种画法颜色必须不同
     assert track_color("visible", dark) != track_color("playback", dark)
 
@@ -3006,11 +3013,12 @@ def test_dead_style(tmpdir: str):
               after.pixelColor(x, y))]
     assert xs and max(xs) - min(xs) + 1 <= 9, f"红叉太大了: {max(xs) - min(xs) + 1}px"
 
-    # ③ 关掉“变暗”: 线路重新按速度着色, 红叉仍在
+    # ③ 关掉“变暗”: 整条线路清除(既不画灰也不画彩), 红叉仍在
     #    (速度配色本身就可能是红的, 所以红叉一律用“开关前后的差值”来断言)
     view.set_dead_style(dim=False)
     after2 = shot(12.0)
-    assert sat(at(after2, 0.20, 0.5)) > 60, "关掉变暗后应恢复速度配色"
+    assert sat(at(after2, 0.20, 0.5)) < 30, \
+        f"关掉变暗后阵亡线路应被清除(取到底图色), 实际 {at(after2, 0.20, 0.5)}"
     view.set_dead_style(dim=False, mark=False)
     after2b = shot(12.0)
     assert red_pixels(after2, 0.55, 0.5) > red_pixels(after2b, 0.55, 0.5) + 3, \

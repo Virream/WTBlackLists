@@ -687,10 +687,14 @@ class RouteMapGlView(RouteMapView):
         colors[:segs * 2] = _seg_colors(pts, 0, segs, vmax)
         under_obj = None
         if under:
+            # 2026-10-22 改动(用户要求): 回放中**不显示**全长未播放底衬 —— 以前一按
+            # 播放就能看到所有线路的整条灰影。这条线只用作“阵亡后的整条灰”,
+            # 平时隐藏(`_apply_progress` 里按“已阵亡 且 勾了变暗”再打开)。
             under_obj = self._add(gfx.Line(
                 gfx.Geometry(positions=pos),
                 gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                        color=_rgba(rmv.COLOR_UNPLAYED))), O_UNDER)
+                                        color=_rgba(rmv.COLOR_DEAD_ROUTE))), O_UNDER)
+            under_obj.visible = False
         play = self._add(gfx.Line(
             # 回放(under=True)的“已播放”从空开始, 由进度逐段填色;
             # 录制/预览的线路本身就整条可见, 直接带着颜色开始
@@ -1135,6 +1139,10 @@ class RouteMapGlView(RouteMapView):
         必须同时处理**回退**: 播放结束后不点“结束播放”直接再按播放时, 头部回到 0,
         上一轮画上去的彩色段如果不擦掉就会整条残留(用户 2026-10-22: “没有清除之前
         残留的线路直接进行了播放, 有些没死亡的线路也没变灰”)。
+
+        阵亡处理(2026-10-22 用户要求): 回放中不画全长底衬, 只在**已阵亡**后
+          * 勾了“被击毁后路线变暗” → 整条变半透明纯灰;
+          * 没勾 → 整条清除(彩色段也清掉)。
         """
         head = self._playhead
         playing = {id(r) for r in self._playback_recs}
@@ -1143,13 +1151,16 @@ class RouteMapGlView(RouteMapView):
                 continue
             pts = tr.rec.points
             end = pts[-1].t if pts else 0.0
-            dead = bool(getattr(tr.rec, "dead", False)) and self._dead_dim and head >= end
-            if dead != tr.dead:
-                tr.dead = dead
-                if tr.under is not None:
-                    tr.under.material.color = _rgba(
-                        rmv.COLOR_DEAD_ROUTE if dead else rmv.COLOR_UNPLAYED)
-            if dead:
+            # 注意: 这里的 dead 是“玩家已阵亡”, 与“变暗”开关无关 —— 开关只决定
+            # 阵亡后是留一条灰线还是直接清除(开关随时可切, 所以每帧比对 visible)。
+            died = bool(getattr(tr.rec, "dead", False)) and head >= end
+            if died != tr.dead:
+                tr.dead = died
+            if tr.under is not None:
+                want = died and self._dead_dim
+                if bool(tr.under.visible) != want:
+                    tr.under.visible = want
+            if died:
                 if tr.drawn:
                     tr.play.geometry.colors.data[:] = 0.0
                     tr.play.geometry.colors.update_full()
