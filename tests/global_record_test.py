@@ -801,6 +801,48 @@ def test_playback_timeline():
     results.append("全局录制回放: 时间轴按绝对时刻(02:00 开始的线路也会动) OK")
 
 
+def test_spawn_start_check():
+    """新建线路时校验起点像不像"刚重生"（用户 2026-10-22 报的 bug 的诊断）。
+
+    场景: B 队录制里有一条线起点离最近重生点 183m、开局速度就 39km/h —— 一辆
+    **已经在路上跑**的车被当成了新单位。根因是 `_new_life()` 的起点取当帧位置,
+    所以任何"中途才被 8111 上报"的单位都会在路中间开一条线。
+    这里验证诊断能把它抓出来(只记日志, 不改变任何行为)。
+    """
+    from types import SimpleNamespace
+
+    spawns = [SimpleNamespace(x=0.30, y=0.61), SimpleNamespace(x=0.33, y=0.62)]
+    rec = GlobalRecord(route_id="g9", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "B", map_size=(4000.0, 4000.0), spawns=spawns)
+
+    t = 0.0
+    for i in range(10):                      # ① 正常重生: 从重生点出发
+        tr.feed(t, [tank(0.300 + 0.001 * i, 0.610)])
+        t += 0.05
+    # ② 一辆"凭空出现在路中间"的车(离最近重生点 ≈183m 那种)
+    for i in range(60):
+        tr.feed(t, [tank(0.300 + 0.001 * 10, 0.610),      # 原来那辆停着
+                    tank(0.4081 + 0.0004 * i, 0.6155, icon="LightTank")])
+        t += 0.05
+    lives = tr.finish()
+    assert len(lives) == 2, len(lives)
+    assert len(tr.suspicious) == 1, tr.suspicious
+    lid, at, dist_m, icon = tr.suspicious[0]
+    assert lid.endswith("B2"), lid
+    assert icon == "LightTank"
+    assert dist_m > 150.0, dist_m               # 实测就是 180m 量级
+    assert at > 0.4, at
+
+    # 没有重生点数据时不检查(不能凭空报警)
+    tr2 = GlobalTracker(GlobalRecord(route_id="g10", map_key="M", map_name="地", created_at=""),
+                        "B")
+    for i in range(10):
+        tr2.feed(i * 0.05, [tank(0.5 + 0.001 * i, 0.5)])
+    tr2.finish()
+    assert not tr2.suspicious
+    results.append("全局录制: 起点不在重生点附近的线路能被抓出来(只记日志) OK")
+
+
 def test_zone_layout_pick(tmpdir: str):
     """回放 AB 队线路时必须用**全局条目自己**的战区布局(可能是另一个交战区)。
 
@@ -887,6 +929,7 @@ def main() -> int:
     test_map_paint()
     test_live_layer_no_rebuild()
     test_playback_timeline()
+    test_spawn_start_check()
     test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)

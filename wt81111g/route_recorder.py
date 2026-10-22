@@ -641,7 +641,9 @@ class RouteRecorder(QObject):
         self._global_side = side
         self._global_created = created
         self._global_prev_lives = list(rec.lives(side))
-        self._tracker = GlobalTracker(rec, side, map_size=self._map_size)
+        # 重生点传进去: 只用于**校验新建线路的起点像不像刚重生**(见 GlobalTracker.suspicious)
+        self._tracker = GlobalTracker(rec, side, map_size=self._map_size,
+                                      spawns=list(self._spawns))
         self._global_waiting = True
         self._global_t0 = 0.0
         self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
@@ -733,6 +735,7 @@ class RouteRecorder(QObject):
         side = self._global_side
         lives = self._tracker.finish() if self._tracker is not None else []
         skipped = dict(self._tracker.seen_skipped) if self._tracker is not None else {}
+        suspicious = list(self._tracker.suspicious) if self._tracker is not None else []
         duration = max(0.0, rec.duration or 0.0)
         self._global = None
         self._tracker = None
@@ -745,6 +748,14 @@ class RouteRecorder(QObject):
             log.info("全局录制: 未录制(%s) 共 %d 种, 数量前 8: %s",
                      "非地面单位/静态对象", len(skipped),
                      ", ".join(f"{t}/{i or '-'}×{n}" for (t, i), n in top))
+        if suspicious:
+            # 起点不像重生的线 —— 不代表软件错, 但要让人一眼看到并知道是哪几条。
+            # 常见成因: 该单位直到那一刻才被 8111 上报(漏报/掉帧 > end_gap),
+            # 或者它本就不从重生点出生(如 AI 地面单位)。
+            log.warning("全局录制: %d 条线路的起点不在重生点附近(可能中途才开始被上报): %s",
+                        len(suspicious),
+                        ", ".join(f"{lid}@{t:.0f}s/{d:.0f}m/{icon}"
+                                  for lid, t, d, icon in suspicious[:12]))
         if not lives:
             if self._global_created:
                 self.store.remove_global(rec.route_id)

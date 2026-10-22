@@ -77,6 +77,10 @@ MIN_MOVE = 0.0002
 HEARTBEAT = 15.0
 # 速度上限(km/h): 帧间“跳一下”(刚被匹配上但其实是另一个单位)不该变成尖峰
 MAX_SPEED_KMH = 200.0
+# 新建线路时, 起点离**任一重生点**超过这个距离(归一化)就记一条警告。
+# 实测正常重生 0.1~2.3m, 而用户 2026-10-22 报的那条异常线是 183m —— 阈值取 40m
+# (0.01) 既不误报, 又能把“中途才开始被上报”的线一次子抓出来。
+SPAWN_START_TOL = 0.01
 # 拿不到 /map_info.json 时的地图边长(米)。实测陆战图 map_max-map_min = 4096。
 DEFAULT_MAP_SIZE = (4096.0, 4096.0)
 
@@ -455,7 +459,8 @@ class GlobalTracker:
                  interval: float = SAMPLE_INTERVAL,
                  match_radius: float = MATCH_RADIUS,
                  end_gap: float = END_GAP,
-                 map_size: tuple[float, float] = DEFAULT_MAP_SIZE):
+                 map_size: tuple[float, float] = DEFAULT_MAP_SIZE,
+                 spawns=None):
         self.record = record
         self.side = side
         self.interval = max(0.02, float(interval))
@@ -469,6 +474,15 @@ class GlobalTracker:
         self._seq = 0
         self._empty_since: float | None = None
         self.seen_skipped: dict[tuple[str, str], int] = {}
+        # 本地记录的重生点(归一化坐标): 只用来**校验新建线路的起点像不像刚重生**。
+        # 用户 2026-10-22 反馈: 有一条线不是从重生点开始 —— 而“新线的起点取当帧位置”
+        # 意味着任何“中途才被 8111 上报”的单位都会在路中间开一条线。这个列表就是
+        # 用来把这种线当场抓出来(0.1~2m 正常, 183m 就一定有问题)。
+        self.spawn_points: list[tuple[float, float]] = [
+            (float(s.x), float(s.y)) for s in (spawns or [])
+            if getattr(s, "x", None) is not None and getattr(s, "y", None) is not None]
+        # 起点不像重生的线: [(life_id, 时刻, 离最近重生点米数, icon)]
+        self.suspicious: list[tuple[str, float, float, str]] = []
         # 坐标系对齐(陆战图 ↔ 空战图): 参考坐标系 = 录制开始时那一帧的静态锚点
         self.aligner = FrameAligner()
         self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
@@ -598,7 +612,7 @@ class GlobalTracker:
         return self.lives
 
     # ------------------------------------------------------------------ 内部
-    def _new_life(self, u: Unit, t: float) -> _Live:
+    def _new_life(self, u: Unit, t: float, n_units: int = 0) -> _Live:
         self._seq += 1
         life = UnitLife(
             life_id=f"{self.record.route_id}:{self.side}{self._seq}",
@@ -610,6 +624,19 @@ class GlobalTracker:
         )
         life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
         self.lives.append(life)
+        # 起点校验: 刚重生的车会在某个重生点上; 离得很远说明它是“中途才被上报”的
+        # (8111 漏报过 >end_gap 秒, 或这辆车本就不从重生点出生, 例如 AI 单位)。
+        # 这里只记日志/诊断, 不改变任何行为 —— 先搞清楚事实再决定要不要处理。
+        if self.spawn_points:
+            d = min(math.hypot(u.x - sx, u.y - sy) for sx, sy in self.spawn_points)
+            if d > SPAWN_START_TOL:
+                w, _h = self.map_size
+                dist_m = d * w
+                self.suspicious.append((life.life_id, t, dist_m, u.icon))
+                log.warning(
+                    "全局录制: 新线路 %s 起点不在重生点附近(离最近重生点 %.0f m, "
+                    "t=%.1fs, %s/%s, 场内单位 %d 个) —— 它可能直到这一刻才被 8111 上报",
+                    life.life_id, dist_m, t, u.icon or "-", u.typ, n_units)
         return _Live(life=life, x=u.x, y=u.y, last_seen=t, last_store=t,
                      last_x=u.x, last_y=u.y)
 
@@ -647,7 +674,7 @@ class GlobalTracker:
         for j, u in enumerate(units):
             if j in taken_u:
                 continue
-            self._live.append(self._new_life(u, t))
+            self._live.append(self._new_life(u, t, len(units)))
 
     def _touch(self, lv: _Live, u: Unit, t: float) -> None:
         """一条线接上了这一帧: 更新位置, 到点就存一个带速度的采样点。"""
