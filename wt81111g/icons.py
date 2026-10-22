@@ -40,9 +40,13 @@ _FALLBACK_TEXT = QColor("#334155")   # 拿不到调色板(无 QApplication)时�
 _cache: dict[tuple[bool, int], QIcon] = {}
 _pin_cache: dict[int, QIcon] = {}
 _circle_cache: dict[tuple[str, int], QIcon] = {}
+_warn_cache: dict[int, QIcon] = {}
 _logged: set[str] = set()      # 已记录“加载成功”的资源路径(只记一次)
 # 图钉的颜色取调色板的“高亮色”(通常蓝), 拿不到时用这个兜底
 _FALLBACK_PIN = QColor("#2563eb")
+# 黄色感叹号(提醒“这局还没指定观战玩家”)—— 固定琥珀色, 深浅主题都能看清
+_WARN_AMBER = QColor("#f59e0b")
+_WARN_MARK = QColor("#1f2937")
 
 # 圆圈图标: 种类 -> (颜色, 地图上的半径, 是否带中心实心点)
 # 数值与 `route_map_view` 里画标记的代码一致(半径 8/8/6, 描边 2.4, 半径比 0.3),
@@ -102,6 +106,43 @@ def pin_icon(size: int = ICON_SIZE) -> QIcon:
     pm.setDevicePixelRatio(ratio)
     icon = QIcon(pm)
     _pin_cache[key] = icon
+    return icon
+
+
+def warn_icon(size: int = ICON_SIZE) -> QIcon:
+    """黄色感叹号: 标在“还没指定观战玩家”的全局录制条目上(点它打开修正界面)。
+
+    与图钉一样直接 `QPainter` 现画 —— 不依赖资源文件; 颜色写死琥珀色, 深浅主题
+    下都够醒目(这是“需要你来做一步”的提示, 不该跟着主题变淡)。
+    """
+    key = int(size)
+    cached = _warn_cache.get(key)
+    if cached is not None:
+        return cached
+    ratio = _device_ratio()
+    px = max(8, int(round(size * ratio)))
+    pm = QPixmap(px, px)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        u = px / 18.0                      # 以 18px 为设计基准
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(_WARN_AMBER)
+        painter.drawPolygon(QPolygonF([
+            QPointF(9.0 * u, 1.4 * u), QPointF(17.4 * u, 16.4 * u),
+            QPointF(0.6 * u, 16.4 * u),
+        ]))
+        painter.setBrush(_WARN_MARK)       # 三角形里的感叹号
+        w = 1.9 * u
+        painter.drawRoundedRect(
+            QRectF(9.0 * u - w / 2.0, 6.4 * u, w, 5.0 * u), w / 2.0, w / 2.0)
+        painter.drawEllipse(QRectF(9.0 * u - w / 2.0, 12.6 * u, w, w))
+    finally:
+        painter.end()
+    pm.setDevicePixelRatio(ratio)
+    icon = QIcon(pm)
+    _warn_cache[key] = icon
     return icon
 
 

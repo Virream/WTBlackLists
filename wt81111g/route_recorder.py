@@ -787,15 +787,14 @@ class RouteRecorder(QObject):
         self.global_finished.emit(rec, side)
 
     def _collect_kills(self, rec) -> None:
-        """录制结束: 取本局新增的击毁消息, 并做一次"时间差对齐"分析。
+        """录制结束: 取本局新增的击毁消息, 并做一次"时间差对齐"诊断。
 
-        **只写日志, 不改任何 `dead` 判定** —— 先用真实数据确认"每队恰好漏一条"
-        这个假设与对齐命中率, 再决定要不要真的去补死亡时刻。
+        **只写日志, 不改任何 `dead` 判定** —— 真正的死亡时刻修正要等用户在界面上
+        指定“镜头挂在谁身上”(见 `RouteStore.set_watchers`)。这里只顺带报一下
+        对齐质量, 便于事后从日志里判断数据是否可信。
 
         为什么要等两队都录完才分析: A/B 是两次独立观战, 每队各有一位玩家被摄像机
-        挂着(他的 icon 永不消失), 所以要把两队线路的结束时刻**合在一起**才凑得出
-        完整的"击毁事件模式"。理论上最多找到 2 条对不上的击毁(两人都在结束前死),
-        最少 0 条(两人都活到最后)。
+        挂着(他的 icon 永不消失), 只有两队的线路凑在一起才看得出整体对齐情况。
         """
         try:
             new = kill_timeline.read_new_kills(self.client, self._hud_cursor)
@@ -820,9 +819,9 @@ class RouteRecorder(QObject):
             return
         report = kill_timeline.analyze(rec)
         log.info("全局录制 击毁对齐: %s", kill_timeline.describe(report))
-        for lid, dt in kill_timeline.pick_death_times(report):
-            log.info("全局录制 击毁对齐: 线路 %s 的推算死亡时刻 %.1fs(仅诊断, 未改判定)",
-                     lid, dt)
+        if kill_timeline.player_lines(rec, "A") or kill_timeline.player_lines(rec, "B"):
+            log.info("全局录制: 请在侧栏点条目右侧的黄色感叹号指定观战玩家, "
+                     "程序才会按 hudmsg 修正那两位的死亡时刻")
  
     def _do_start(self, now: float, player: tuple[float, float] | None, vehicle: str,
                   start_on_move: bool = False) -> None:

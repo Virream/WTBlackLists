@@ -38,7 +38,7 @@ from .global_hotkey import (
 )
 from .help_text import about_html
 from .hotkey_dialog import HotkeyDialog
-from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon
+from .icons import ICON_SIZE, circle_icon, eye_icon, pin_icon, warn_icon
 from .map_cache import MapCache
 from .map_manager import MapManagerDialog
 from .route_map_view import RouteMapView
@@ -57,6 +57,7 @@ from .sound import play_error as play_error_sound
 from .sound import settings as sound_settings
 from .sound_dialog import SoundSettingsDialog
 from .tree_view import RouteTreeWidget
+from .watcher_dialog import WatcherDialog
 from .zones import ground_spawns, layout_spread, ownership_text, spawns_from_json
 from .zones import spawns_to_json, zones_to_json
 
@@ -95,7 +96,8 @@ GROUP_ITEM_FLAGS = Qt.ItemFlag.ItemIsEnabled
 # 侧栏列: 0=展开/收起(眼睛图标) 1=地图/模式/版本/线路 2=信息(条数或用时)
 _COL_EYE = 0
 _COL_NAME = 1
-_COL_TIME = 2
+_COL_INFO = 2          # “信息”列: 条数/用时; 未指定观战玩家的全局条目在这里挂感叹号
+_COL_TIME = _COL_INFO
 
 # 眼睛列宽度(px): 最深的一条是全局录制里的线路(地图 → 模式 → 版本 → 全局 → 队伍 → 线路,
 # 缩进 12×5), 图标 18px, 再加一点间距 —— 取小了图标会被列边界裁掉/压到名称列的文字上
@@ -918,13 +920,30 @@ class RouteTesterWindow(QMainWindow):
                                             for side in GLOBAL_SIDES
                                             for life in g.lives(side))))
         item.setToolTip(_COL_EYE, "点击显示 / 隐藏整局的全部线路")
-        item.setToolTip(_COL_NAME,
-                        f"全局录制 · {g.map_name} · {g.mode_label}\n"
-                        f"录制时间 {g.created_at.replace('T', ' ')}\n"
-                        f"用时 {fmt_time(g.duration)} · "
-                        f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条\n"
-                        f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}\n"
-                        f"右键可标记为 A/B 队录制目标、清除标记或删除")
+        # 还没指定“录制时镜头挂在谁身上” → 信息列挂一个黄色感叹号(点它打开修正界面)。
+        # 那位玩家阵亡后 8111 仍会继续上报残骸, 不修正的话他的死亡时刻会落在整局结束。
+        if not g.fixed and g.count():
+            item.setIcon(_COL_INFO, warn_icon())
+            item.setToolTip(_COL_INFO,
+                            "这局还没指定“录制时镜头挂在谁身上”\n"
+                            "——点这个感叹号来指定, 程序会据此修正那两位玩家的死亡时刻\n"
+                            "(右键条目也能打开同一个界面)")
+            item.setForeground(_COL_INFO, QBrush(QColor("#b45309")))
+        tooltip = [
+            f"全局录制 · {g.map_name} · {g.mode_label}",
+            f"录制时间 {g.created_at.replace('T', ' ')}",
+            f"用时 {fmt_time(g.duration)} · "
+            f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条",
+            f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}",
+        ]
+        if not g.fixed:
+            tooltip.append("未指定观战玩家 —— 点右侧黄色感叹号(或右键条目)")
+        elif g.watchers:
+            tooltip.append("观战玩家: " + " / ".join(
+                f"{side} 队 {name}" for side, name in
+                ((s, g.watchers.get(s)) for s in GLOBAL_SIDES) if name))
+        tooltip.append("右键可标记为 A/B 队录制目标、指定观战玩家或删除")
+        item.setToolTip(_COL_NAME, "\n".join(tooltip))
         parent.addChild(item)
         for side in GLOBAL_SIDES:
             lives = g.lives(side)
@@ -1140,7 +1159,15 @@ class RouteTesterWindow(QMainWindow):
         self._expand_item(route_id)
 
     def _on_tree_item_clicked(self, item: QTreeWidgetItem, col: int) -> None:
-        """点击第一列的**眼睛图标** → 切换该条目在地图上的显示/隐藏。"""
+        """点击第一列的**眼睛图标** → 切换该条目在地图上的显示/隐藏。
+
+        全局条目信息列上的**黄色感叹号** → 打开“指定观战玩家”修正界面。
+        """
+        if col == _COL_INFO and item.data(0, _ROLE_KIND) == "global":
+            g = self.store.get_global(item.data(0, _ROLE_ID))
+            if g is not None and not g.fixed:
+                self._open_watcher_dialog(g.route_id)
+            return
         if col != _COL_EYE:
             return
         kind = item.data(0, _ROLE_KIND)
@@ -1735,10 +1762,49 @@ class RouteTesterWindow(QMainWindow):
         menu.addAction(act_expand)
         if kind == "global":
             menu.addSeparator()
+            gid = item.data(0, _ROLE_ID)
+            g = self.store.get_global(gid)
+            act_fix = QAction("指定观战玩家(修正死亡时刻)…", self)
+            act_fix.setToolTip(
+                "8111 不告诉我们录制时镜头挂在谁身上 —— 而那位玩家阵亡后 8111\n"
+                "仍会继续上报残骸, 导致他的死亡时刻落在整局结束。\n"
+                "在这里从本局击毁名单里点选他, 程序就会把死亡时刻补上。")
+            act_fix.setEnabled(g is not None and bool(g.count()))
+            act_fix.triggered.connect(lambda: self._open_watcher_dialog(gid))
+            menu.addAction(act_fix)
+            menu.addSeparator()
             act_del = QAction("删除该全局录制…", self)
             act_del.triggered.connect(
                 lambda: self._delete_global(item.data(0, _ROLE_ID)))
             menu.addAction(act_del)
+
+    def _open_watcher_dialog(self, gid: str) -> None:
+        """打开“指定观战玩家”弹框 → 应用后按 hudmsg 修正两位的死亡时刻。"""
+        g = self.store.get_global(gid)
+        if g is None:
+            return
+        if not g.count():
+            self._set_status("这条全局录制还没有线路, 无法指定观战玩家", sticky=3.0)
+            return
+        dlg = WatcherDialog(g, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        resolved = self.store.set_watchers(gid, dlg.watchers())
+        self._reload_tree()
+        self._refresh_map_tracks()
+        parts = []
+        for side in GLOBAL_SIDES:
+            row = resolved.get(side) or {}
+            if not row.get("watcher"):
+                continue
+            if row.get("ok"):
+                parts.append(f"{side} 队 {row['watcher']} → 阵亡 "
+                             f"{fmt_time(row['death'])}(停住后 {row['gap']:.1f} 秒)")
+            else:
+                parts.append(f"{side} 队 {row['watcher']} → 不修正({row.get('note')})")
+        self._set_status("已按观战玩家修正死亡时刻: " + " | ".join(parts)
+                         if parts else "已保存(这一局不需要修正死亡时刻)",
+                         sticky=8.0)
 
     def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
         """打/清“下次录到这一条”的标记。"""
@@ -2029,12 +2095,17 @@ class RouteTesterWindow(QMainWindow):
         self._update_buttons()
         # 刚录完的这一队自动点亮, 否则侧栏看起来“什么都没发生”
         self._visible_lives = {life.life_id for life in rec.lives(side)}
+        # 录了新的一队 → 之前指定的观战玩家可能已经不对了, 重新置为“待修正”
+        if rec.fixed:
+            self.store.set_fixed(rec.route_id, False)
         self._reload_tree()
         self._expand_item(rec.route_id)
         self._ensure_map_for([rec])
         self._set_status(
             f"全局录制完成: {rec.label} · {side} 队 {len(rec.lives(side))} 条线路"
-            f" | 用时 {fmt_time(rec.duration)}", sticky=8.0)
+            f" | 用时 {fmt_time(rec.duration)}"
+            f"\n点条目右侧的黄色感叹号指定“镜头挂在谁身上”, 程序会据此修正"
+            f"那两位玩家的死亡时刻", sticky=10.0)
 
     def _on_global_cancelled(self) -> None:
         self.overlay.set_active(False)

@@ -56,6 +56,7 @@ from .zones import layout_spread
 from .zones import mode_name as zone_mode_name
 from .zones import signature as zones_signature
 from .zones import spawns_to_json, zones_from_signature, zones_to_json
+from . import kill_timeline
 
 log = logging.getLogger("route_store")
 
@@ -211,6 +212,13 @@ class UnitLife:
     # 一次只能开一台载具, 想换固定翼必先阵亡; 退局后载具停在原地、
     # 8111 过一会儿不再上报, 也算击毁。实现上只看“线断那一刻场上还有没有别人”。
     dead: bool = False
+    # **已修正的死亡时刻**(录制时间轴的秒数; 0 = 未修正)。
+    # 只对“摄像机挂着的那位玩家”有意义: 他阵亡后 8111 依旧上报残骸, 线尾其实是
+    # 录制结束, 所以由用户指定观战昵称、用 hudmsg 的击毁时刻反推真实死亡时刻。
+    # 修正时会把 `points` 截断到这个时刻(末尾补一个合成点), 原始点存在 `trimmed` 里。
+    death_t: float = 0.0
+    # 修正前的**原始点序列**(便于改主意时重新指定观战玩家); 未修正时为空。
+    trimmed: list[TrackPoint] = field(default_factory=list)
 
     @property
     def route_id(self) -> str:
@@ -251,7 +259,7 @@ class UnitLife:
     def to_json(self) -> dict:
         # 点写成 [t, x, y, speed] 的紧凑数组: 整局几十辆车 → 几十万个点,
         # 用 {"x":..,"y":..,"t":..} 的字典形式会让 routes.json 膨胀 3 倍以上
-        return {
+        out = {
             "id": self.life_id,
             "icon": self.icon,
             "type": self.obj_type,
@@ -262,6 +270,13 @@ class UnitLife:
             "pts": [[round(p.t, 2), round(p.x, 5), round(p.y, 5), round(p.speed, 1)]
                     for p in self.points],
         }
+        if self.death_t:
+            out["death_t"] = round(self.death_t, 2)
+        if self.trimmed:
+            # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
+            out["trim"] = [[round(p.t, 2), round(p.x, 5), round(p.y, 5),
+                            round(p.speed, 1)] for p in self.trimmed]
+        return out
 
     @classmethod
     def from_json(cls, data: dict) -> UnitLife | None:
@@ -269,28 +284,38 @@ class UnitLife:
             life_id = str(data["id"])
         except (KeyError, TypeError):
             return None
-        pts: list[TrackPoint] = []
-        for row in data.get("pts") or []:
-            try:
-                t, x, y = float(row[0]), float(row[1]), float(row[2])
-            except (IndexError, TypeError, ValueError):
-                continue
-            speed = 0.0
-            if len(row) > 3:
+
+        def read_points(rows) -> list[TrackPoint]:
+            pts: list[TrackPoint] = []
+            for row in rows or []:
                 try:
-                    speed = float(row[3])
-                except (TypeError, ValueError):
-                    speed = 0.0
-            pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
+                    t, x, y = float(row[0]), float(row[1]), float(row[2])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                speed = 0.0
+                if len(row) > 3:
+                    try:
+                        speed = float(row[3])
+                    except (TypeError, ValueError):
+                        speed = 0.0
+                pts.append(TrackPoint(x=x, y=y, t=t, speed=speed))
+            return pts
+
+        try:
+            death_t = float(data.get("death_t") or 0.0)
+        except (TypeError, ValueError):
+            death_t = 0.0
         return cls(
             life_id=life_id,
             icon=str(data.get("icon") or ""),
             obj_type=str(data.get("type") or ""),
             color=str(data.get("color") or ""),
             map_key=str(data.get("map_key") or ""),
-            points=pts,
+            points=read_points(data.get("pts")),
             side=str(data.get("side") or ""),
             dead=bool(data.get("dead")),
+            death_t=death_t,
+            trimmed=read_points(data.get("trim")),
         )
 
 
@@ -324,6 +349,13 @@ class GlobalRecord:
     # 所以只能拿“击毁事件之间的**时间差模式**”去和线路结束时刻对齐 ——
     # 摄像机挂着的那个玩家 icon 不会消失(实测), 他的死亡时刻只能靠这个反推。
     kills: list[dict] = field(default_factory=list)
+    # **录制时镜头挂在谁身上**: `{"A": "killflik", "B": "jjh67"}`(昵称)。
+    # 8111 不告诉我们这件事, 而它正是“反推那位玩家死亡时刻”的唯一钥匙 ——
+    # 由用户在修正界面里从本局击毁名单中点选(见 `RouteStore.set_watchers`)。
+    watchers: dict[str, str] = field(default_factory=dict)
+    # 死亡时刻是否已经确认过。`False` 时侧栏条目上会显示一个黄色感叹号
+    # (点它就打开修正界面); 重录任何一队都会重置成 `False`。
+    fixed: bool = False
 
     def zone_state_at(self, t: float) -> list[dict] | None:
         """取回放时刻 `t` 的战区快照(没有时间轴返回 None)。
@@ -413,6 +445,8 @@ class GlobalRecord:
             "marks": list(self.marks),
             "zone_states": self.zone_states,
             "kills": self.kills,
+            "watchers": dict(self.watchers),
+            "fixed": 1 if self.fixed else 0,
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -431,6 +465,10 @@ class GlobalRecord:
                 duration=float(data.get("duration") or 0.0),
                 marks=[str(m) for m in (data.get("marks") or [])
                        if str(m) in GLOBAL_SIDES],
+                watchers={str(k): str(v) for k, v in
+                          (data.get("watchers") or {}).items()
+                          if str(k) in GLOBAL_SIDES and str(v or "").strip()},
+                fixed=bool(data.get("fixed")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
@@ -878,6 +916,71 @@ class RouteStore:
             if target is not None:
                 target.marks.clear()
         self.save()
+
+    def set_fixed(self, gid: str, value: bool) -> None:
+        """改“死亡时刻是否已确认” —— `False` 时侧栏条目上会挂一个黄色感叹号。"""
+        with self._lock:
+            target = self.get_global(gid)
+            if target is not None:
+                target.fixed = bool(value)
+        self.save()
+
+    @staticmethod
+    def _apply_death(life: UnitLife, death_t: float) -> None:
+        """把一条线截断到 `death_t` 并补一个合成点, 记下原始点以便回退。
+
+        为什么要补合成点: 停止时程序是"每 15 秒一个心跳点", 死亡时刻往往落在两个
+        心跳点之间(实测有一位停稳 9.8 秒才被打死)。不补的话线尾会落在停住那一刻,
+        地图上的阵亡叉与"用时"都会少算这 9.8 秒。
+        """
+        if not life.trimmed:
+            life.trimmed = list(life.points)
+        pts = [p for p in life.trimmed if p.t < float(death_t)]
+        if not pts:                       # 死亡时刻早于第一个点(不应该发生) → 不动
+            life.points = list(life.trimmed)
+            return
+        last = pts[-1]
+        pts.append(TrackPoint(x=last.x, y=last.y, t=round(float(death_t), 2),
+                              speed=0.0))
+        life.points = pts
+        life.death_t = round(float(death_t), 2)
+        life.dead = True
+
+    @staticmethod
+    def _reset_death(life: UnitLife) -> None:
+        """撤销修正: 把原始点还回去。"""
+        if life.trimmed:
+            life.points = list(life.trimmed)
+        life.trimmed = []
+        life.death_t = 0.0
+
+    def set_watchers(self, gid: str, watchers: dict[str, str]) -> dict[str, dict]:
+        """指定“录制时镜头挂在谁身上”, 并按 hudmsg 的击毁时刻修正死亡时刻。
+
+        `watchers` 形如 `{"A": "killflik", "B": "jjh67"}`; 某一队留空表示“这一队
+        不用修正”(他活到录制结束)。返回 `kill_timeline.resolve_deaths` 的结果,
+        界面拿它显示“阵亡于 3:28(停住后 0.0 秒)”。
+        """
+        rec = self.get_global(gid)
+        if rec is None:
+            return {}
+        clean = {side: str((watchers or {}).get(side) or "").strip()
+                 for side in GLOBAL_SIDES}
+        resolved = kill_timeline.resolve_deaths(rec, clean)
+        with self._lock:
+            rec.watchers = {side: name for side, name in clean.items() if name}
+            rec.fixed = True
+            for side in GLOBAL_SIDES:
+                row = resolved.get(side) or {}
+                for life in kill_timeline.player_lines(rec, side):
+                    if row.get("ok") and life.life_id == row.get("life_id"):
+                        self._apply_death(life, row["death"])
+                    else:
+                        self._reset_death(life)
+        self.save()
+        log.info("全局录制 %s 观战玩家: %s", gid,
+                 kill_timeline.summarize(resolved))
+        return resolved
 
     def globals_by_group(self) -> dict[tuple[str, str], list[GlobalRecord]]:
         """{(地图键, 战区指纹): [全局录制条目...]} —— 新的在前(按录制时间倒序)。"""

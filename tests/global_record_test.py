@@ -899,51 +899,226 @@ def test_kill_timeline():
                  {"id": 1, "t": 5.0, "msg": "x"}]       # 模拟两队都抓到了 id=1
     assert [k["id"] for k in kt.merge_kills(rec)] == [1, 2]
 
-    # ---- 3) 偏移搜索 + 未配对识别
-    def life(lid, side, t1, dead, last_move=None):
-        """造一条线: 末点 t1; 若给 last_move 则它最后一段不再移动。"""
-        pts = [TrackPoint(0.2, 0.2, 0.0, 0.0)]
-        if last_move is not None:
-            pts.append(TrackPoint(0.3, 0.3, float(last_move), 30.0))
-            if t1 > last_move:                       # 之后残骸不动
-                pts.append(TrackPoint(0.3, 0.3, float(t1), 0.0))
-        else:
-            pts.append(TrackPoint(0.4, 0.4, float(t1), 30.0))
-        lf = UnitLife(life_id=lid, icon="MediumTank", obj_type="ground_model",
-                      map_key="M", points=pts, side=side, dead=dead)
-        return lf
+    # ---- 3) 从击毁文本里认出玩家昵称(载具名自己还带括号; 武器/AI 没有括号)
+    assert kt.split_actor("[Mc185] Renamed#763 (◍M1A1 HC)") == (
+        "[Mc185] Renamed#763", "◍M1A1 HC")
+    assert kt.split_actor("weapons/su_r_77_1/short") == (
+        "weapons/su_r_77_1/short", "")
+    st = kt.player_stats([
+        {"t": 10.0, "msg": "甲 (T-80) 击毁了 乙 (M1)"},
+        {"t": 20.0, "msg": "乙 (M1) 击毁了 甲 (T-80)"},
+        {"t": 30.0, "msg": "丙 (红旗-11) 击毁了 weapons/su_r_77_1/short"},
+    ])
+    assert st["乙"]["deaths"] == [10.0], st["乙"]       # 只记“他被打死”的时刻
+    assert st["乙"]["kills"] == 1 and st["甲"]["kills"] == 1
+    assert "weapons/su_r_77_1/short" not in st, st     # 武器/AI 不是玩家
+
+    # ---- 4) “停住不动”的时刻: 心跳点 0.45m 的抖动不能算“还在动”,
+    #         但刹车滑行的 1~3m 必须排除(否则会早报十几秒)
+    def pts(*rows):
+        """(x, y, t, speed) —— 归一化坐标, 0.0001 ≈ 0.4m(4km 地图)"""
+        return [TrackPoint(x, y, t, v) for x, y, t, v in rows]
+
+    stop_pts = pts((0.5000, 0.5000, 152.0, 0.0), (0.5000, 0.5000, 167.0, 0.0),
+                   (0.5020, 0.5000, 176.0, 8.0), (0.5040, 0.5000, 179.4, 13.0),
+                   (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
+                   (0.5039, 0.5000, 224.4, 0.0))
+    got = kt.tail_stop(stop_pts)
+    assert got is not None and abs(got[0] - 179.4) < 1e-6, got
+
+    creep_pts = pts((0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
+                    (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))
+    got = kt.tail_stop(creep_pts)
+    assert got is not None and abs(got[0] - 364.6) < 1e-6, got   # 351.0 是刹车的 1.6m
+
+    moving_pts = pts((0.1, 0.1, 0.0, 30.0), (0.2, 0.1, 5.0, 30.0),
+                     (0.3, 0.1, 10.0, 30.0))
+    assert kt.tail_stop(moving_pts) is None, "一直在跑的不该被判成残骸"
+
+    # ---- 5) 按昵称定位死亡时刻(结构仿诺曼底那局: 比赛 = 录制 + 5 秒)
+    def life(lid, side, icon, rows, dead=True):
+        return UnitLife(life_id=lid, icon=icon, obj_type="ground_model",
+                        map_key="M", points=pts(*rows), side=side, dead=dead)
 
     rec2 = GlobalRecord(route_id="g21", map_key="M", map_name="地图", created_at="",
                         duration=100.0)
-    # A 队: 两条正常阵亡(10s / 30s) + 一条"被摄像机挂着"(活到最后, 70s 后不动)
-    rec2.sides["A"] = [life("A1", "A", 10.0, True),
-                       life("A2", "A", 30.0, True),
-                       life("A3", "A", 100.0, False, last_move=70.0)]
-    # B 队: 一条正常阵亡(50s) + 一条"真活到最后"(一直在动 → 不能判死)
-    rec2.sides["B"] = [life("B1", "B", 50.0, True),
-                       life("B2", "B", 100.0, False, last_move=99.0)]
-    # hudmsg: 比赛秒数比我们的 t 小 5 秒 → 偏移 +5;
-    # 另外混进一条"对空击杀"(我们不录空中单位), 它不该影响配对与判定。
-    rec2.kills = [{"id": 100 + i, "t": t, "msg": "x (载具) 击毁了 y (载具)"}
-                  for i, t in enumerate([5.0, 25.0, 45.0, 65.0])]
-    rec2.kills.append({"id": 200, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"})
-
+    rec2.sides["A"] = [
+        life("A1", "A", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 10.0, 20.0))),
+        life("A2", "A", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 30.0, 20.0))),
+        # 跑出 8111 上报范围 → 结束时刻是个噪声断点(没有对应的击杀)
+        life("A9", "A", "LightTank", ((0.6, 0.6, 12.0, 20.0), (0.7, 0.6, 20.0, 20.0))),
+        life("A3", "A", "Player", (
+            (0.5000, 0.5000, 152.0, 0.0), (0.5000, 0.5000, 167.0, 0.0),
+            (0.5020, 0.5000, 176.0, 8.0), (0.5040, 0.5000, 179.4, 13.0),
+            (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
+            (0.5039, 0.5000, 224.4, 0.0))),
+    ]
+    rec2.sides["B"] = [
+        life("B1", "B", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 50.0, 20.0))),
+        life("B2", "B", "Player", (
+            (0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
+            (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))),
+    ]
+    rec2.kills = [
+        {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A1 结束 10
+        {"id": 2, "t": 35.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A2 结束 30
+        {"id": 3, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ B1 结束 50
+        # 摄像机挂着的那两位: 停住之后才被打死
+        {"id": 4, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+        {"id": 5, "t": 374.6, "msg": "w (ZTZ96) 击毁了 jjh67 (RDF/LT)"},
+        # 对空击杀(我们不录空中单位), 不该影响判定
+        {"id": 6, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"},
+    ]
+    shift = kt.pooled_shift(rec2)
+    assert abs(shift - 5.0) <= 0.6, shift
     report = kt.analyze(rec2)
-    assert abs(report["offset"] - 5.0) < 0.2, report["offset"]
-    assert len(report["pairs"]) == 3, report["pairs"]     # 10/30/50 都能配上
-    assert 65.0 in report["unmatched"], report["unmatched"]   # 那位玩家的死亡
-    assert 33.0 in report["unmatched"], report["unmatched"]   # 对空击杀也在"未配对"里
-    silent_ids = [s[0] for s in report["silent"]]
-    assert silent_ids == ["A3", "B2"], report["silent"]
+    assert abs(report["shift"] - 5.0) <= 0.6, report["shift"]
+    assert [p[0] for p in report["pairs"]].count(15.0) == 1, report["pairs"]
+    assert "待指定的观战玩家线路" in kt.describe(report), kt.describe(report)
 
-    # ---- 4) 只修"死后残骸不动"的那条: A3(静止 30s) 能命中; B2(一直在动) 不动
-    picked = kt.pick_death_times(report)
-    assert picked == [("A3", 70.0)], picked
-    text = kt.describe(report)
-    assert "A3" in text and "可判定" in text, text
-    assert "B2" in text and "在动" in text, text
-    assert "含对空" in text, text
-    results.append("全局录制: hudmsg 击毁时刻能反推摄像机那位玩家的死亡时刻 OK")
+    got = kt.resolve_deaths(rec2, {"A": "killflik", "B": "jjh67"})
+    assert got["A"]["ok"] and got["B"]["ok"], got
+    assert abs(got["A"]["stop"] - 179.4) < 1e-6, got["A"]["stop"]
+    assert abs(got["A"]["death"] - 179.4) < 1.2, got["A"]        # 184.4 - 5
+    assert abs(got["B"]["death"] - 369.6) < 1.2, got["B"]        # 374.6 - 5
+    assert got["B"]["gap"] > 4.0, got["B"]      # 停住之后才死的情形要如实反映
+    text = kt.summarize(got)
+    assert "A 队 killflik" in text and "阵亡" in text, text
+    # 名字不在本局击毁里 / 他没阵亡 → 都要明确说“不修正”, 而不是乱猜一个
+    assert not kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["ok"]
+    assert "阵亡记录" in kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["note"]
+    assert not kt.resolve_deaths(rec2, {"A": ""})["A"]["ok"]
+    results.append("全局录制: 按观战玩家昵称精确定位死亡时刻 OK")
+
+
+def test_watcher_apply(tmpdir: str):
+    """指定观战玩家 → 把那条线截断到死亡时刻; 改回“不修正”能完整还原。
+
+    为什么要截断而不是只改标记: 摄像机那位阵亡后 8111 还在上报残骸, 那段尾巴
+    能拖到整局结束(实测 201 秒)。不截断的话地图上的阵亡叉与“用时”都会落在
+    整局结束, 看不出他到底什么时候死的。
+    """
+    from wt81111g import kill_timeline as kt
+
+    def pts(*rows):
+        return [TrackPoint(x, y, t, v) for x, y, t, v in rows]
+
+    path = os.path.join(tmpdir, "watch.json")
+    store = RouteStore(path)
+    g = store.new_global("MAP1", "地图 1")
+    g.sides["A"] = [
+        UnitLife(life_id=f"{g.route_id}:A1", icon="MediumTank",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=True,
+                 points=pts((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 10.0, 20.0))),
+        UnitLife(life_id=f"{g.route_id}:A2", icon="Player",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=True,
+                 points=pts((0.50, 0.50, 152.0, 0.0), (0.5020, 0.50, 176.0, 8.0),
+                            (0.5040, 0.50, 179.4, 13.0), (0.5039, 0.50, 194.4, 0.0),
+                            (0.5039, 0.50, 224.4, 0.0), (0.5039, 0.50, 260.0, 0.0))),
+    ]
+    g.sides["B"] = [
+        UnitLife(life_id=f"{g.route_id}:B1", icon="MediumTank",
+                 obj_type="ground_model", map_key="MAP1", side="B", dead=True,
+                 points=pts((0.4, 0.4, 0.0, 20.0), (0.5, 0.4, 50.0, 20.0))),
+    ]
+    g.kills = [
+        {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},
+        {"id": 2, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},
+        {"id": 3, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+    ]
+    store.add_global(g)
+    assert not g.fixed, "新条目默认是“待修正”(侧栏会挂感叹号)"
+
+    player = g.lives("A")[1]
+    original = [p.t for p in player.points]
+    resolved = store.set_watchers(g.route_id, {"A": "killflik"})
+    assert resolved["A"]["ok"] and not resolved["B"]["ok"], resolved
+    assert g.fixed and g.watchers == {"A": "killflik"}, (g.fixed, g.watchers)
+    # 截断到死亡时刻(184.4 - 偏移 5 ≈ 179.4), 尾巴收进 trimmed
+    assert player.dead and player.death_t > 0, player.death_t
+    assert abs(player.points[-1].t - resolved["A"]["death"]) < 1e-6, player.points[-1]
+    assert len(player.points) < len(original), (len(player.points), len(original))
+    assert len(player.trimmed) == len(original), "原始点要留一份以便改主意"
+    assert player.points[-1].t < 260.0, "残骸尾巴应被截掉"
+
+    # 落盘/读回: 修正结果、原始点、watchers/fixed 都要在
+    again = RouteStore(path)
+    got = again.get_global(g.route_id)
+    assert got is not None and got.fixed and got.watchers == {"A": "killflik"}
+    l2 = got.lives("A")[1]
+    assert abs(l2.death_t - player.death_t) < 0.01
+    assert abs(l2.points[-1].t - player.points[-1].t) < 0.01
+    assert len(l2.trimmed) == len(original)
+    # 还原后必须和录下来的原始数据一模一样
+    again.set_watchers(g.route_id, {"A": "", "B": ""})
+    l3 = got.lives("A")[1]
+    assert l3.death_t == 0.0 and l3.trimmed == [], (l3.death_t, l3.trimmed)
+    assert [round(p.t, 2) for p in l3.points] == [round(t, 2) for t in original]
+    assert got.fixed and got.watchers == {}
+    results.append("全局录制: 指定观战玩家→截断死亡时刻/可还原/落盘 OK")
+
+
+def test_watcher_ui(tmpdir: str):
+    """侧栏: 未指定观战玩家的条目挂黄色感叹号; 点它 → 修正界面 → 感叹号消失。
+
+    弹框本身是模态的, 这里有把手把它换成桩 —— 只验证“点感叹号会走修正流程、
+    应用后数据被改、提醒图标消失”, 界面细节靠手动看。
+    """
+    from PyQt6.QtWidgets import QDialog
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "watch_win.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    win.show()
+    app.processEvents()
+    win.store.rename_map("MAPW", "待修正")
+    g = win.store.new_global("MAPW", "待修正")
+    g.sides["A"].append(UnitLife(life_id=f"{g.route_id}:A1", icon="IFV",
+                                 obj_type="ground_model", side="A", dead=True,
+                                 points=[TrackPoint(0.2, 0.2, 0.0, 20.0),
+                                         TrackPoint(0.3, 0.25, 10.0, 20.0)]))
+    g.sides["A"].append(UnitLife(life_id=f"{g.route_id}:A2", icon="Player",
+                                 obj_type="ground_model", side="A", dead=True,
+                                 points=[TrackPoint(0.5000, 0.50, 152.0, 0.0),
+                                         TrackPoint(0.5020, 0.50, 176.0, 8.0),
+                                         TrackPoint(0.5040, 0.50, 179.4, 13.0),
+                                         TrackPoint(0.5039, 0.50, 224.4, 0.0)]))
+    g.kills = [{"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},
+               {"id": 2, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"}]
+    win.store.add_global(g)
+    win._reload_tree()
+    app.processEvents()
+
+    item = _global_items(win)[0]
+    assert not item.icon(rw._COL_INFO).isNull(), "待修正的条目要挂黄色感叹号"
+    assert "感叹号" in item.toolTip(rw._COL_INFO), item.toolTip(rw._COL_INFO)
+
+    class FakeDialog:
+        def __init__(self, record, parent=None):
+            self.record = record
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def watchers(self):
+            return {"A": "killflik", "B": ""}
+
+    real = rw.WatcherDialog
+    rw.WatcherDialog = FakeDialog
+    try:
+        win._on_tree_item_clicked(item, rw._COL_INFO)
+    finally:
+        rw.WatcherDialog = real
+    app.processEvents()
+    assert g.fixed and g.watchers == {"A": "killflik"}, (g.fixed, g.watchers)
+    player = [lf for lf in g.lives("A") if lf.icon == "Player"][0]
+    assert abs(player.death_t - 179.4) < 1.2, player.death_t     # 184.4 - 偏移 5
+    assert abs(player.points[-1].t - player.death_t) < 1e-6
+    assert player.points[-1].t < 200.0, "残骸尾巴应被截掉"
+    assert _global_items(win)[0].icon(rw._COL_INFO).isNull(), "修正完感叹号要消失"
+    results.append("全局录制侧栏: 待修正挂感叹号 + 点它修正死亡时刻 OK")
 
 
 def test_zone_layout_pick(tmpdir: str):
@@ -1034,6 +1209,8 @@ def main() -> int:
     test_playback_timeline()
     test_spawn_start_check()
     test_kill_timeline()
+    test_watcher_apply(tmpdir)
+    test_watcher_ui(tmpdir)
     test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)

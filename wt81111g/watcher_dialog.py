@@ -1,0 +1,168 @@
+"""「指定观战玩家」对话框 —— 修正摄像机挂着那位玩家的死亡时刻。
+
+============================================================= 为什么要手动指定
+录制全局路线时, 镜头必须挂在我方一位玩家身上(8111 才肯报这一方), 于是那位玩家
+阵亡后 8111 **依旧持续上报残骸**, 他的线路一直到录制结束才断 —— 拿不到死亡时刻,
+地图上那一叉会画在"整局结束"的位置。
+
+`/hudmsg` 的击毁文本里有**双方昵称**(`A (载具) 击毁了 B (载具)`), 只要知道镜头挂在
+谁身上, 就能从本局全部击毁里挑出他唯一那次阵亡。而 8111 不告诉我们这件事 ——
+只能问用户。本对话框就是从**本局击毁名单**里点选, 避免手打昵称出错(昵称里还夹着
+军团前缀和零宽空格)。
+
+=============================================================== 交互
+每队一个下拉框: 第一项是「这一队不用修正(他活到录制结束)」, 后面按"阵亡时刻离
+'他停住不动'那一刻有多近"排序 —— 第一位就是最可能的, 默认选中它。下方实时显示
+推算结果("阵亡 3:28, 停住后 0.0 秒"), 选错了能一眼看出来。
+"""
+from __future__ import annotations
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QLabel,
+    QVBoxLayout,
+)
+
+from . import kill_timeline as kt
+from .route_store import GLOBAL_SIDE_LABELS, GLOBAL_SIDES, fmt_time
+
+_TIP = (
+    "8111 不告诉我们录制时镜头挂在谁身上, 而那位玩家阵亡后 8111 仍会继续上报残骸 ——\n"
+    "他的线路拿不到死亡时刻(线尾是整局结束)。这里从本局击毁名单里点选他, 程序就会\n"
+    "用 `/hudmsg` 的击毁时刻把死亡时刻补上。"
+)
+
+
+class WatcherDialog(QDialog):
+    """让用户点选 A/B 队录制时的观战对象(两队的名单都来自本局 hudmsg)。"""
+
+    def __init__(self, record, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("指定观战玩家 · 修正死亡时刻")
+        self.setMinimumWidth(520)
+        self._record = record
+        self._kills = kt.merge_kills(record)
+        self._combos: dict[str, QComboBox] = {}
+        self._notes: dict[str, QLabel] = {}
+        self._ranked: dict[str, list[dict]] = {}
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+
+        head = QLabel(_TIP)
+        head.setWordWrap(True)
+        head.setStyleSheet("color: #6b7280;")
+        outer.addWidget(head)
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(line)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(10)
+        grid.setVerticalSpacing(8)
+        for r, side in enumerate(GLOBAL_SIDES):
+            label = QLabel(f"{GLOBAL_SIDE_LABELS[side]}录制时, 镜头挂在这位玩家身上:")
+            grid.addWidget(label, r * 2, 0, Qt.AlignmentFlag.AlignTop)
+            combo = QComboBox()
+            combo.setMinimumWidth(300)
+            combo.currentIndexChanged.connect(self._refresh)
+            grid.addWidget(combo, r * 2, 1)
+            note = QLabel("")
+            note.setWordWrap(True)
+            note.setStyleSheet("color: #2563eb;")
+            grid.addWidget(note, r * 2 + 1, 1)
+            self._combos[side] = combo
+            self._notes[side] = note
+        grid.setColumnStretch(1, 1)
+        outer.addLayout(grid)
+
+        self._warn = QLabel("")
+        self._warn.setWordWrap(True)
+        self._warn.setStyleSheet("color: #b45309;")
+        outer.addWidget(self._warn)
+
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel)
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("应用修正")
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        outer.addWidget(self._buttons)
+
+        self._fill()
+        self._refresh()
+
+    # ------------------------------------------------------------------
+    def _fill(self) -> None:
+        """按队填下拉框: 第一项是"不修正", 其余按可能性排序。"""
+        for side in GLOBAL_SIDES:
+            combo = self._combos[side]
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("（这一队不用修正 — 他活到录制结束）", "")
+            ranked = kt.rank_watchers(self._record, side, self._kills)
+            self._ranked[side] = ranked
+            if not kt.player_lines(self._record, side):
+                combo.addItem("（这一队没有观战玩家的线路）", "")
+                combo.setEnabled(False)
+                combo.blockSignals(False)
+                continue
+            for row in ranked:
+                text = "%s（%s）· 阵亡 %d 次" % (
+                    row["watcher"], row.get("vehicle") or "?", len(row["deaths"]))
+                text += (" · 推算 %s" % fmt_time(row["death"]) if row["ok"]
+                         else " · 不适用")
+                combo.addItem(text, row["watcher"])
+                combo.setItemData(
+                    combo.count() - 1,
+                    "阵亡时刻: %s\n%s" % (
+                        "、".join(fmt_time(t) for t in row["deaths"][:6]),
+                        row.get("note") or ""),
+                    Qt.ItemDataRole.ToolTipRole)
+            # 只预选**上次确认过的**名字。按"最可能"预选看着方便, 但实测排序只能
+            # 把真正的观战对象提到前几个(同一时刻往往好几个人在死), 预选错了用户
+            # 直接点确定就会把数据改坏 —— 宁可让他自己扫一眼名单。
+            want = (self._record.watchers or {}).get(side) or ""
+            idx = combo.findData(want) if want else -1
+            if idx > 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+
+    def watchers(self) -> dict[str, str]:
+        """`{"A": 昵称, "B": 昵称}`(留空 = 这一队不修正)。"""
+        return {side: str(self._combos[side].currentData() or "")
+                for side in GLOBAL_SIDES}
+
+    def _refresh(self) -> None:
+        """选完立刻显示推算结果 —— 选错了用户能一眼看出来。"""
+        chosen = self.watchers()
+        resolved = kt.resolve_deaths(self._record, chosen, self._kills)
+        for side in GLOBAL_SIDES:
+            note = self._notes[side]
+            name = chosen.get(side) or ""
+            if not name:
+                note.setText("这一队不修正(保持原样)")
+                note.setStyleSheet("color: #6b7280;")
+                continue
+            row = resolved.get(side) or {}
+            if row.get("ok"):
+                note.setText(
+                    "→ 阵亡 %s ｜ 他停住不动是 %s, 之后 %.1f 秒被打死 ｜ "
+                    "这一队的击毁对齐偏移 %+.1f 秒(配对 %d 条)"
+                    % (fmt_time(row["death"]), fmt_time(row["stop"]),
+                       row["gap"], row["shift"], row["hits"]))
+                note.setStyleSheet("color: #047857;")
+            else:
+                note.setText("→ 不修正: %s" % (row.get("note") or "无法定位"))
+                note.setStyleSheet("color: #b45309;")
+        both = [n for n in chosen.values() if n]
+        same = len(both) == 2 and both[0] == both[1]
+        self._warn.setText(
+            "两队不可能挂在同一位玩家身上(他们属于不同阵营), 请重新选。" if same
+            else "")
+        ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        ok_btn.setEnabled(not same)
