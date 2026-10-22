@@ -41,9 +41,13 @@ PLAYER_DIR_W = 5.0            # 两只脚相对中轴的横向半宽(越大越�
 PLAYER_DIR_H = 4.5            # 尖点比两只脚连线再往前多少
 # 回放光标 = **一个实心白点**(多条一起回放时环太乱, 2026-10-21 用户要求去掉环);
 # 朝向仍用一根白线表示, 线起点贴住这个点(半径 PLAY_CURSOR_R)
-PLAY_CURSOR_R = 3.0           # 回放光标白点半径
-CURSOR_DIR_BACK = 3.0         # 线起点到光标中心的距离
-CURSOR_DIR_LEN = 3.8          # 线长
+# 回放光标: 一个实心白点, 朝向用**点内部的一条黑色短线**表示(用户 2026-10-22:
+# 原来“白点 + 伸出圆点外的白色带黑边线”看着像小蝌蚪)。
+PLAY_CURSOR_R = 4.0           # 白点半径(2026-10-22: 3.0 → 4.0, 给内部短线留空间)
+CURSOR_DIR_BACK = 1.2         # 朝向短线起点到圆心的距离(点内部)
+CURSOR_DIR_LEN = 2.6          # 短线长度 → 终点距圆心 3.8px(仍在 4px 半径内)
+CURSOR_DIR_PEN = 1.8          # 短线粗细(1.5px 时经抗锯齿后几乎没有实黑像素)
+COLOR_CURSOR_DIR = QColor("#0f172a")    # 短线黑色(与地图背景同色系)
 COLOR_DIR_LINE = QColor("#f8fafc")   # 回放朝向线颜色(白, 与回放光标同色)
 # 选中的历史轨迹: **不透明**(便于多条叠在一起对比)
 COLOR_HISTORY = QColor("#8fa6c8")
@@ -1845,26 +1849,19 @@ class RouteMapView(QWidget):
             p.drawLine(tip, foot2)
 
     def _draw_cursor_dir(self, p: QPainter, c: QPointF, dx: float, dy: float) -> None:
-        """回放光标上的**白色朝向线**(车头朝上时就是竖线); 几何见 CURSOR_DIR_* 。
+        """回放光标**圆点内部**的朝向短线(黑色)。
 
-        深色描边只留在线**两侧**: 两端各内缩半个描边宽、并改用平头端帽 ——
-        否则线头会露出一截黑头, 看着跟光标的白圈/白点接不上
-        (用户要求: 线看起来要跟这两个白圈是一体的)。
+        用户 2026-10-22: 原来是“白点 + 伸出圆点外的白色带黑边线”, 看着像小蝌蚪;
+        现在把点放大一圈(半径 4), 朝向改成点在内部的一条黑色短线。
+        用**平头**端帽: 圆头会在起点端婳进圆心, 把白点中心也染黑。
         """
         ang = self._dir_angle(dx, dy)
         if ang is None:
             return
         start, tip = cursor_dir_points(c, ang)
-        dark_w, light_w = 4.2, 2.0
-        inset = (dark_w - light_w) / 2.0
-        ux, uy = math.cos(ang), math.sin(ang)
         p.setBrush(Qt.BrushStyle.NoBrush)
-        p.setPen(QPen(QColor(15, 23, 42, 210), dark_w,
+        p.setPen(QPen(COLOR_CURSOR_DIR, CURSOR_DIR_PEN,
                       Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
-        p.drawLine(QPointF(start.x() + ux * inset, start.y() + uy * inset),
-                   QPointF(tip.x() - ux * inset, tip.y() - uy * inset))
-        p.setPen(QPen(COLOR_DIR_LINE, light_w,
-                      Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
         p.drawLine(start, tip)
 
     def _draw_hover_mark(self, p: QPainter) -> None:

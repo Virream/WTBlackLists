@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """跑图线路测试器 验证脚本(离屏): 存储 / 录制状态机 / 窗口与侧栏。
 
 用法: python tests/route_tester_test.py
@@ -484,14 +484,26 @@ def test_player_heading():
     view.set_player(pos, (0.0, 0.0))           # 全零向量 = 无有效朝向
     assert bright(0.0) == 0 and bright(90.0) == 0, "零向量不该画出方向"
 
-    # --- 回放光标: 用**录制时存下的**朝向画白线(游戏没开也能看) ---
-    def cursor_bright(rec, head: float, angle_deg: float) -> int:
-        """在回放光标处沿那根白线取样(中段, 免得碰到光标的白圈/白点)。"""
+    # --- 回放光标: 朝向是**圆点内部的一条黑色短线**(2026-10-22 用户要求) ---
+    def cursor_dark(rec, head: float, angle_deg: float) -> int:
+        """沿那根黑色短线取样数**暗**像素。
+
+        判据用“既不是白点(≈750)也不是底图(≈204)”—— 短线只有 1~2px 宽, 加上亚像素
+        位置, 实际像素大多是抗锯齿半透明黑(实测 247~351); 只数纯黑会全是 0。
+        """
         cur = point_at(rec.points, head)
         c = view.map_pos(cur.x, cur.y)
         img = render_now()
         start, tip = cursor_dir_points(c, math.radians(angle_deg))
-        return count_bright(img, start, tip, 0.2, 0.6)
+        n = 0
+        for i in range(16):
+            t = 0.2 + 0.6 * (i + 0.5) / 16
+            x = int(round(start.x() + (tip.x() - start.x()) * t))
+            y = int(round(start.y() + (tip.y() - start.y()) * t))
+            col = img.pixelColor(x, y)
+            if 100 < col.red() + col.green() + col.blue() < 600:
+                n += 1
+        return n
 
     def playback_rec(dx: float, dy: float) -> RouteRecord:
         r = RouteRecord(route_id="head", map_key="k", map_name="m", vehicle="v",
@@ -503,13 +515,14 @@ def test_player_heading():
     view.set_player(None)
     rec_dir = playback_rec(0.0, -1.0)          # 录制时朝上
     view.set_playback(rec_dir, 2.0)
-    assert cursor_bright(rec_dir, 2.0, -90.0) > 8, "回放光标也要画朝向线"
-    assert cursor_bright(rec_dir, 2.0, 90.0) == 0, "反方向不该有朝向线"
+    assert cursor_dark(rec_dir, 2.0, -90.0) > 8, \
+        "回放光标圆点内部应有一条指向车头的黑线"
+    assert cursor_dark(rec_dir, 2.0, 90.0) == 0, "反方向不该有黑线(那里是白点)"
     view.set_playback(None)
 
     rec_old = playback_rec(0.0, 0.0)           # 旧轨迹: 点里没有朝向
     view.set_playback(rec_old, 2.0)
-    assert cursor_bright(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画点"
+    assert cursor_dark(rec_old, 2.0, -90.0) == 0, "旧轨迹没有朝向 → 只画白点"
 
     # 光标**只留实心圆**(2026-10-21 用户要求): 外圈半径 9 那一圈不该有白像素
     img = render_now()

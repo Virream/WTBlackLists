@@ -1041,8 +1041,8 @@ class RouteMapGlView(RouteMapView):
                                     color=_rgba(rmv.COLOR_PLAYER))), O_PLAYER_DIR)
 
     def _build_cursor(self) -> None:
-        """回放光标: 每条线路一个白点 + 白色朝向线(带深色垫底), 与软件版一致。"""
-        self._gl_cursor = self._gl_cursor_dir = self._gl_cursor_dir_dark = None
+        """回放光标: 每条线路一个白点 + **点内部的黑色朝向短线**(与软件版一致)。"""
+        self._gl_cursor = self._gl_cursor_dir = None
         n = len(self._playback_recs)
         if not n:
             return
@@ -1050,14 +1050,11 @@ class RouteMapGlView(RouteMapView):
             gfx.Geometry(positions=np.zeros((n, 3), dtype=np.float32)),
             gfx.PointsMaterial(size=CURSOR_DOT_R * 2.0, size_space="screen",
                                color=_rgba(QColor("#f8fafc")))), O_CURSOR_DOT)
-        self._gl_cursor_dir_dark = self._add(gfx.Line(
-            gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
-            gfx.LineSegmentMaterial(thickness=4.2, thickness_space="screen",
-                                    color=_rgba(QColor(15, 23, 42, 210)))), O_CURSOR_DIR)
         self._gl_cursor_dir = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
-            gfx.LineSegmentMaterial(thickness=2.0, thickness_space="screen",
-                                    color=_rgba(rmv.COLOR_DIR_LINE))), O_CURSOR_DIR)
+            gfx.LineSegmentMaterial(thickness=rmv.CURSOR_DIR_PEN,
+                                    thickness_space="screen",
+                                    color=_rgba(rmv.COLOR_CURSOR_DIR))), O_CURSOR_DIR)
 
     def _build_border(self) -> None:
         """地图边框(与软件版 `_draw_base` 末尾那条细框一致)。"""
@@ -1290,8 +1287,6 @@ class RouteMapGlView(RouteMapView):
             dw, dh = self._map_size()
             parr = self._gl_cursor.geometry.positions.data
             darr = self._gl_cursor_dir.geometry.positions.data if self._gl_cursor_dir else None
-            ddarr = (self._gl_cursor_dir_dark.geometry.positions.data
-                     if self._gl_cursor_dir_dark else None)
             far = -1.0e6
             for i, rec in enumerate(self._playback_recs):
                 cur = rmv.point_at(rec.points, self._playhead) if rec.points else None
@@ -1301,8 +1296,6 @@ class RouteMapGlView(RouteMapView):
                     parr[i] = (far, far, 0.0)
                     if darr is not None:
                         darr[2 * i] = darr[2 * i + 1] = (far, far, 0.0)
-                    if ddarr is not None:
-                        ddarr[2 * i] = ddarr[2 * i + 1] = (far, far, 0.0)
                     continue
                 x, y = cur.x, 1.0 - cur.y
                 if not np.isfinite(x) or not np.isfinite(y):
@@ -1312,24 +1305,17 @@ class RouteMapGlView(RouteMapView):
                 if ang is None:
                     if darr is not None:
                         darr[2 * i] = darr[2 * i + 1] = (far, far, 0.0)
-                    if ddarr is not None:
-                        ddarr[2 * i] = ddarr[2 * i + 1] = (far, far, 0.0)
                     continue
                 ca, sa = math.cos(ang), math.sin(ang)
-                inset = (4.2 - 2.0) / 2.0
-                # 深色垫底两端各内缩半个描边宽(否则线头会露出黑头, 与白点接不上)
-                for arr, shrink in ((ddarr, inset), (darr, 0.0)):
-                    if arr is None:
-                        continue
-                    b0 = rmv.CURSOR_DIR_BACK + shrink
-                    b1 = rmv.CURSOR_DIR_BACK + rmv.CURSOR_DIR_LEN - shrink
-                    arr[2 * i] = (x + b0 * ca / dw, y - b0 * sa / dh, Z_PLAYER)
-                    arr[2 * i + 1] = (x + b1 * ca / dw, y - b1 * sa / dh, Z_PLAYER)
+                # 点内部的黑色短线(不需要再内缩: 已经是平头且完全落在白点里)
+                b0 = rmv.CURSOR_DIR_BACK
+                b1 = rmv.CURSOR_DIR_BACK + rmv.CURSOR_DIR_LEN
+                if darr is not None:
+                    darr[2 * i] = (x + b0 * ca / dw, y - b0 * sa / dh, Z_PLAYER)
+                    darr[2 * i + 1] = (x + b1 * ca / dw, y - b1 * sa / dh, Z_PLAYER)
             self._gl_cursor.geometry.positions.update_full()
             if self._gl_cursor_dir is not None:
                 self._gl_cursor_dir.geometry.positions.update_full()
-            if self._gl_cursor_dir_dark is not None:
-                self._gl_cursor_dir_dark.geometry.positions.update_full()
 
         # 悬停浮层的尺寸/内容都随文本变, 而且文本已进 `_content_key`
         # → 由 `_rebuild_objects` 统一重建(这里不再做就地改字的特例)
