@@ -250,6 +250,7 @@ class RouteMapGlView(RouteMapView):
         self._icon_mode = False
         self._hover_mode = False
         self._gl_hover_key: tuple | None = None
+        self._gl_hit_cache: dict = {}        # route_id -> (点数, 归一化坐标数组)
         self._gl_key: tuple | None = None
         self._gl_geom: tuple | None = None
         self._gl_tracks: list[_Track] = []
@@ -480,12 +481,49 @@ class RouteMapGlView(RouteMapView):
             self._gl_icons.append(obj)
         return obj
 
-    def _hover_key(self) -> tuple:
-        """悬停内容的指纹(文本 + 命中那一点)。
+    def _hit_points(self, rec) -> np.ndarray:
+        """轨迹的归一化坐标数组(悬停命中使用, 按点数缓存)。
 
-        悬停变化**不能**进 `_content_key`: 那会让鼠标在线上移动时每帧重建 64 条轨迹
-        (实测 150 ms 级), 表现就是“鼠标碰到线路卡一下”、播放时拖地图完全不跟手。
+        父类 `_hit_test` 是纯 Python 循环 + 每点 `_to_px()`(内部又重算地图尺寸),
+        64 条回放时一次鼠标移动要上百毫秒, 事件积压 → 手感就是“鼠标一段一段地跳”。
+        这里改成 numpy 批量算, 一次 1~2 ms。
         """
+        n = len(rec.points)
+        got = self._gl_hit_cache.get(rec.route_id)
+        if got is not None and got[0] == n:
+            return got[1]
+        xy = np.empty((n, 2), dtype=np.float64)
+        xy[:, 0] = [p.x for p in rec.points]
+        xy[:, 1] = [p.y for p in rec.points]
+        self._gl_hit_cache[rec.route_id] = (n, xy)
+        return xy
+
+    def _hit_test(self, mx: float, my: float):
+        """在显示中的轨迹里找离鼠标最近的采样点(口径与软件版一致: 半径 18px、最多 400 点/条)。"""
+        r = self._map_rect()
+        dw, dh = self._map_size()
+        if dw <= 0 or dh <= 0:
+            return None
+        mx, my = mx - r.left(), my - r.top()
+        best = None
+        best_d2 = rmv.HOVER_RADIUS ** 2
+        for rec in self._hover_candidates():
+            xy = self._hit_points(rec)
+            n = len(xy)
+            if n == 0:
+                continue
+            step = 1 if n <= 400 else n // 400      # 与软件版同一抽样规则
+            idx = np.arange(0, n, step)
+            dx = xy[idx, 0] * dw - mx
+            dy = xy[idx, 1] * dh - my
+            d2 = dx * dx + dy * dy
+            k = int(np.argmin(d2))
+            if d2[k] < best_d2:
+                best_d2 = float(d2[k])
+                best = (rec, rec.points[int(idx[k])])
+        return best
+
+    def _hover_key(self) -> tuple:
         pt = self._hover_pt
         return (self._hover_text,
                 None if pt is None else (round(float(pt.x), 7), round(float(pt.y), 7)),
@@ -1048,7 +1086,12 @@ class RouteMapGlView(RouteMapView):
 
     # ---------------------------------------------------- 每帧: 进度/闪烁/位置
     def _apply_progress(self) -> None:
-        """回放进度: 只改颜色切片(1~2 ms), 不重建几何。"""
+        """回放进度: 只改颜色切片(1~2 ms), 不重建几何。
+
+        必须同时处理**回退**: 播放结束后不点“结束播放”直接再按播放时, 头部回到 0,
+        上一轮画上去的彩色段如果不擦掉就会整条残留(用户 2026-10-22: “没有清除之前
+        残留的线路直接进行了播放, 有些没死亡的线路也没变灰”)。
+        """
         head = self._playhead
         playing = {id(r) for r in self._playback_recs}
         for tr in self._gl_tracks:
@@ -1070,6 +1113,12 @@ class RouteMapGlView(RouteMapView):
                 continue
             if id(tr.rec) in playing:
                 kseg = max(0, _bisect_time(pts, head) - 1)
+                if kseg < tr.drawn:
+                    # 回退(重播 / 往回拖): 把多出来的段擦成透明
+                    arr = tr.play.geometry.colors.data
+                    arr[2 * kseg:2 * tr.drawn] = 0.0
+                    tr.play.geometry.colors.update_range(2 * kseg, 2 * (tr.drawn - kseg))
+                    tr.drawn = kseg
                 if kseg > tr.drawn:
                     arr = tr.play.geometry.colors.data
                     arr[2 * tr.drawn:2 * kseg] = tr.colors[2 * tr.drawn:2 * kseg]
