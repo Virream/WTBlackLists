@@ -22,7 +22,7 @@ import os
 import time
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QFont, QIcon
+from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
     QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu,
@@ -440,6 +440,16 @@ class RouteTesterWindow(QMainWindow):
         header.setSectionResizeMode(_COL_TIME, QHeaderView.ResizeMode.ResizeToContents)
         header.setMinimumSectionSize(24)
         self.tree.setColumnWidth(_COL_EYE, EYE_COLUMN_WIDTH)
+        # 选中行不够显眼 → 把选中底色调**深**(系统默认的浅蓝高亮在两种主题下都偏淡)。
+        # 用 palette 而不是 QSS: QSS 的 `::item` 会接管单元格绘制, 容易连带改掉
+        # 交替行/图标/文字顏色; 只换 Highlight 两个颜色, 其余绘制保持系统原生。
+        pal = self.tree.palette()
+        # Active / Inactive 两组都要设: 窗口失焦时 Qt 用的是 Inactive.Highlight,
+        # 只设 Active 的话切出去再回来会看到浅灰高亮(实测取样仍是 #f3f3f3)。
+        for group in (QPalette.ColorGroup.Active, QPalette.ColorGroup.Inactive):
+            pal.setColor(group, QPalette.ColorRole.Highlight, QColor("#1d4ed8"))
+            pal.setColor(group, QPalette.ColorRole.HighlightedText, QColor("#f8fafc"))
+        self.tree.setPalette(pal)
         # 选中的条目决定「回放」播哪几条(可 Shift/Ctrl 多选);
         # 而「地图上有没有显示」完全由眼睛图标控制 —— 两者职责分开。
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
@@ -744,9 +754,6 @@ class RouteTesterWindow(QMainWindow):
                         f"A 队 {len(g.lives('A'))} 条 / B 队 {len(g.lives('B'))} 条\n"
                         f"标记: {g.mark_label or '(无 — 点「A/B 队录制」会新建一个条目)'}\n"
                         f"右键可标记为 A/B 队录制目标、清除标记或删除")
-        f = QFont()
-        f.setItalic(True)
-        item.setFont(_COL_NAME, f)
         parent.addChild(item)
         for side in GLOBAL_SIDES:
             lives = g.lives(side)
