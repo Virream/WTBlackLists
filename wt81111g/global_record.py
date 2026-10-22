@@ -56,6 +56,7 @@ import math
 from dataclasses import dataclass, field
 
 from .route_store import GlobalRecord, TrackPoint, UnitLife
+from .zones import SIDE_ENEMY, _color_of, side_of
 
 log = logging.getLogger("global_record")
 
@@ -416,6 +417,13 @@ def extract_units(objects) -> tuple[list[Unit], dict[tuple[str, str], int]]:
 
     坐标必须落在 0~1: 空中/无人机视角会带出机场附近 10 个 AI 防空
     (`Airdefence`, 坐标 2.9~3.4), 那种东西既不是玩家也会画到图外。
+
+    **敌方色的单位一律不要**(2026-10-22 用户实测): `/map_obj.json` 只给
+    “摄像机所在那一方”的单位, 但**死亡回放摄像机**会在我方全灭后接管并把镜头
+    移到敌方一辆车上 —— 那辆敌方车于是混进本队名单。而 8111 对它的 `color`
+    标得很清楚: 实测两次 B 队录制里都混进一条 `#fa0C00`(敌方红)的 A 队轻坦,
+    与本条目里 A 队同名线路逐点吻合(平均差 0.8m、时间偏移 +1.81s)。
+    直接按 `color` 过滤最简单, 而且零误伤(A 队那 28 条全是蓝/黄/绿)。
     """
     units: list[Unit] = []
     skipped: dict[tuple[str, str], int] = {}
@@ -435,8 +443,12 @@ def extract_units(objects) -> tuple[list[Unit], dict[tuple[str, str], int]]:
             key = (typ, icon or "-")
             skipped[key] = skipped.get(key, 0) + 1
             continue
-        units.append(Unit(typ=typ, icon=icon, color=str(obj.get("color") or ""),
-                          x=x, y=y))
+        color = _color_of(obj)
+        if side_of(color) == SIDE_ENEMY:
+            key = ("敌方色", icon or "-")
+            skipped[key] = skipped.get(key, 0) + 1
+            continue
+        units.append(Unit(typ=typ, icon=icon, color=color, x=x, y=y))
     return units, skipped
 
 

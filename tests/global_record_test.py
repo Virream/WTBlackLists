@@ -85,7 +85,23 @@ def test_filters():
     units, skipped = extract_units(objects)
     assert len(units) == 1 and units[0].x == 0.5, [u.x for u in units]
     assert ("Airdefence", "Airdefence") in skipped
-    results.append("全局录制: 单位过滤(地面/空中全跳过/静态/超界坐标) OK")
+
+    # 敌方色 → 一律不录(死亡回放摄像机把镜头移到敌方车上时会带进来)
+    # 实测两次 B 队录制都混进一条 #fa0C00 的 A 队轻坦, 与本条目 A 队同名线路
+    # 逐点吻合(平均差 0.8m) —— 8111 自己标了敌方色, 按 color 过滤即可。
+    red = tank(0.6, 0.6, color="#fa0C00", icon="LightTank")
+    units, skipped = extract_units([
+        tank(0.3, 0.3, color=BLUE),                     # 我方蓝 → 录
+        tank(0.4, 0.4, color="#faC81E", icon="Player"),  # 自己黄(摄像机所在) → 录
+        tank(0.5, 0.5, color="#67D756"),                 # 队友绿 → 录
+        red,                                            # 敌方红 → 跳过
+        {"type": "ground_model", "icon": "LightTank",    # color[] 数组形式的红
+         "x": 0.7, "y": 0.7, "color[]": [250, 12, 0]},
+    ])
+    assert len(units) == 3, [(u.x, u.color) for u in units]
+    assert units[-1].color != "#fa0C00"
+    assert skipped.get(("敌方色", "LightTank")) == 2, skipped
+    results.append("全局录制: 单位过滤(地面/空中全跳过/静态/超界坐标/敌方色) OK")
 
 
 # ---------------------------------------------------------------- 跟踪
