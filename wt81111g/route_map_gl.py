@@ -791,42 +791,60 @@ class RouteMapGlView(RouteMapView):
 
     # ---------------------------------------------------- 图元: 重生/战区/叉
     def _build_spawns(self) -> None:
-        """重生方块: 深色垫底(粗) + 归属色(细), 与软件版一致。"""
+        """重生方块: 深色垫底 + 归属色, 四条边直接用**实心四边形**拼出来。
+
+        2026-10-22 用户要求“框细一点、去掉圆角”。以前用 `LineSegmentMaterial` 画
+        四条独立线段 —— 厚线的**端帽**会往拐角外面伸出去, 看着就像圆角/毛边。
+        这里改成每条边一个四边形(端点各向外扩半个线宽, 四个角刚好闭合), 拐角就是
+        干净的直角, 线宽也精确到像素。
+        """
         if not self._show_spawns or not self._spawns:
             return
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
-        sx, sy = rmv.SPAWN_HALF / dw, rmv.SPAWN_HALF / dh
-        pos: list[float] = []
-        cols: list[float] = []
-        for s in self._spawns:
-            try:
-                x, y = float(s["x"]), 1.0 - float(s["y"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            col = _rgba(rmv.SPAWN_SIDE_COLORS.get(str(s.get("side") or "neutral"),
-                                                  rmv.SPAWN_SIDE_COLORS["neutral"]))
-            for a, b in (((x - sx, y - sy), (x + sx, y - sy)),
-                         ((x + sx, y - sy), (x + sx, y + sy)),
-                         ((x + sx, y + sy), (x - sx, y + sy)),
-                         ((x - sx, y + sy), (x - sx, y - sy))):
-                pos += [a[0], a[1], Z_SPAWN, b[0], b[1], Z_SPAWN]
-                cols += [*col, *col]
-        if not pos:
-            return
-        arr = np.array(pos, dtype=np.float32).reshape(-1, 3)
-        # 深色垫底: 比方块粗 1.4px(软件版 SPAWN_PEN + 1.4), 浅色底图上也能看清
-        self._add(gfx.Line(
-            gfx.Geometry(positions=arr.copy()),
-            gfx.LineSegmentMaterial(thickness=rmv.SPAWN_PEN + 1.4,
-                                    thickness_space="screen",
-                                    color=_rgba(QColor(15, 23, 42, 200)))), O_SPAWN)
-        self._add(gfx.Line(
-            gfx.Geometry(positions=arr,
-                         colors=np.array(cols, dtype=np.float32).reshape(-1, 4)),
-            gfx.LineSegmentMaterial(thickness=rmv.SPAWN_PEN, thickness_space="screen",
-                                    color_mode="vertex")), O_SPAWN)
+        hx, hy = rmv.SPAWN_HALF / dw, rmv.SPAWN_HALF / dh
+        dark = _rgba(QColor(15, 23, 42, 200))
+
+        def build(half_pen: float, color=None):
+            """所有方块的四条边 → (顶点, 顶点色)。`color` 为空时用各自的归属色。"""
+            tx, ty = half_pen / dw, half_pen / dh
+            pos: list[tuple[float, float, float]] = []
+            cols: list[tuple[float, float, float, float]] = []
+            for s in self._spawns:
+                try:
+                    x, y = float(s["x"]), 1.0 - float(s["y"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                col = color or _rgba(rmv.SPAWN_SIDE_COLORS.get(
+                    str(s.get("side") or "neutral"),
+                    rmv.SPAWN_SIDE_COLORS["neutral"]))
+                x0, x1 = x - hx, x + hx
+                y0, y1 = y - hy, y + hy
+                # 上/下边: 横向长条; 左/右边: 竖向长条(两端各外扩 tx/ty)
+                for xa, xb, ya, yb in ((x0 - tx, x1 + tx, y1 - ty, y1 + ty),
+                                       (x0 - tx, x1 + tx, y0 - ty, y0 + ty),
+                                       (x0 - tx, x0 + tx, y0 - ty, y1 + ty),
+                                       (x1 - tx, x1 + tx, y0 - ty, y1 + ty)):
+                    for px, py in ((xa, ya), (xb, ya), (xb, yb),
+                                   (xa, ya), (xb, yb), (xa, yb)):
+                        pos.append((px, py, Z_SPAWN))
+                        cols.append(col)
+            return (np.array(pos, dtype=np.float32).reshape(-1, 3),
+                    np.array(cols, dtype=np.float32).reshape(-1, 4))
+
+        for half_pen, color in ((rmv.SPAWN_DARK_PEN / 2.0, dark),
+                                (rmv.SPAWN_PEN / 2.0, None)):
+            pos, cols = build(half_pen, color)
+            if not len(pos):
+                return
+            self._add(gfx.Mesh(
+                gfx.Geometry(positions=pos, colors=cols,
+                             # pygfx 的 mesh 管线要求 indices 存在, 且形状是 (N,3)
+                             indices=np.arange(len(pos), dtype=np.int32).reshape(-1, 3)),
+                gfx.MeshBasicMaterial(color_mode="vertex",
+                                      # 双面: 四边形是手拼的, 万一绕向反了也不至于整片消失
+                                      side="both")), O_SPAWN)
 
     def _build_zones(self) -> None:
         """战区: 菱形**填充** + 深色 3.4px 描边 + 白色 1.6px 描边 + 中心字母。

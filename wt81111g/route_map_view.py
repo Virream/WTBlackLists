@@ -82,7 +82,11 @@ ZONE_DARK = QColor(15, 23, 42)    # 变暗时拉向的底色(与界面同色系)
 # 重生位置: **空心方块** —— 颜色与战区同一套(蓝=我方, 红=敌方)
 SPAWN_SIDE_COLORS = ZONE_SIDE_COLORS
 SPAWN_HALF = 3.4          # 方块半边长(px): 一个位置一个小方块, 连成一片就是重生区域
-SPAWN_PEN = 1.7
+# 2026-10-22 用户要求“框细一点、去掉圆角”: 1.7 → 1.0, 垫底的深色也收窄到 2.0。
+# 去圆角靠的是“拐角处不允许段端帽伸出去”—— 软件版关掉抗锯齿(矩形轴对齐, 直角依然清楚),
+# GPU 版直接把四条边拼成四边形(见 `RouteMapGlView._build_spawns`)。
+SPAWN_PEN = 1.0
+SPAWN_DARK_PEN = 2.0
 
 
 def _blend(color: QColor, rgb: tuple[int, int, int], k: float) -> QColor:
@@ -1862,14 +1866,18 @@ class RouteMapView(QWidget):
         paths = self._spawn_paths()
         if not paths:
             return
+        # 方块是**轴对齐**的矩形: 关掉抗锯齿后拐角才是干净的直角(开着会糊成圆角)
+        p.save()
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         p.setBrush(Qt.BrushStyle.NoBrush)      # 空心
-        p.setPen(QPen(dark, SPAWN_PEN + 1.4))
+        p.setPen(QPen(dark, SPAWN_DARK_PEN))
         for path in paths.values():
             p.drawPath(path)
         for side, path in paths.items():
             color = SPAWN_SIDE_COLORS.get(side, SPAWN_SIDE_COLORS["neutral"])
             p.setPen(QPen(color, SPAWN_PEN))
             p.drawPath(path)
+        p.restore()
 
     def _spawn_paths(self) -> dict[str, QPainterPath]:
         """重生方块按归属色分堆的路径 —— 缓存(只跟缩放/尺寸/方块内容有关)。
