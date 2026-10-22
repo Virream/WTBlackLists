@@ -34,8 +34,10 @@ def about_html(bindings: dict | None = None) -> str:
     <a href="{AUTHOR_BILI}" style="color:#7ec8e3;">B站</a> ·
     <a href="{AUTHOR_GITHUB}" style="color:#7ec8e3;">GitHub</a></p>
 
-<h3>这一版新增了什么</h3>
+<h3>这一版的变化</h3>
 <ul>
+<li><b>回放不再整片卡顿</b>: 以前每次战区易手都会把全部线路重算一遍(GPU 版单帧
+    200+ ms), 现在只换那几面旗子 —— 单帧最慢 239 ms → 7.8 ms;</li>
 <li><b>A/B 队全局录制</b>: 把一整局所有玩家的线路录下来, 分两队、按绝对时间轴回放;</li>
 <li><b>阵亡时刻修正</b>: 用 <code>/hudmsg</code> 把观战对象(摄像机挂着那位)的真实阵亡
     时刻补回来, 一局死几次就修几条线(见下面“那两位玩家的死亡时刻是怎么补出来的”);</li>

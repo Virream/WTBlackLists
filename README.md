@@ -100,7 +100,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 > 本仓库还保留一份**跑图线路测试器**的代码(`route_tester.py` + `build_route_tester.ps1`):
 > 它是另一个独立程序(记录"重生后多久到达某位置"), 已单独发布在
-> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.1.0**)。
+> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.1.1**)。
 > 主要能力: 单条线路录制(速度配色 / 标记 / 转弯半径)、**A/B 队全局录制**(整局所有玩家
 > 的线路, 分两队按绝对时间轴回放)、**阵亡时刻修正**(用 `/hudmsg` 补回观战对象的真实死亡
 > 时刻)、录制叠加层(实际采样率 / 轮询频率)、地图与战区缓存与回放。
