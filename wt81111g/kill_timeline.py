@@ -38,6 +38,10 @@ MATCH_TOL = 2.0              # 配对容差(秒): 两队时间轴本身还差 1~
 SEARCH_SPAN = 90.0           # 平移量搜索范围 ±90 秒
 SEARCH_STEP = 0.1
 DEAD_EPS = 1e-4              # 判定"位置没变"的阈值(归一化坐标 ≈ 0.4m)
+# 静默线路"最后移动之后至少静止这么久"才可能是残骸(死亡后不动)。
+# 真活到最后的玩家一直在跑, 这个差值接近 0。取 5 秒: 停着守点的车也可能静止很久,
+# 所以它只用来**排除真活跃的线**, 不下"它一定死了"的结论。
+STATIC_MIN = 5.0
 
 
 def clean_text(text) -> str:
@@ -217,41 +221,49 @@ def describe(report: dict) -> str:
     if not kills:
         return "hudmsg 里没有本局的击毁消息(抓取失败或这局没人阵亡)"
     parts = [
-        "击毁 %d 条 / 与线路结束配对 %d 条 (偏移 %+.1fs)"
+        "击毁 %d 条(含对空, 只用于对齐) / 与线路结束配对 %d 条 (偏移 %+.1fs)"
         % (len(kills), len(pairs), report.get("offset") or 0.0),
+        "未配对击毁 %d 条(含对空击杀, 不作为候选)" % len(unmatched),
     ]
-    if unmatched:
-        parts.append("未配对击毁时刻 %s" % ", ".join("%.0fs" % t for t in unmatched[:6]))
-    else:
-        parts.append("未配对击毁 0 条")
     if silent:
         parts.append("活到最后的线路 %d 条: %s"
                      % (len(silent),
-                        ", ".join("%s(末 %.0fs, 最后移动 %.0fs)"
-                                  % (lid.split(":")[-1], t1, lm or 0.0)
+                        ", ".join("%s(末 %.0fs, 最后移动 %.0fs, 静止 %.0fs %s)"
+                                  % (lid.split(":")[-1], t1, lm or 0.0,
+                                     (t1 - (lm or t1)),
+                                     "可判定" if (lm is not None
+                                                and (t1 - lm) >= STATIC_MIN)
+                                     else "在动")
                                   for lid, t1, lm in silent[:6])))
     return " | ".join(parts)
 
 
-def pick_death_times(report: dict) -> list[tuple[str, float]]:
-    """把"未配对的击毁时刻"分配给"活到最后的线路"。
+def pick_death_times(report: dict, tol: float = MATCH_TOL) -> list[tuple[str, float]]:
+    """给"死后的残骸"型静默线路找死亡时刻。
 
-    规则(尽量保守): 对每条未配对击毁, 找**最后移动时刻**最接近的那条静默线路,
-    距离超过 `MATCH_TOL*2` 就不认。返回 `[(life_id, 推算死亡时刻)]`。
+    **不从"未配对击毁"里挑** —— `hudmsg` 含**对空击杀**(玩家打飞机、飞机互咬),
+    而我们只录地面单位, 未配对的数量会远超"每队 1 条", 拿它当候选会被污染。
+    改为: 对每条静默线路, 直接用它的"最后移动时刻"去 hudmsg 里找映射后最近的击毁。
+
+    只认"`t1 - 最后移动时刻 >= STATIC_MIN`"的线 —— 那是**死后残骸不再移动**的特征;
+    真活到最后的玩家一直在动, 这个差值接近 0, 不会被误改。
     """
+    offset = report.get("offset") or 0.0
+    kills = [k["t"] for k in (report.get("kills") or [])]
+    used: set[float] = set()
     out: list[tuple[str, float]] = []
-    silent = list(report.get("silent") or [])
-    tol = MATCH_TOL * 2
-    for kill_t in report.get("unmatched") or []:
-        want = kill_t + (report.get("offset") or 0.0)
+    for lid, t1, lm in report.get("silent") or []:
+        if lm is None or (t1 - lm) < STATIC_MIN:
+            continue                      # 一直在动 → 真活着, 不动它
+        want = lm - offset                # end ≈ kill + offset → kill = end - offset
         best = None
-        for lid, t1, lm in silent:
-            if lm is None:
-                continue
-            d = abs(lm - want)
+        for t in kills:
+            if t in used:
+                continue                  # 一条击毁只能对应一条线路
+            d = abs(t - want)
             if d <= tol and (best is None or d < best[0]):
-                best = (d, lid, lm)
+                best = (d, t)
         if best is not None:
-            silent = [s for s in silent if s[0] != best[1]]
-            out.append((best[1], best[2]))
+            used.add(best[1])
+            out.append((lid, lm))
     return out

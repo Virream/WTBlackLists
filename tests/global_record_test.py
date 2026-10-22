@@ -919,23 +919,30 @@ def test_kill_timeline():
     rec2.sides["A"] = [life("A1", "A", 10.0, True),
                        life("A2", "A", 30.0, True),
                        life("A3", "A", 100.0, False, last_move=70.0)]
-    # B 队: 一条正常阵亡(50s)
-    rec2.sides["B"] = [life("B1", "B", 50.0, True)]
-    # hudmsg: 比赛秒数比我们的 t 小 5 秒 → 偏移 +5
+    # B 队: 一条正常阵亡(50s) + 一条"真活到最后"(一直在动 → 不能判死)
+    rec2.sides["B"] = [life("B1", "B", 50.0, True),
+                       life("B2", "B", 100.0, False, last_move=99.0)]
+    # hudmsg: 比赛秒数比我们的 t 小 5 秒 → 偏移 +5;
+    # 另外混进一条"对空击杀"(我们不录空中单位), 它不该影响配对与判定。
     rec2.kills = [{"id": 100 + i, "t": t, "msg": "x (载具) 击毁了 y (载具)"}
                   for i, t in enumerate([5.0, 25.0, 45.0, 65.0])]
+    rec2.kills.append({"id": 200, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"})
 
     report = kt.analyze(rec2)
     assert abs(report["offset"] - 5.0) < 0.2, report["offset"]
     assert len(report["pairs"]) == 3, report["pairs"]     # 10/30/50 都能配上
-    assert report["unmatched"] == [65.0], report["unmatched"]
-    assert [s[0] for s in report["silent"]] == ["A3"], report["silent"]
+    assert 65.0 in report["unmatched"], report["unmatched"]   # 那位玩家的死亡
+    assert 33.0 in report["unmatched"], report["unmatched"]   # 对空击杀也在"未配对"里
+    silent_ids = [s[0] for s in report["silent"]]
+    assert silent_ids == ["A3", "B2"], report["silent"]
 
-    # ---- 4) 未配对的击毁 → 分配给"最后移动时刻"最接近的静默线路
+    # ---- 4) 只修"死后残骸不动"的那条: A3(静止 30s) 能命中; B2(一直在动) 不动
     picked = kt.pick_death_times(report)
     assert picked == [("A3", 70.0)], picked
     text = kt.describe(report)
-    assert "未配对击毁时刻 65s" in text and "A3" in text, text
+    assert "A3" in text and "可判定" in text, text
+    assert "B2" in text and "在动" in text, text
+    assert "含对空" in text, text
     results.append("全局录制: hudmsg 击毁时刻能反推摄像机那位玩家的死亡时刻 OK")
 
 
