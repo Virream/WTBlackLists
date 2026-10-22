@@ -1102,22 +1102,57 @@ class RouteTesterWindow(QMainWindow):
         return out
 
 
+    def _life_owner(self, life) -> GlobalRecord | None:
+        """全局线路(`UnitLife`)所属的全局条目(找不到返回 None)。"""
+        lid = getattr(life, "life_id", "")
+        if not lid:
+            return None
+        for g in self.store.globals:
+            for side in GLOBAL_SIDES:
+                if any(lf.life_id == lid for lf in g.lives(side)):
+                    return g
+        return None
+
     def _zone_signature_for_view(self) -> str:
         """当前视图(回放中的 / 眼睛点亮的轨迹)对应的模式指纹(取不到就空串)。
 
         多条轨迹时只在它们指纹一致时才返回 —— 否则无法决定画哪套战区。
-        全局线路(UnitLife)**没有** `zone_signature`, 直接跳过(它们不影响战区选择)。
+
+        2026-10-22 修: 全局线路(`UnitLife`)**自己没有** `zone_signature`,
+        以前这里直接把它当空串跳过 → `layout_for(key, "")` 退化成 `layouts[0]`,
+        于是回放 AB 队录制的线路时画的是**单条路线录制时**那套战区位置。
+        现在对全局线路反查它所属的 `GlobalRecord.zone_signature`。
         """
         recs = self.map_view.playback_records or self.map_view.visible_tracks
         sigs = {s for r in recs if (s := getattr(r, "zone_signature", ""))}
-        return sigs.pop() if len(sigs) == 1 else ""
+        if len(sigs) == 1:
+            return sigs.pop()
+        if sigs:
+            return ""                    # 多条轨迹模式不一致 → 无法决定
+        gsigs: set[str] = set()          # 全是全局线路 → 问它们所属的条目
+        for r in recs:
+            owner = self._life_owner(r)
+            if owner is not None and owner.zone_signature:
+                gsigs.add(owner.zone_signature)
+        return gsigs.pop() if len(gsigs) == 1 else ""
+
+    def _playback_global(self) -> GlobalRecord | None:
+        """回放中若含全局线路, 返回它们所属的全局条目(用于取战区时间轴)。"""
+        for r in self.map_view.playback_records:
+            owner = self._life_owner(r)
+            if owner is not None:
+                return owner
+        return None
 
     def _apply_zones(self, info: dict | None = None) -> None:
         """决定地图上画哪套战区(小菱形 + A/B/C)。
 
-        战局内且 8111 正在给同一张图 → 用**实时**战区;
-        其它情况(游戏关了/在看缓存底图) → 用该地图存过的布局:
-        优先匹配“正在看的轨迹的模式指纹”, 没有就取最近一次见过的。
+        优先级:
+        1. **回放全局录制** → 用录像里记的战区状态时间轴(归属变化、占领中都能重现);
+           这是 2026-10-22 用户要求的: 回放 AB 队线路时不该显示当前战局/别的录像的战区;
+        2. 战局内且 8111 正在给同一张图 → 用**实时**战区;
+        3. 其它(游戏关了/在看缓存底图) → 用该地图存过的布局:
+           优先匹配“正在看的轨迹的模式指纹”, 没有就取最近一次见过的。
         """
         key = self.map_view.map_key
         if not key:
@@ -1125,15 +1160,26 @@ class RouteTesterWindow(QMainWindow):
         recorder = getattr(self, "recorder", None)
         live = list((info or {}).get("zones") or [])
         live_spawns = list((info or {}).get("spawns") or [])
+        layout = self.store.layout_for(key, self._zone_signature_for_view())
+        # 1) 回放全局录制: 按 playhead 取当时的战区快照
+        if self._in_playback():
+            g = self._playback_global()
+            snap = g.zone_state_at(self.player.time) if g is not None else None
+            if snap:
+                self.map_view.set_zones(snap)
+                self.map_view.set_spawns(spawns_to_json(ground_spawns(
+                    spawns_from_json((layout or {}).get("spawns")))))
+                return
         if live and recorder is not None and recorder.map_key == key:
             self.map_view.set_zones(zones_to_json(live))
             # 只画**地面**重生位置(空军的 fighter/bomber/ucav 也记了, 但地图上不画)
             self.map_view.set_spawns(spawns_to_json(ground_spawns(live_spawns)))
             return
-        # 旧布局: 只画字母 + 中立色 —— 当时谁占着哪个战区早已过期, 不拿来误导
-        layout = self.store.layout_for(key, self._zone_signature_for_view())
+        # 旧布局: 位置 + 当时存下的归属色(用户 2026-10-22 要求把归属显示回来;
+        # `blink` 不存也不画 —— 那只是那一刻"正在被占领"的瞬时状态)
         self.map_view.set_zones([
-            {"label": z.get("label"), "x": z.get("x"), "y": z.get("y")}
+            {"label": z.get("label"), "x": z.get("x"), "y": z.get("y"),
+             "color": z.get("color"), "side": z.get("side")}
             for z in (layout or {}).get("zones") or []
         ])
         # 重生位置: 存过就画(同一张图不同版本存的是各自的那份)
@@ -2002,6 +2048,9 @@ class RouteTesterWindow(QMainWindow):
         """
         self._ensure_map_for(list(recs) if isinstance(recs, (list, tuple)) else [recs])
         self.player.load(recs)
+        # 战区要跟着这次回放的**对象**换: 全局线路用条目自己的布局/时间轴,
+        # 单条轨迹用它录的那套(见 `_apply_zones`) —— 否则会留着上一批线路的战区
+        self._apply_zones()
         self._update_buttons()
         self._set_status(
             f"回放模式({len(self.player.records)} 条): 其余功能已暂停使用, "
@@ -2055,9 +2104,25 @@ class RouteTesterWindow(QMainWindow):
         """兼容旧调用点: 实质上重新计算全部控件状态。"""
         self._update_buttons()
 
+    def _sync_playback_zones(self, t: float) -> None:
+        """回放全局录制时, 把战区状态跟着时间轴一起推进。
+
+        用户 2026-10-22 要求: 回放 AB 队线路时要能看到当时战区被谁占着、
+        哪个正在被占领 —— 而不是一张与录像无关的静态布局(甚至是**另一个区域**
+        的布局: 全局录像和单条路线可能根本不在同一片交战区)。
+        `set_zones` 自己会去重, 所以每帧调用只是几次列表比较。
+        """
+        g = self._playback_global()
+        if g is None:
+            return
+        snap = g.zone_state_at(t)
+        if snap:
+            self.map_view.set_zones(snap)
+
     def _on_playback_progress(self, t: float) -> None:
         recs = self.player.records
         self.map_view.set_playback(recs, t)
+        self._sync_playback_zones(t)
         if recs:
             n = f"  ({len(recs)} 条)" if len(recs) > 1 else ""
             self.lbl_play.setText(

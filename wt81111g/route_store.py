@@ -287,6 +287,33 @@ class GlobalRecord:
     duration: float = 0.0
     marks: list[str] = field(default_factory=list)
     sides: dict[str, list[UnitLife]] = field(default_factory=lambda: {"A": [], "B": []})
+    # 战区状态**时间轴**: [{"t": 秒, "zones": [{label,x,y,side,color,blink}]}]
+    # 只在“归属变了或开始/结束被占领”时记一条(见 `RouteRecorder._record_zone_state`),
+    # 回放时按时间取最近一条 → 战区能重现当时的蓝/红/占领中, 而不是一张静态快照。
+    # 旧数据没有这个字段 → 回放退回静态布局(取 `layout_for`)。
+    zone_states: list[dict] = field(default_factory=list)
+
+    def zone_state_at(self, t: float) -> list[dict] | None:
+        """取回放时刻 `t` 的战区快照(没有时间轴返回 None)。
+
+        用时间轴里 `<= t` 的最后一条 —— 战区状态是“阶毯式”变化(只在不连续时刻变),
+        用“最近的前一条”才是当时真实的样子; 取最近的一条(不管是前是后)会在
+        占领发生**之前**就先把颜色改了。
+        """
+        states = self.zone_states
+        if not states:
+            return None
+        lo, hi, best = 0, len(states) - 1, -1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if float(states[mid].get("t") or 0.0) <= t:
+                best, lo = mid, mid + 1
+            else:
+                hi = mid - 1
+        if best < 0:
+            best = 0                     # 早于第一条 → 用第一条(录制开始那一刻)
+        zones = states[best].get("zones")
+        return list(zones) if isinstance(zones, list) else None
 
     @property
     def label(self) -> str:
@@ -352,6 +379,7 @@ class GlobalRecord:
             "mode_name": self.mode_name,
             "duration": self.duration,
             "marks": list(self.marks),
+            "zone_states": self.zone_states,
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -374,6 +402,18 @@ class GlobalRecord:
         except (KeyError, TypeError, ValueError) as exc:
             log.warning("跳过损坏的全局录制记录: %s", exc)
             return None
+        for row in data.get("zone_states") or []:
+            if not isinstance(row, dict):
+                continue
+            zones = row.get("zones")
+            if not isinstance(zones, list) or not zones:
+                continue
+            try:
+                t = float(row.get("t") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            rec.zone_states.append({"t": t, "zones": [z for z in zones
+                                                       if isinstance(z, dict)]})
         for side, rows in (data.get("sides") or {}).items():
             if side not in GLOBAL_SIDES or not isinstance(rows, list):
                 continue
@@ -1039,13 +1079,22 @@ class RouteStore:
         return list(self.map_zones.get(map_key) or [])
 
     def layout_for(self, map_key: str, signature: str = "") -> dict | None:
-        """取某地图的战区布局: 优先精确匹配指纹, 否则用最新见过的那张。"""
+        """取某地图的战区布局: 优先精确匹配指纹, 否则用**最近见过**的那张。
+
+        2026-10-22 修正: 回退原先取 `layouts[0]`, 但那只是“最后**新出现**的布局” ——
+        `remember_zones` 只在新布局插入队首, 老布局被再次看到时仅刷新 `seen_at`,
+        于是用户先录一张单路的“区域 1”再录 AB 队的“区域 2”(区域 2 历史上见过),
+        回放 AB 队时却拿到“区域 1”的战区位置。改为按 `seen_at` 取最新的。
+        """
         layouts = self.map_zones.get(map_key) or []
         if signature:
             for item in layouts:
                 if item.get("sig") == signature:
                     return item
-        return layouts[0] if layouts else None
+        if not layouts:
+            return None
+        # seen_at 是 `%Y-%m-%dT%H:%M:%S` 字串, 字典序即时间序
+        return max(layouts, key=lambda it: str(it.get("seen_at") or ""))
 
     def grouped_by_mode(self) -> dict[str, list[tuple[str, list[RouteRecord]]]]:
         """{地图键: [(模式名, [轨迹...]), ...]} —— 侧栏三层树用。

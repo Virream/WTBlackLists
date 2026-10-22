@@ -42,9 +42,12 @@ from .route_store import (
 )
 from .zones import Zone, mode_name as zone_mode_name, signature as zones_signature
 from .zones import (Spawn, spawn_state, spawn_summary, spawns_from_objects, zone_state,
-                    zones_from_objects)
+                    zones_from_objects, zones_to_json)
 
 log = logging.getLogger("route_recorder")
+
+# 全局录制里战区状态时间轴的条数上限(正常一局只有几十条; 异常时也不写爆数据)
+MAX_ZONE_STATES = 4000
 
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
@@ -183,6 +186,8 @@ class RouteRecorder(QObject):
         self._spawns: list[Spawn] = []  # 重生位置(respawn_base_*)
         self._spawns_state: tuple = ()
         self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
+        # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
+        self._zone_state_key: tuple | None = None
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -634,6 +639,9 @@ class RouteRecorder(QObject):
         self._tracker = GlobalTracker(rec, side, map_size=self._map_size)
         self._global_waiting = True
         self._global_t0 = 0.0
+        self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
+        if created:
+            rec.zone_states = []
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
         self._map_lock = True
         self._map_info_at = 0.0          # 下一次 tick 立刻取一次地图边长
@@ -670,6 +678,7 @@ class RouteRecorder(QObject):
             self._do_global_stop()
             return max(0.0, elapsed)
         rec.duration = elapsed
+        self._record_zone_state(rec, elapsed)
         # 点录制时可能还没拿到战区(进图瞬间) → 一旦知道就把模式/布局补进条目,
         # 否则它会被归到“未知位置”那个版本组里
         if not rec.zone_signature and self._zones_sig:
@@ -677,6 +686,38 @@ class RouteRecorder(QObject):
             rec.zone_count = len(self._zones)
             rec.mode_name = self.mode_name
         return elapsed
+
+    def _record_zone_state(self, rec, elapsed: float) -> None:
+        """把战区状态的**变化**记进 `rec.zone_states` 时间轴(回放用)。
+
+        用户 2026-10-22 要求: 回放 AB 队录像时战区要能重现当时的归属(蓝/红)
+        与“正在被占领”, 而不是一张与录像无关的静态布局。8111 每帧都会给归属色,
+        但直接每帧存一条会让 routes.json 膨胀得没法看, 所以只在**下面三件事之一
+        变了**才记一条:
+
+        * 归属变了(我方 ↔ 敌方 ↔ 中立);
+        * 开始/结束被占领(`blink > 0` 的布尔位变了);
+        * 战区集合本身变了(换布局、数量变)。
+
+        `blink` 在 1 / 2 之间跳变属于“同一个占领过程”, 不当成变化 —— 否则一个
+        占领会造成每秒好几条记录。回放时取 `<= playhead` 的最后一条, 于是整段
+        占领期间都保持脉冲动画, 与实际观感一致。
+        """
+        zones = self._zones
+        if not zones:
+            return
+        key = tuple((z.label, round(z.x, 5), round(z.y, 5), z.side,
+                     1 if z.blink else 0) for z in zones)
+        if key == self._zone_state_key:
+            return
+        self._zone_state_key = key
+        # 兜底上限: 正常一局只有几十条; 真遇到异常(比如坐标系抖动)也不要写爆
+        if len(rec.zone_states) >= MAX_ZONE_STATES:
+            return
+        rec.zone_states.append({
+            "t": round(elapsed, 2),
+            "zones": zones_to_json(zones),
+        })
 
     def _do_global_stop(self) -> None:
         """结束全局录制并落盘。一条线都没录到 → 撤销(新建的删掉/重录的恢复原状)。"""
@@ -691,6 +732,7 @@ class RouteRecorder(QObject):
         self._global = None
         self._tracker = None
         self._global_waiting = False
+        self._zone_state_key = None
         self._map_lock = False
         self._map_digest = None          # 解锁后重新判断一次当前地图(可能已回到车库)
         if skipped:

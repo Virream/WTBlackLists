@@ -801,6 +801,77 @@ def test_playback_timeline():
     results.append("全局录制回放: 时间轴按绝对时刻(02:00 开始的线路也会动) OK")
 
 
+def test_zone_layout_pick(tmpdir: str):
+    """回放 AB 队线路时必须用**全局条目自己**的战区布局(可能是另一个交战区)。
+
+    用户 2026-10-22 实测: 同一张图先录了 3 条单路(交战区 #新), 之后录 AB 队全局
+    (#旧, **另一个区域**)。回放 AB 队时地图上画的是单路那套战区位置 —— 因为
+    `_zone_signature_for_view()` 把 `UnitLife` 当“没有指纹”跳过, 于是
+    `layout_for(key, "")` 回退到 `layouts[0]`(最后**新出现**的那套 = 单路的)。
+    顺带验证: 战区归属要跟着回放时间轴推进, 而不是一张静态快照。
+    """
+    from wt81111g.zones import Zone
+    from wt81111g.zones import signature as zone_sig
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "zones_win.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+
+    def zones(points):
+        return [Zone(label=label, x=x, y=y) for label, x, y in points]
+
+    old_pts = [("A", 0.30, 0.30), ("B", 0.40, 0.40), ("C", 0.50, 0.50)]  # AB 队区域
+    new_pts = [("A", 0.70, 0.70), ("B", 0.80, 0.80), ("C", 0.90, 0.90)]  # 单路区域
+    old_sig, new_sig = zone_sig(zones(old_pts)), zone_sig(zones(new_pts))
+    assert old_sig != new_sig, "构造失败: 两套布局指纹居然一样"
+
+    win.store.remember_zones("MAPZ", zones(old_pts))     # 先看到的老布局
+    win.store.remember_zones("MAPZ", zones(new_pts))     # 后看到的新布局 → 队首
+    assert win.store.map_zones["MAPZ"][0]["sig"] == new_sig, "构造失败: 新布局应在队首"
+
+    g = win.store.new_global("MAPZ", "地图 Z", zone_count=3,
+                             zone_signature=old_sig, mode_name="战区控制")
+    # 战区状态时间轴: 0s 中立 → 5s 我方占领
+    g.zone_states = [
+        {"t": 0.0, "zones": [{"label": "A", "x": 0.30, "y": 0.30,
+                              "side": "neutral", "color": "#ffFFFA", "blink": 0}]},
+        {"t": 5.0, "zones": [{"label": "A", "x": 0.30, "y": 0.30,
+                              "side": "ours", "color": "#174DFF", "blink": 0}]},
+    ]
+    for k in range(2):
+        g.sides["A"].append(UnitLife(
+            life_id=f"{g.route_id}:A{k}", icon="MediumTank", obj_type="ground_model",
+            map_key="MAPZ",
+            points=[TrackPoint(0.3, 0.3, 0.0), TrackPoint(0.4, 0.4, 8.0)]))
+    win.store.add_global(g)
+    win._reload_tree()
+    app.processEvents()
+
+    win._load_playback(list(g.lives("A")))
+    app.processEvents()
+    assert win._in_playback()
+
+    # 指纹必须是 AB 队那个区域, 而不是“最后新出现”的单路那套
+    assert win._zone_signature_for_view() == old_sig, win._zone_signature_for_view()
+
+    win.map_view.set_map_bytes(png_bytes(), key="MAPZ")
+    win.player.seek(0.0)
+    app.processEvents()
+    got = win.map_view.zones
+    assert got and abs(got[0]["x"] - 0.30) < 1e-6, f"战区位置应取自 AB 队布局: {got}"
+    assert got[0]["side"] == "neutral", got
+
+    win.player.seek(6.0)                    # 越过 5s 那条 → 归属变成我方
+    app.processEvents()
+    assert win.map_view.zones[0]["side"] == "ours", "回放应跟着时间轴推进战区归属"
+
+    win._end_playback()
+    app.processEvents()
+    results.append("全局录制回放: 战区用条目自己的布局(不是最新那套) + 归属随时间轴变化 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -816,6 +887,7 @@ def main() -> int:
     test_map_paint()
     test_live_layer_no_rebuild()
     test_playback_timeline()
+    test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)
     test_buttons_and_map_lock(tmpdir)
