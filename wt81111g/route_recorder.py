@@ -35,6 +35,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from .api8111 import WT8111
 from .config import WT_BASE_URL
 from .global_record import DEFAULT_MAP_SIZE, GlobalTracker, extract_units
+from . import kill_timeline
 from .map_cache import MapCache
 from .route_store import (
     GLOBAL_SIDES, PLACEHOLDER_MAP_KEY, PLACEHOLDER_MAP_SHA1, GlobalRecord, RouteMark,
@@ -188,6 +189,8 @@ class RouteRecorder(QObject):
         self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
         # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
         self._zone_state_key: tuple | None = None
+        # 全局录制开始时抓到的 /hudmsg 游标(录制结束后据它取增量击毁消息)
+        self._hud_cursor = 0
         # 最近 2 秒内的**实际采样时刻**: 叠加层要显示“每秒真的写入了几个轨迹点”
         # (它和 8111 轮询频率不是一回事 —— 采样还要过“采样间隔 + 最小位移”两道闸)
         self._pt_times: deque[float] = deque()
@@ -647,6 +650,11 @@ class RouteRecorder(QObject):
         self._global_waiting = True
         self._global_t0 = 0.0
         self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
+        # 抓一次 /hudmsg 的游标: 录制结束后取增量, 用来反推"摄像机挂着那位玩家"
+        # 到底什么时候死的(他的 icon 永远不会消失, 见 `kill_timeline` 模块说明)。
+        # 只在开/停各抓一次, 不是持续轮询 —— 对游戏几乎无影响。
+        self._hud_cursor = kill_timeline.read_cursor(self.client)
+        log.info("全局录制: hudmsg 游标 = %d", self._hud_cursor)
         if created:
             rec.zone_states = []
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
@@ -769,6 +777,7 @@ class RouteRecorder(QObject):
             return
         rec.sides[side] = lives          # 重录 = 整队替换
         rec.duration = duration
+        self._collect_kills(rec)
         self.store.save()
         self._global_prev_lives = []
         log.info("全局录制完成: %s %s 队 %d 条线路, 用时 %.1fs",
@@ -777,6 +786,44 @@ class RouteRecorder(QObject):
         log.info("全局录制 时间轴: %s", rec.timeline_note())
         self.global_finished.emit(rec, side)
 
+    def _collect_kills(self, rec) -> None:
+        """录制结束: 取本局新增的击毁消息, 并做一次"时间差对齐"分析。
+
+        **只写日志, 不改任何 `dead` 判定** —— 先用真实数据确认"每队恰好漏一条"
+        这个假设与对齐命中率, 再决定要不要真的去补死亡时刻。
+
+        为什么要等两队都录完才分析: A/B 是两次独立观战, 每队各有一位玩家被摄像机
+        挂着(他的 icon 永不消失), 所以要把两队线路的结束时刻**合在一起**才凑得出
+        完整的"击毁事件模式"。理论上最多找到 2 条对不上的击毁(两人都在结束前死),
+        最少 0 条(两人都活到最后)。
+        """
+        try:
+            new = kill_timeline.read_new_kills(self.client, self._hud_cursor)
+        except Exception as exc:  # noqa: BLE001 - 抓不到也不能影响落盘
+            log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
+            new = []
+        if new:
+            known = {int(k.get("id") or 0) for k in rec.kills}
+            for row in new:
+                if int(row["id"]) not in known:
+                    rec.kills.append(row)
+            known = {int(k.get("id") or 0) for k in rec.kills}
+            rec.kills = [k for k in rec.kills if int(k.get("id") or 0) in known]
+            log.info("全局录制: 本局新增击毁消息 %d 条(累计 %d 条)",
+                     len(new), len(rec.kills))
+        else:
+            log.info("全局录制: hudmsg 没有新击毁消息(累计 %d 条)", len(rec.kills))
+        sides_done = [s for s in GLOBAL_SIDES if rec.lives(s)]
+        if len(sides_done) < 2:
+            log.info("全局录制: 只录了 %s 队, 等另一队也录完后再做死亡时刻对齐",
+                     "/".join(sides_done) or "?")
+            return
+        report = kill_timeline.analyze(rec)
+        log.info("全局录制 击毁对齐: %s", kill_timeline.describe(report))
+        for lid, dt in kill_timeline.pick_death_times(report):
+            log.info("全局录制 击毁对齐: 线路 %s 的推算死亡时刻 %.1fs(仅诊断, 未改判定)",
+                     lid, dt)
+ 
     def _do_start(self, now: float, player: tuple[float, float] | None, vehicle: str,
                   start_on_move: bool = False) -> None:
         if self._global is not None:

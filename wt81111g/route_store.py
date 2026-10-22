@@ -318,6 +318,12 @@ class GlobalRecord:
     # 回放时按时间取最近一条 → 战区能重现当时的蓝/红/占领中, 而不是一张静态快照。
     # 旧数据没有这个字段 → 回放退回静态布局(取 `layout_for`)。
     zone_states: list[dict] = field(default_factory=list)
+    # 本局 `/hudmsg` 的**击毁消息**(录制前后各抓一次取差集, 按 id 去重):
+    # [{"id": 1234, "t": 457.0, "msg": "A (豹 2A4) 击毁了 B (T-64A)"}]
+    # 用途: `t` 是**比赛秒数**(从服务器端开始录像计时, 与我们 t=0 差一个未知偏移),
+    # 所以只能拿“击毁事件之间的**时间差模式**”去和线路结束时刻对齐 ——
+    # 摄像机挂着的那个玩家 icon 不会消失(实测), 他的死亡时刻只能靠这个反推。
+    kills: list[dict] = field(default_factory=list)
 
     def zone_state_at(self, t: float) -> list[dict] | None:
         """取回放时刻 `t` 的战区快照(没有时间轴返回 None)。
@@ -406,6 +412,7 @@ class GlobalRecord:
             "duration": self.duration,
             "marks": list(self.marks),
             "zone_states": self.zone_states,
+            "kills": self.kills,
             "sides": {side: [life.to_json() for life in self.lives(side)]
                       for side in GLOBAL_SIDES},
         }
@@ -440,6 +447,15 @@ class GlobalRecord:
                 continue
             rec.zone_states.append({"t": t, "zones": [z for z in zones
                                                        if isinstance(z, dict)]})
+        for row in data.get("kills") or []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                rec.kills.append({"id": int(row.get("id") or 0),
+                                  "t": float(row.get("t") or 0.0),
+                                  "msg": str(row.get("msg") or "")})
+            except (TypeError, ValueError):
+                continue
         for side, rows in (data.get("sides") or {}).items():
             if side not in GLOBAL_SIDES or not isinstance(rows, list):
                 continue

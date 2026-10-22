@@ -859,6 +859,86 @@ def test_spawn_start_check():
     results.append("全局录制: 起点不在重生点附近的线路能被抓出来(只记日志) OK")
 
 
+def test_kill_timeline():
+    """用 hudmsg 的击毁时刻"时间差模式"反推摄像机挂着那位玩家的死亡时刻。
+
+    背景(用户 2026-10-22): 录制全局路线时视角挂在我方一位玩家身上, 他阵亡后
+    8111 依旧持续上报(icon 不消失) → 那条线拿不到死亡时刻。其余玩家正常消失判死。
+    思路: 本局所有线路的结束时刻 ≈ hudmsg 击毁时刻 + 一个**未知固定偏移**
+    (绝对偏移不可用: 录像从服务器端就开始、准备阶段的 15 秒还是假数字),
+    所以扫一遍偏移量取配对最多的, 对不上的击毁就是那位玩家的死亡。
+    """
+    from wt81111g import kill_timeline as kt
+
+    # ---- 1) 只认"击毁了", 排除"引燃了 / 获得嘉奖", 并去掉零宽空格
+    class FakeClient:
+        def __init__(self, rows):
+            self.rows = rows
+            self.calls = []
+
+        def hudmsg(self, a, b):
+            self.calls.append((a, b))
+            return {"events": [], "damage": self.rows}
+
+    rows = [
+        {"id": 10, "time": 5, "msg": "A (豹 2A4) 击毁了 B (T-64A)"},
+        {"id": 11, "time": 6, "msg": "C (护卫坦克 57) 的\u200b攻击引燃了 D (黄蜂)"},
+        {"id": 12, "time": 7, "msg": "E (豹 2A4) 获得嘉奖“装甲克星”"},
+        {"id": 13, "time": 8, "msg": "F (T-80) 击\u200b毁\u200b了 G (M1)"},
+    ]
+    client = FakeClient(rows)
+    assert kt.read_cursor(client) == 13
+    new = kt.read_new_kills(client, 10)
+    assert [r["id"] for r in new] == [13], new          # 11/12 不是击杀, 10 等于游标
+    assert "\u200b" not in new[0]["msg"], new[0]["msg"]
+
+    # ---- 2) 两队各自抓到的消息要按 id 去重
+    rec = GlobalRecord(route_id="g20", map_key="M", map_name="地图", created_at="",
+                       duration=100.0)
+    rec.kills = [{"id": 1, "t": 5.0, "msg": "x"}, {"id": 2, "t": 6.0, "msg": "y"},
+                 {"id": 1, "t": 5.0, "msg": "x"}]       # 模拟两队都抓到了 id=1
+    assert [k["id"] for k in kt.merge_kills(rec)] == [1, 2]
+
+    # ---- 3) 偏移搜索 + 未配对识别
+    def life(lid, side, t1, dead, last_move=None):
+        """造一条线: 末点 t1; 若给 last_move 则它最后一段不再移动。"""
+        pts = [TrackPoint(0.2, 0.2, 0.0, 0.0)]
+        if last_move is not None:
+            pts.append(TrackPoint(0.3, 0.3, float(last_move), 30.0))
+            if t1 > last_move:                       # 之后残骸不动
+                pts.append(TrackPoint(0.3, 0.3, float(t1), 0.0))
+        else:
+            pts.append(TrackPoint(0.4, 0.4, float(t1), 30.0))
+        lf = UnitLife(life_id=lid, icon="MediumTank", obj_type="ground_model",
+                      map_key="M", points=pts, side=side, dead=dead)
+        return lf
+
+    rec2 = GlobalRecord(route_id="g21", map_key="M", map_name="地图", created_at="",
+                        duration=100.0)
+    # A 队: 两条正常阵亡(10s / 30s) + 一条"被摄像机挂着"(活到最后, 70s 后不动)
+    rec2.sides["A"] = [life("A1", "A", 10.0, True),
+                       life("A2", "A", 30.0, True),
+                       life("A3", "A", 100.0, False, last_move=70.0)]
+    # B 队: 一条正常阵亡(50s)
+    rec2.sides["B"] = [life("B1", "B", 50.0, True)]
+    # hudmsg: 比赛秒数比我们的 t 小 5 秒 → 偏移 +5
+    rec2.kills = [{"id": 100 + i, "t": t, "msg": "x (载具) 击毁了 y (载具)"}
+                  for i, t in enumerate([5.0, 25.0, 45.0, 65.0])]
+
+    report = kt.analyze(rec2)
+    assert abs(report["offset"] - 5.0) < 0.2, report["offset"]
+    assert len(report["pairs"]) == 3, report["pairs"]     # 10/30/50 都能配上
+    assert report["unmatched"] == [65.0], report["unmatched"]
+    assert [s[0] for s in report["silent"]] == ["A3"], report["silent"]
+
+    # ---- 4) 未配对的击毁 → 分配给"最后移动时刻"最接近的静默线路
+    picked = kt.pick_death_times(report)
+    assert picked == [("A3", 70.0)], picked
+    text = kt.describe(report)
+    assert "未配对击毁时刻 65s" in text and "A3" in text, text
+    results.append("全局录制: hudmsg 击毁时刻能反推摄像机那位玩家的死亡时刻 OK")
+
+
 def test_zone_layout_pick(tmpdir: str):
     """回放 AB 队线路时必须用**全局条目自己**的战区布局(可能是另一个交战区)。
 
@@ -946,6 +1026,7 @@ def main() -> int:
     test_live_layer_no_rebuild()
     test_playback_timeline()
     test_spawn_start_check()
+    test_kill_timeline()
     test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)
