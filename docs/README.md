@@ -27,7 +27,11 @@ docs/
 8111使用经验.md            # 8111 接口使用经验汇总(端点清单/玩家坐标/地图/性能/注意事项)
 
 # 功能文档(项目自有实现说明)
-跑图线路测试器.md          # 跑图线路测试器: 布局/快捷键/绘制规则/8111 数据来源/持久化
+CHANGELOG.md               # 两个程序的更新日志合并记录
+
+# 跑图线路测试器(独立程序)的文档在它自己的仓库里:
+#   https://github.com/Virream/WTRouteTester → docs/跑图线路测试器.md
+#                                              docs/WTRouteTester-FEATURES.md
 ```
 
 ## 来源

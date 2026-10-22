@@ -20,3 +20,48 @@ WTBlackList_promo.png
 
 # ����������/���ؽ��(WTRTI ʵʱ��Ϣ����, 28MB, �����)
 WTRTI/
+
+# ===== 跑图线路测试器(独立程序, 只属于 Virream/WTRouteTester 仓库) =====
+# 本工作区里照旧开发它, 但**不跟踪** —— 代码与它自己的文档请推
+# d:\course\VSCODE\WTRouteTester (见 tools\sync_route_tester.ps1)。
+# 共用的只有: wt81111g\api8111.py / config.py / garage.py / assets\ /
+# tools\trim_qt.py / README.md / docs\CHANGELOG.md / docs\8111使用经验.md
+/route_tester.py
+/build_route_tester.ps1
+/version_info_route.txt
+/requirements-gl.txt
+/icon/WTRouteTester.ico
+/icon/icon_512X512_WTRouteTester.png
+/tests/route_tester_test.py
+/tests/global_record_test.py
+/docs/跑图线路测试器.md
+/docs/WTRouteTester-FEATURES.md
+/tools/route_map_gl_demo.py
+/tools/probe_playback_stutter.py
+/tools/probe_vram.py
+/tools/probe_watcher_fix.py
+/tools/probe_frame_align.py
+/tools/probe_turn_radius.py
+/tools/make_app_icon.py
+/wt81111g/global_hotkey.py
+/wt81111g/global_record.py
+/wt81111g/help_text.py
+/wt81111g/hotkey_dialog.py
+/wt81111g/icons.py
+/wt81111g/kill_timeline.py
+/wt81111g/map_cache.py
+/wt81111g/map_manager.py
+/wt81111g/record_overlay.py
+/wt81111g/record_overlay_dialog.py
+/wt81111g/route_instance.py
+/wt81111g/route_map_gl.py
+/wt81111g/route_map_view.py
+/wt81111g/route_playback.py
+/wt81111g/route_recorder.py
+/wt81111g/route_store.py
+/wt81111g/route_window.py
+/wt81111g/sound.py
+/wt81111g/sound_dialog.py
+/wt81111g/tree_view.py
+/wt81111g/watcher_dialog.py
+/wt81111g/zones.py

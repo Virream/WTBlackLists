@@ -98,14 +98,13 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 打包时会自动把 `LICENSE` 与 `NOTICE` 放进程序目录, 因此 ZIP 版与安装版里都带许可文件;
 **源码不再另外打包**(源码就在本仓库, 1.0 版见 `1.0` 分支)。
 
-> 本仓库还保留一份**跑图线路测试器**的代码(`route_tester.py` + `build_route_tester.ps1`):
-> 它是另一个独立程序(记录"重生后多久到达某位置"), 已单独发布在
-> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.1.1**)。
-> 主要能力: 单条线路录制(速度配色 / 标记 / 转弯半径)、**A/B 队全局录制**(整局所有玩家
+> **跑图线路测试器是另一个独立程序**, 已单独发布在
+> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.1.1**),
+> 代码与它自己的文档都在那个仓库里, **本仓库不再包含它**。
+> 两者只是共用 8111 的调用封装(`wt81111g/api8111.py`)与地图/战区缓存格式。
+> 能力概览: 单条线路录制(速度配色 / 标记 / 转弯半径)、**A/B 队全局录制**(整局所有玩家
 > 的线路, 分两队按绝对时间轴回放)、**阵亡时刻修正**(用 `/hudmsg` 补回观战对象的真实死亡
 > 时刻)、录制叠加层(实际采样率 / 轮询频率)、地图与战区缓存与回放。
-> 文档: [`docs/WTRouteTester-FEATURES.md`](docs/WTRouteTester-FEATURES.md)、
-> [`docs/跑图线路测试器.md`](docs/跑图线路测试器.md)。
 
 运行后会在可写目录自动创建 `data\blacklist.json` 与 `evidences\` 文件夹;
 若安装到受保护的 Program Files 目录, 数据会自动改存到 `%LOCALAPPDATA%\WTBlackList`。
@@ -130,8 +129,6 @@ WTBlackList/
 │   ├── nickname_collector.py# 昵称解析
 │   ├── evidence.py          # 证据文件夹
 │   ├── monitor.py           # 对局监控线程
-│   ├── route_store.py       # 路线/地图缓存读写
-│   ├── route_window.py      # 跑图线路测试器(独立程序, 入口 route_tester.py)
 │   └── main_window.py       # PyQt6 主窗口
 ├── docs/                    # 参考文档归档(见下节)
 │   ├── wtrti/               # WTRTI 官方文档
