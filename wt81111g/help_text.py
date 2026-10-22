@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+from .config import ROUTE_VERSION
 from .global_hotkey import ACTION_LABELS, DEFAULT_BINDINGS, describe_binding
 
 APP_TITLE = "跑图线路测试器"
@@ -27,11 +28,21 @@ def about_html(bindings: dict | None = None) -> str:
     """功能说明正文(HTML, 给 QTextBrowser 用)。"""
     keys = "".join(f"<li>{line}</li>" for line in hotkey_lines(bindings))
     return f"""
-<h2>{APP_TITLE}</h2>
+<h2>{APP_TITLE} <span style="font-size:13px; color:#888;">v{ROUTE_VERSION}</span></h2>
 <p style="color:#888">{APP_SUBTITLE}</p>
 <p style="color:#888">作者 <b>{AUTHOR}</b> ·
     <a href="{AUTHOR_BILI}" style="color:#7ec8e3;">B站</a> ·
     <a href="{AUTHOR_GITHUB}" style="color:#7ec8e3;">GitHub</a></p>
+
+<h3>这一版新增了什么</h3>
+<ul>
+<li><b>A/B 队全局录制</b>: 把一整局所有玩家的线路录下来, 分两队、按绝对时间轴回放;</li>
+<li><b>阵亡时刻修正</b>: 用 <code>/hudmsg</code> 把观战对象(摄像机挂着那位)的真实阵亡
+    时刻补回来, 一局死几次就修几条线(见下面“那两位玩家的死亡时刻是怎么补出来的”);</li>
+<li><b>录制叠加层</b>: 录制时在屏幕角落显示实际采样率/轮询频率(菜单「设置 → 叠加层」);</li>
+<li><b>阵亡叉与回放点的颜色</b>跟该队重生点一致, 多队同屏时一眼能分出阵营;</li>
+<li>转弯半径改成整数米 + <code>±x%</code> 一致度; 全局线路存储改紧凑 JSON + gzip。</li>
+</ul>
 
 <h3>快捷键(全局, 游戏中也能按)</h3>
 <ul>{keys}</ul>
@@ -108,6 +119,8 @@ def about_html(bindings: dict | None = None) -> str:
 <li><b>录到哪一条?</b> 右键全局条目可以打上「标记为 A/B 队录制目标」。
     有标记 → 点录制就录到那条(已录过会先问是否清空重录); <b>没有任何标记 → 新建一条</b>。
     右键可「清除标记」。</li>
+<li><b>重录某一队</b>时, 这一局存的击毁消息会**清空重采**、之前指定的观战玩家也会被
+    清掉(换了录像, 那个名字不一定还成立) —— 所以重录完需要重新点一次感叹号。</li>
 <li>8111 不给玩家名, 所以线路按“出现时间 + 载具类别”命名; 同一个人中途上飞机/换车
     会断成两条线。</li>
 <li><b>黄色感叹号 = 这一局还没指定“镜头挂在谁身上”</b>。视角挂在我方一位玩家身上
@@ -160,7 +173,9 @@ def about_html(bindings: dict | None = None) -> str:
     不再上报也算死); <b>全场一起消失</b>(回到车库/录制结束) 不算,
     所以“整局一次不死”不会误标。</li>
 <li><b>被击毁标记</b>(默认开): 在阵亡位置(线路末端)画一个小叉, 回放越过那一刻才出现。
-    颜色按队区分: <b>A 队蓝</b>、<b>B 队红</b>。
+    叉的颜色、以及每条线路那个**回放光标点**的颜色, 都跟<b>这一队重生点在地图上的颜色</b>
+    一致 —— 为什么不能写死 A 蓝/B 红: A、B 是两次独立观战, 每次都是“摄像机那一方 = 我方
+    (蓝)”, 反过来录的时候两队颜色正好互换, 写成固定值就会和画出来的重生点对不上。
     两个开关都能单独关掉, 也会记住选择。</li>
 <li>回放期间其余功能同样锁定, 点“■ 结束播放”退出。</li>
 </ul>
