@@ -126,6 +126,7 @@ class RouteTesterWindow(QMainWindow):
         self._last_global: GlobalRecord | None = None
         # 选中集合(决定回放播哪几条; 用于判断“本次新加进来的是哪张地图”)
         self._sel_ids: set[str] = set()
+        self._sel_groups: set[tuple[str, str]] = set()
         # “基准版本”: 双击某条轨迹后, 它的(地图键, 战区指纹)被锁为基准 ——
         # 之后多选/回放只能在同一版本内进行(见 _group_of / _on_tree_selection_changed)
         self._anchor: tuple[str, str] | None = None
@@ -1142,8 +1143,8 @@ class RouteTesterWindow(QMainWindow):
     def _selection_tracks(self) -> list[RouteRecord]:
         """侧栏中当前选中的线路(可 Shift/Ctrl 多选), 按侧栏顺序。"""
         out: list[RouteRecord] = []
-        for it in self.tree.selectedItems():
-            if it.data(0, _ROLE_KIND) != "route":
+        for it in self._iter_route_items():
+            if not self._is_item_selected(it):
                 continue
             rec = self.store.get(it.data(0, _ROLE_ID))
             if rec is not None:
@@ -1171,12 +1172,16 @@ class RouteTesterWindow(QMainWindow):
         选中整个全局条目 / A·B 队行时, 把它们下面的全部线路都算进来;
         只选中几条线路时就只算那几条 —— 与用户要的“选了就播选中的”一致。
         按**树的顺序**取(不能用 `selectedItems()` 的顺序, 那是选择模型的顺序)。
+
+        选中与否以 `selectionModel` 为准(见 `_is_item_selected` 的说明): 只看
+        `QTreeWidgetItem.isSelected()` 会把“父项折叠时只有内部标志”的条目也算进来,
+        于是明明取消掉的其它地图的线路还在选中集合里。
         """
         def hit(item: QTreeWidgetItem) -> bool:
             node: QTreeWidgetItem | None = item
             while node is not None:
-                if node.isSelected() and node.data(0, _ROLE_KIND) in (
-                        "glife", "gside", "global"):
+                if (self._is_item_selected(node)
+                        and node.data(0, _ROLE_KIND) in ("glife", "gside", "global")):
                     return True
                 node = node.parent()
             return False
@@ -1190,9 +1195,62 @@ class RouteTesterWindow(QMainWindow):
                 out.append(life)
         return out
 
+    def _iter_all_items(self):
+        """递归遍历侧栏里的**全部**条目(不限可见性)。"""
+        def walk(item):
+            for i in range(item.childCount()):
+                ch = item.child(i)
+                yield ch
+                yield from walk(ch)
+
+        yield from walk(self.tree.invisibleRootItem())
+
+    def _is_item_selected(self, item: QTreeWidgetItem) -> bool:
+        """该条目此刻是否真的处于选中状态(index 级判断)。
+
+        不能用 `QTreeWidgetItem.isSelected()`: 父项折叠时它可能只是 item 自身的
+        标志位, 并不在 selectionModel 里(实测同一行 isSelected()=True 但
+        `selectedIndexes()` 里没有它) —— 那样子项会被误认为“选中”。
+        也不能用 `_ROLE_KEY` 建集合: 同一个全局条目下的所有线路条目共用同一个 KEY。
+        """
+        model = self.tree.selectionModel()
+        if model is None:
+            return False
+        idx = self.tree.indexFromItem(item, 0)
+        return idx.isValid() and model.isSelected(idx)
+
     def _selection_playables(self) -> list:
         """回放/高亮用: 选中的单条轨迹 + 选中的全局线路(侧栏顺序)。"""
         return self._selection_tracks() + self._selection_lives()
+
+    def _playable_group(self, r) -> tuple[str, str]:
+        """一条**可播放线路**属于哪个分组 (地图, 战区指纹)。
+
+        单条轨迹自带 `zone_signature`; 全局线路(`UnitLife`)只有 map_key,
+        它的版本信息在**所属全局录制**上 —— 不这样取的话, 同一张地图不同版本的
+        全局条目会被当成同一组。
+        """
+        if isinstance(r, RouteRecord):
+            return self._group_of(r)
+        lid = getattr(r, "life_id", "")
+        if lid:
+            for g in self.store.globals:
+                if any(l.life_id == lid for side in GLOBAL_SIDES for l in g.lives(side)):
+                    return (g.map_key or "", g.zone_signature or "")
+        return (getattr(r, "map_key", "") or "", "")
+
+    def _item_groups(self, item: QTreeWidgetItem) -> set[tuple[str, str]]:
+        """某个侧栏条目(任意层级)涉及哪些分组 —— 取消越界选中时按它判定。"""
+        groups: set[tuple[str, str]] = set()
+        for lid in self._life_ids_of(item):
+            life = self._life_by_id(lid)
+            if life is not None:
+                groups.add(self._playable_group(life))
+        if not groups:
+            rec = self.store.get(item.data(0, _ROLE_ID))
+            if rec is not None:
+                groups.add(self._playable_group(rec))
+        return groups
 
     def _on_tree_selection_changed(self) -> None:
         """选中项变化 → 回放将播放这几条; 同时**限制为同一张地图的同一版本**。
@@ -1205,38 +1263,59 @@ class RouteTesterWindow(QMainWindow):
 
         基准(图钉)还会**跟随当前选中所在的版本** —— 刚开始没选中任何条目时,
         第一个点到的路线就把它的“地图·模式·版本”定为基准。
+
+        判定用 `_selection_playables()`(单条轨迹 + 全局线路)而不是只看单条轨迹:
+        以前用 `_selection_tracks()`, 而它只认 `kind == "route"` 的条目 —— 选中
+        全局条目 / A·B 队行 / 全局线路时列表是空的, 跨地图限制完全不生效
+        (用户 2026-10-22: 选中 AB 队所有路线后还能 Ctrl 点别的地图的路线)。
         """
         if self._reselecting or self._in_playback():
             return
-        recs = self._selection_tracks()
-        if not recs:
+        playables = self._selection_playables()
+        if not playables:
             self._sel_ids = set()
+            self._sel_groups = set()
             self._update_play_label()
             self._refresh_map_tracks()   # 选中全局线路时也要把高亮刷出来
             return                       # 清空选中时保留基准(图钉不消失)
-        groups = {self._group_of(r) for r in recs}
+        groups = {self._playable_group(r) for r in playables}
         if len(groups) > 1:
             keep: tuple[str, str] | None = None
             if self._anchor is not None and self._anchor in groups:
                 keep = self._anchor
             else:
-                new_ids = {r.route_id for r in recs} - self._sel_ids
-                keep = next((self._group_of(r) for r in recs if r.route_id in new_ids), None)
-                if keep is None:
-                    keep = self._group_of(recs[-1])
-            recs = [r for r in recs if self._group_of(r) == keep]
+                new_groups = groups - self._sel_groups
+                keep = next(iter(new_groups), None) or self._playable_group(playables[-1])
             self._reselecting = True
             try:
                 self.tree.blockSignals(True)
-                self._select_route_ids([r.route_id for r in recs])
+                # 按**条目**取消选中(它可能是全局条目/队伍行, 没法用 route_id 选回去)。
+                # 两套都清: selectionModel(真正生效的选中) + item 自身标志位 ——
+                # 折叠组里的条目可能只改了自身标志, 不在 selectionModel 里
+                # (`selectedItems()` 还会过滤隐藏项, 所以也不能用它)。
+                model = self.tree.selectionModel()
+                seen: set[int] = set()
+                for idx in list(model.selectedIndexes()):
+                    it = self.tree.itemFromIndex(idx)
+                    if it is None or id(it) in seen:
+                        continue
+                    seen.add(id(it))
+                    if self._item_groups(it) - {keep}:
+                        it.setSelected(False)
+                for it in self._iter_all_items():
+                    if it.isSelected() and self._item_groups(it) - {keep}:
+                        it.setSelected(False)
                 self.tree.blockSignals(False)
             finally:
                 self._reselecting = False
+            playables = [r for r in playables if self._playable_group(r) == keep]
+            groups = {keep}
             self._set_status(
                 "同一张地图的同一版本才能一起回放/显示, 已只保留一个版本内的选中条目",
                 sticky=3.0)
-        self._sel_ids = {r.route_id for r in recs}
-        grp = self._group_of(recs[0])
+        self._sel_groups = groups
+        self._sel_ids = {getattr(r, "route_id", "") for r in playables}
+        grp = self._playable_group(playables[0])
         if grp != self._anchor:
             self._anchor = grp          # 基准跟着当前选中走
             self._refresh_anchor_icon()
@@ -1283,7 +1362,8 @@ class RouteTesterWindow(QMainWindow):
     @staticmethod
     def _group_of(rec: RouteRecord) -> tuple[str, str]:
         """一条轨迹属于哪个分组: (地图键, 战区坐标指纹) —— 版本 = 战区位置。"""
-        return (rec.map_key or "", rec.zone_signature or "")
+        return (getattr(rec, "map_key", "") or "",
+                getattr(rec, "zone_signature", "") or "")
 
     def _group_name(self, map_key: str, signature: str) -> str:
         """分组的可读名字(地图 · 模式 · 版本)。"""
