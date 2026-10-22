@@ -280,7 +280,9 @@ class RouteMapGlView(RouteMapView):
         self._hover_mode = False
         self._gl_hover_key: tuple | None = None
         self._gl_hit_cache: dict = {}        # route_id -> (点数, 归一化坐标数组)
-        self._gl_key: tuple | None = None
+        self._gl_key: tuple | None = None       # 轨迹层指纹
+        self._gl_icon_key: tuple | None = None  # 图标层指纹(重生点/占位文字)
+        self._gl_zone_key: tuple | None = None  # 战区层指纹
         self._gl_geom: tuple | None = None
         self._gl_tracks: list[_Track] = []
         self._gl_anim = 0.0
@@ -432,21 +434,34 @@ class RouteMapGlView(RouteMapView):
 
     # -------------------------------------------------------- GPU 内容同步
     def _content_key(self) -> tuple:
-        """决定要不要**重建 GPU 对象**的指纹(进度/闪烁不在内, 那些每帧只改颜色)。"""
+        """**轨迹层**的指纹 —— 只有它变了才重建线路几何(最贵, 67 条要 100+ ms)。
+
+        2026-10-22 用户报“回放时所有路线会卡一下”: 以前战区状态也在这个指纹里,
+        而回放每帧都会把战区推到当时的快照(`set_zones`), 于是每次占领/易手都会
+        **连带重建全部线路**(实测 185~239 ms)。现在拆成两个指纹, 战区这类
+        图标层变化只走 `_icon_key`。
+        """
 
         def sig(recs) -> tuple:
             return tuple(getattr(r, "route_id", id(r)) for r in recs)
 
         live = self._live
-        zones = ()
-        if self._show_zones:
-            zones = tuple((z.get("label"), z.get("side"), round(float(z.get("x", 0)), 6),
-                           round(float(z.get("y", 0)), 6)) for z in self._zones)
         return (sig(self._visible), sig(self._highlight),
                 getattr(live, "route_id", "") if live else None,
                 sig(self._live_multi), sig(self._playback_recs),
-                self._show_zones, zones, self._show_spawns, self._spawns_ver,
-                self._map_digest, self._status)
+                self._map_digest)
+
+    def _icon_key(self) -> tuple:
+        """**图标层**的指纹(重生点/占位文字) —— 变了只换图标, 轨迹不动。"""
+        return (self._show_spawns, self._spawns_ver, self._status)
+
+    def _zone_key(self) -> tuple:
+        """**战区层**的指纹 —— 回放时它每几十秒就变一次, 所以单独一条最轻的路。"""
+        if not self._show_zones:
+            return ()
+        return tuple((z.get("label"), z.get("side"),
+                      round(float(z.get("x", 0)), 6),
+                      round(float(z.get("y", 0)), 6)) for z in self._zones)
 
     def _drop_object(self, obj) -> None:
         """把对象从场景里**真正**移掉。
@@ -478,6 +493,8 @@ class RouteMapGlView(RouteMapView):
         icons = {id(o) for o in self._gl_icons}
         self._gl_objs = [o for o in self._gl_objs if id(o) not in icons]
         self._gl_icons = []
+        self._gl_zone_objs = []
+        self._gl_zones = []
         self._hover_obj = None
         self._gl_hover_box = None
         self._gl_hover_px = None
@@ -653,10 +670,14 @@ class RouteMapGlView(RouteMapView):
 
     def _sync_objects(self) -> None:
         key = self._content_key()
+        ikey = self._icon_key()
+        zkey = self._zone_key()
         geom = self._geom_key()
         hkey = self._hover_key()
         if key != self._gl_key:
             self._gl_key = key
+            self._gl_icon_key = ikey
+            self._gl_zone_key = zkey
             self._gl_geom = geom
             self._gl_hover_key = hkey
             self._rebuild_objects()
@@ -664,8 +685,22 @@ class RouteMapGlView(RouteMapView):
             # 只缩放了/改了窗口: 轨迹几何不用动(归一化 + 屏幕线宽),
             # 但图标的像素尺寸要按新的地图尺寸重算
             self._gl_geom = geom
+            self._gl_icon_key = ikey
+            self._gl_zone_key = zkey
             self._gl_hover_key = hkey
             self._rebuild_icons()
+        elif ikey != self._gl_icon_key:
+            # 重生点/占位文字变了 → 换整层图标(含战区)
+            self._gl_icon_key = ikey
+            self._gl_zone_key = zkey
+            self._gl_hover_key = hkey
+            self._rebuild_icons()
+        elif zkey != self._gl_zone_key:
+            # 只是战队占领状态变了(回放跟着时间轴推进) → 只换那几面菱形旗。
+            # 以前这种变化会走“整层重建”, 连带把 67 条线路重算一遍 —— 实测
+            # 185~239 ms, 就是用户 2026-10-22 说的“播放中所有路线卡一下”。
+            self._gl_zone_key = zkey
+            self._rebuild_zones()
         elif hkey != self._gl_hover_key:
             # 鼠标在线路上滑过 → 只换悬停那两三个对象
             self._gl_hover_key = hkey
@@ -674,6 +709,23 @@ class RouteMapGlView(RouteMapView):
             self._extend_tracks()          # 录制中点涨了 → 只补新段
         self._apply_progress()
         self._apply_anim()
+
+    def _rebuild_zones(self) -> None:
+        """只换战队占领图标(填充/两层描边/字母), 其余一律不动。"""
+        objs = list(getattr(self, "_gl_zone_objs", ()))
+        for obj in objs:
+            self._drop_object(obj)
+        ids = {id(o) for o in objs}
+        if ids:
+            self._gl_objs = [o for o in self._gl_objs if id(o) not in ids]
+            self._gl_icons = [o for o in self._gl_icons if id(o) not in ids]
+        self._gl_zone_objs = []
+        self._gl_zones = []
+        self._icon_mode = True
+        try:
+            self._build_zones()
+        finally:
+            self._icon_mode = False
 
     def _rebuild_objects(self) -> None:
         self._clear_objects()
@@ -861,6 +913,7 @@ class RouteMapGlView(RouteMapView):
             return
         rx, ry = rmv.ZONE_RADIUS / dw, rmv.ZONE_RADIUS / dh
         self._gl_zones = []
+        self._gl_zone_objs = []          # 战区用到的**全部**对象(单独换战区时只删这些)
         for z in self._zones:
             try:
                 x, y = float(z["x"]), 1.0 - float(z["y"])
@@ -875,17 +928,18 @@ class RouteMapGlView(RouteMapView):
                 gfx.Geometry(positions=quad,
                              indices=np.array([[0, 1, 2], [0, 2, 3]], np.uint32)),
                 gfx.MeshBasicMaterial(color=_rgba(color), side="both")), O_ZONE)
+            self._gl_zone_objs.append(fill)
             ring = np.array([(x, y + ry, Z_ZONE), (x + rx, y, Z_ZONE),
                              (x, y - ry, Z_ZONE), (x - rx, y, Z_ZONE),
                              (x, y + ry, Z_ZONE)], dtype=np.float32)
-            self._add(gfx.Line(  # 深色描边(浅色底图上也看得清)
+            self._gl_zone_objs.append(self._add(gfx.Line(  # 深色描边(浅色底图上也看得清)
                 gfx.Geometry(positions=ring.copy()),
                 gfx.LineMaterial(thickness=3.4, thickness_space="screen",
-                                 color=_rgba(QColor(15, 23, 42, 210)))), O_ZONE_EDGE)
-            self._add(gfx.Line(  # 白色描边(COLOR_ZONE)
+                                 color=_rgba(QColor(15, 23, 42, 210)))), O_ZONE_EDGE))
+            self._gl_zone_objs.append(self._add(gfx.Line(  # 白色描边(COLOR_ZONE)
                 gfx.Geometry(positions=ring),
                 gfx.LineMaterial(thickness=1.6, thickness_space="screen",
-                                 color=_rgba(rmv.COLOR_ZONE))), O_ZONE_EDGE)
+                                 color=_rgba(rmv.COLOR_ZONE))), O_ZONE_EDGE))
             label = str(z.get("label") or "").strip()
             text = None
             if label:                        # 软件版: Consolas 9 bold, 区域中心
@@ -894,6 +948,7 @@ class RouteMapGlView(RouteMapView):
                     family="Consolas", anchor="middle-center",
                     material=gfx.TextMaterial(color=label_color)), O_ZONE_LABEL)
                 text.local.position = (x, y, Z_ZONE + 0.002)
+                self._gl_zone_objs.append(text)
             self._gl_zones.append((z, fill, color, text))
 
     def _build_marks(self) -> None:
