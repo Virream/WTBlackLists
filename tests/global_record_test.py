@@ -801,6 +801,48 @@ def test_playback_timeline():
     results.append("全局录制回放: 时间轴按绝对时刻(02:00 开始的线路也会动) OK")
 
 
+def test_camera_handover():
+    """我方全灭后 8111 把摄像机自动移到敌方 → 必须立即停止录制。
+
+    用户 2026-10-22 看回放确认的 8111 行为: 摄像机挂着的车就算已死也一直上报
+    (`icon == "Player"`), 而我方全灭后摄像机会被**自动移交到敌方一辆车上**,
+    `/map_obj.json` 于是报的全是敌方单位 —— 不停下来就会把敌方载具记成本队线路
+    (实测: A 队的一辆轻坦被记成 B34, 起点离本队重生点 183m, 开局就 40km/h)。
+    信号: `icon == "Player"` 就是摄像机所在单位, 它单帧大幅跳位 = 换了目标;
+    若那一刻本队活线 ≤1 条, 就是全灭后被游戏强制移交。
+    """
+    def cam(x, y):
+        return {"type": "ground_model", "icon": "Player", "x": x, "y": y}
+
+    def enemy(x, y):
+        return {"type": "ground_model", "icon": "LightTank", "x": x, "y": y}
+
+    rec = GlobalRecord(route_id="g11", map_key="M", map_name="地图", created_at="")
+    tr = GlobalTracker(rec, "B", map_size=(4000.0, 4000.0))
+    t = 0.0
+    for i in range(10):
+        assert not tr.feed(t, [cam(0.30 + 0.001 * i, 0.30)])
+        t += 0.05
+    assert not tr.camera_handover
+    # 自己这辆车死了 → 摄像机被移到敌方轻坦(跳了 0.3 归一化 ≈ 1200m)
+    stop = tr.feed(t, [cam(0.60, 0.70), enemy(0.60, 0.70)])
+    assert stop, "本队全灭后被移交, feed 应该返回 True(该停)"
+    assert tr.camera_handover and tr.handover_at == t, tr.handover_at
+
+    # 反例: 本队还有好几条活线, 摄像机跳位只是用户手动切目标 → 不能判成"全灭"
+    rec2 = GlobalRecord(route_id="g12", map_key="M", map_name="地图", created_at="")
+    tr2 = GlobalTracker(rec2, "B", map_size=(4000.0, 4000.0))
+    t = 0.0
+    for _ in range(4):
+        assert not tr2.feed(t, [cam(0.30, 0.30), tank(0.32, 0.32),
+                                 tank(0.34, 0.34), tank(0.36, 0.36)])
+        t += 0.05
+    stop = tr2.feed(t, [cam(0.70, 0.70), tank(0.32, 0.32),
+                        tank(0.34, 0.34), tank(0.36, 0.36)])
+    assert not stop and not tr2.camera_handover, "本队还有 3 条活线, 不该判成全灭"
+    results.append("全局录制: 本队全灭后摄像机被移交敌方 → 自动停止(手动切目标不误判) OK")
+
+
 def test_spawn_start_check():
     """新建线路时校验起点像不像"刚重生"（用户 2026-10-22 报的 bug 的诊断）。
 
@@ -930,6 +972,7 @@ def main() -> int:
     test_live_layer_no_rebuild()
     test_playback_timeline()
     test_spawn_start_check()
+    test_camera_handover()
     test_zone_layout_pick(tmpdir)
     test_window(tmpdir)
     test_only_global(tmpdir)
