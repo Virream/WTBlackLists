@@ -2032,6 +2032,11 @@ class RouteMapView(QWidget):
         for rec in self._hover_candidates():
             pts = rec.points
             n = len(pts)
+            if self._playback_recs:
+                # 回放中只允许命中**已播放**的点(玩家还没走到的路段不该能被选中)
+                n = min(n, self._played_prefix(rec, self._playhead)[0])
+            if n <= 0:
+                continue
             step = 1 if n <= 400 else n // 400
             # 粗扫(step == 1 时就是全量)
             k = -1
@@ -2086,13 +2091,18 @@ class RouteMapView(QWidget):
         self._hover_pt = None
 
     def _drop_hover_if_gone(self) -> None:
-        """命中的那条线被隐藏/换掉后, 悬停提示不该还留着。
+        """命中的那条线被隐藏/换掉、或回放头回退到命中点之前时, 悬停提示不该还留着。
 
-        用 `_hover_candidates()` 而不是 `_drawn_records()`: 回放中阵亡且没勾“变暗”的
-        线路已经从画面上清除, 停在它上面的浮层也得跟着消失(用户 2026-10-22)。
+        * 用 `_hover_candidates()` 而不是 `_drawn_records()`: 回放中阵亡且没勾“变暗”的
+          线路已经从画面上清除, 停在它上面的浮层也得跟着消失(用户 2026-10-22);
+        * 回放只能命中已播放的点 → 往回拖之后那个点可能又变成“未行进”, 也要清掉。
         """
-        if self._hover_rec is not None and not any(
-                r is self._hover_rec for r in self._hover_candidates()):
+        if self._hover_rec is None:
+            return
+        alive = any(r is self._hover_rec for r in self._hover_candidates())
+        if alive and self._playback_recs and self._hover_pt is not None:
+            alive = self._hover_pt.t <= self._playhead
+        if not alive:
             self._reset_hover()
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名

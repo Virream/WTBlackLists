@@ -532,7 +532,10 @@ class RouteMapGlView(RouteMapView):
         for rec in self._hover_candidates():
             xy, bb = self._hit_points(rec)
             n = len(xy)
-            if n == 0:
+            if self._playback_recs:
+                # 回放中只允许命中**已播放**的点 —— 玩家还没走到的路段不该能被选中
+                n = min(n, self._played_prefix(rec, self._playhead)[0])
+            if n <= 0:
                 continue
             # 包围盒预筛: 整条线都在命中圈外就不必算距离
             if (mx < bb[0] * dw - rad or mx > bb[2] * dw + rad
@@ -540,9 +543,9 @@ class RouteMapGlView(RouteMapView):
                 continue
             step = 1 if n <= _HIT_COARSE else n // _HIT_COARSE
             if step == 1:
-                idx = np.arange(n)
-                dx = xy[:, 0] * dw - mx
-                dy = xy[:, 1] * dh - my
+                sub = xy[:n]                    # 回放中可能只取已播放前缀
+                dx = sub[:, 0] * dw - mx
+                dy = sub[:, 1] * dh - my
                 d2 = dx * dx + dy * dy
                 k = int(np.argmin(d2))
                 if d2[k] < best_d2:
@@ -646,14 +649,19 @@ class RouteMapGlView(RouteMapView):
             for rec in self._playback_recs:
                 self._make_track(rec, colored=True, under=True)
         else:
-            # 1) 眼睛点亮的轨迹: 单色灰蓝
+            # 与软件版 `_draw_tracks` 一致: 同一条轨迹只画一次(高亮优先)
+            hi = list(self._highlight)
+            if self._live is not None and all(r is not self._live for r in hi):
+                hi.append(self._live)
+            hi_ids = {id(r) for r in hi}
+            # 1) 眼睛点亮但没选中的: 单色灰蓝
             for rec in self._visible:
+                if id(rec) in hi_ids:
+                    continue
                 self._make_track(rec, colored=False, under=False)
             # 2) 选中的 / 正在录的: 速度配色
-            for rec in self._highlight:
+            for rec in hi:
                 self._make_track(rec, colored=True, under=False)
-            if self._live is not None:
-                self._make_track(self._live, colored=True, under=False)
         # 3) 全局录制中“边录边画”的线路: 始终画(软件版画在轨迹层**之上**)
         for rec in self._live_multi:
             self._make_track(rec, colored=True, under=False, order=O_TRACK + 1)
@@ -713,6 +721,11 @@ class RouteMapGlView(RouteMapView):
         容量不够或速度基准涨太多(颜色桶全变)时把 `_gl_key` 置空, 下一帧整层重建。
         """
         for tr in self._gl_tracks:
+            if tr.colors is None:
+                # 灰色历史轨迹没有逐段颜色(也从不增量长), 而且它的 vmax 是 0 ——
+                # 不加这个判断就会和真实峰值速度比出巨大差异, 每帧把 `_gl_key` 置空,
+                # 结果每帧重建整个场景(实测预览模式 130ms/帧, 用户 2026-10-22 报拖动卡)。
+                continue
             pts = tr.rec.points
             n = len(pts)
             if n < 2:
