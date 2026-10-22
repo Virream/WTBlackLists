@@ -2064,6 +2064,11 @@ class RouteMapView(QWidget):
         半径会炸掉(录制时停车采样就会这样)。
 
         没有朝向数据的老轨迹、或 ω 小到几乎直线时, 分别返回空串 / “直线”。
+
+        **注意这是局部平均值, 不是精确几何量**: 窗口只有 ±120ms, 且朝向是 8111
+        按帧给的连续量, 所以两位小数(用户 2026-10-22 要求)体现的是同一窗口内的
+        稳定性, 不代表真实半径精确到厘米级。速度也取窗口内**有效点的平均**
+        (原先是两端点平均, 在加速/刹车时偏差更明显)。
         """
         pts = rec.points
         if len(pts) < 5:
@@ -2076,9 +2081,14 @@ class RouteMapView(QWidget):
             return ""
         total = 0.0
         used = 0
+        vsum = 0.0
+        vcnt = 0
         prev: float | None = None
         for j in range(i0, i1 + 1):
             p = pts[j]
+            if p.speed > 0:                  # 停车采样点(车没动)不参与平均
+                vsum += p.speed
+                vcnt += 1
             if not p.dx and not p.dy:
                 prev = None                  # 缺朝向 → 断开, 不要跨过它算转角
                 continue
@@ -2096,13 +2106,13 @@ class RouteMapView(QWidget):
         if used < 2 or dt <= 0:
             return ""                        # 旧轨迹没有朝向数据
         omega = abs(total) / dt
-        v = 0.5 * (pts[i0].speed + pts[i1].speed) / 3.6      # km/h → m/s
+        v = (vsum / vcnt) / 3.6 if vcnt else 0.0             # km/h → m/s
         if omega < 0.02 or v <= 0:           # < 1.15°/s 视为直线
             return "转弯半径 直线"
         radius = v / omega
         if radius > 5000.0:
             return "转弯半径 直线"
-        return f"转弯半径 ~{radius:.0f} m"
+        return f"转弯半径 ~{radius:.2f} m"
 
     def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
         """悬停浮层文本。
