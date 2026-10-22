@@ -1007,7 +1007,9 @@ class RouteMapGlView(RouteMapView):
             if not getattr(rec, "dead", False) or not rec.points:
                 continue
             side = getattr(rec, "side", "")
-            col = _rgba(rmv.COLOR_DEAD_MARK_A if side == "A" else rmv.COLOR_DEAD_MARK_B)
+            col = _rgba(self._side_spawn_color(side)
+                        or (rmv.COLOR_DEAD_MARK_A if side == "A"
+                            else rmv.COLOR_DEAD_MARK_B))
             x, y = rec.points[-1].x, 1.0 - rec.points[-1].y
             v0 = len(cols)
             for a, b in (((x - sx, y - sy), (x + sx, y + sy)),
@@ -1074,15 +1076,24 @@ class RouteMapGlView(RouteMapView):
                                     color=_rgba(rmv.COLOR_PLAYER))), O_PLAYER_DIR)
 
     def _build_cursor(self) -> None:
-        """回放光标: 每条线路一个白点 + **点内部的主题色朝向短线**(与软件版一致)。"""
+        """回放光标: 每条线路一个实心点 + **点内部的主题色朝向短线**(与软件版一致)。
+
+        点的颜色 = 该队重生点在地图上的颜色(算不出时用白色) —— 用户 2026-10-22:
+        这样多条线一起回放时, 一眼能看出哪个点是哪一边的。
+        """
         self._gl_cursor = self._gl_cursor_dir = None
         n = len(self._playback_recs)
         if not n:
             return
+        cols = np.empty((n, 4), dtype=np.float32)
+        for i, rec in enumerate(self._playback_recs):
+            color = self._side_spawn_color(getattr(rec, "side", ""))
+            cols[i] = _rgba(color if color is not None else QColor("#f8fafc"))
         self._gl_cursor = self._add(gfx.Points(
-            gfx.Geometry(positions=np.zeros((n, 3), dtype=np.float32)),
+            gfx.Geometry(positions=np.zeros((n, 3), dtype=np.float32),
+                         colors=cols),
             gfx.PointsMaterial(size=CURSOR_DOT_R * 2.0, size_space="screen",
-                               color=_rgba(QColor("#f8fafc")))), O_CURSOR_DOT)
+                               color_mode="vertex")), O_CURSOR_DOT)
         self._gl_cursor_dir = self._add(gfx.Line(
             gfx.Geometry(positions=np.zeros((2 * n, 3), dtype=np.float32)),
             gfx.LineSegmentMaterial(thickness=rmv.CURSOR_DIR_PEN,

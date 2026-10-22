@@ -361,6 +361,9 @@ class RouteMapView(QWidget):
         self._times_cache: dict[str, tuple] = {}   # route_id -> (点数, [t...])
         self._bbox_cache: dict[str, tuple] = {}    # route_id -> (点数, 包围盒) 视野裁剪用
         self._cache_alive: set[str] = set()        # 上次剪枝时的“画面上存在的 id”
+        # 队号 → 该队重生点在画面上显示的颜色(阵亡叉 / 回放白点用它)
+        self._side_color_key: tuple | None = None
+        self._side_color_cache: dict[str, QColor] = {}
 
     def _on_blink_tick(self) -> None:
         """推进闪烁相位并重画。"""
@@ -400,6 +403,68 @@ class RouteMapView(QWidget):
                       self._bbox_cache, self._vmax_cache):
             for rid in [k for k in cache if k not in alive]:
                 cache.pop(rid, None)
+
+    def _recs_for_colors(self) -> list:
+        """参与配色判断的轨迹(去重, 保持插入顺序)。"""
+        out: dict[int, object] = {}
+        seqs = (self._visible, self._highlight, self._live_multi,
+                self._playback_recs, (self._live,) if self._live else ())
+        for seq in seqs:
+            for rec in seq or ():
+                out[id(rec)] = rec
+        return list(out.values())
+
+    def _spawn_side_colors(self) -> dict[str, QColor]:
+        """`{队号: 该队重生点在画面上显示的颜色}` —— 按“线路起点离哪个重生点最近”投票。
+
+        为什么不能写死 A=蓝 / B=红: 全局录制的 A、B 是**两次独立观战**, 每次都是
+        “摄像机所在那一方 = 我方(蓝)”。于是同一个条目里两队记录的 `side` 是反的,
+        画出来的重生点颜色也会跟着“最后一次录制”整体翻转 —— 用户 2026-10-22 实测
+        播放时阵亡叉的颜色和重生点对不上。所以直接问“画面上这批重生点是什么颜色”。
+
+        算法: 每条线路的**起点**都贴着本队某个重生点, 谁离得最近就投谁一票,
+        票数最多的那个颜色就是这一队重生点的颜色。
+        """
+        recs = self._recs_for_colors()
+        key = (self._spawns_ver, len(self._spawns),
+               tuple(sorted((getattr(r, "side", "") or "", r.route_id) for r in recs)))
+        if key == self._side_color_key:
+            return self._side_color_cache
+        tanks = [s for s in self._spawns if str(s.get("kind") or "") == "tank"] \
+            or list(self._spawns)
+        votes: dict[str, dict[str, int]] = {}
+        for rec in recs:
+            side = getattr(rec, "side", "")
+            pts = getattr(rec, "points", None)
+            if not side or not pts or not tanks:
+                continue
+            x0, y0 = pts[0].x, pts[0].y
+            pick, best = None, 0.0
+            for sp in tanks:
+                try:
+                    d = (float(sp["x"]) - x0) ** 2 + (float(sp["y"]) - y0) ** 2
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if pick is None or d < best:
+                    pick, best = sp, d
+            if pick is None:
+                continue
+            spawn_side = str(pick.get("side") or "neutral")
+            row = votes.setdefault(side, {})
+            row[spawn_side] = row.get(spawn_side, 0) + 1
+        out: dict[str, QColor] = {}
+        for side, counts in votes.items():
+            spawn_side = max(counts.items(), key=lambda kv: kv[1])[0]
+            color = SPAWN_SIDE_COLORS.get(spawn_side)
+            if isinstance(color, QColor):
+                out[side] = QColor(color)
+        self._side_color_key = key
+        self._side_color_cache = out
+        return out
+
+    def _side_spawn_color(self, side: str) -> QColor | None:
+        """这一队的重生点在画面上是什么颜色(算不出来就 None)。"""
+        return self._spawn_side_colors().get(str(side or ""))
 
     def _sync_blink_timer(self) -> None:
         """按当前战区状态开关闪烁定时器。"""
@@ -665,6 +730,8 @@ class RouteMapView(QWidget):
         self._times_cache.clear()
         self._bbox_cache.clear()
         self._cache_alive = set()
+        self._side_color_key = None
+        self._side_color_cache = {}
         self.update()
 
     # ------------------------------------------------------------------ 几何
@@ -1637,8 +1704,17 @@ class RouteMapView(QWidget):
         return self._dead_mark
 
     def _dead_mark_color(self, rec) -> QColor:
-        """阵亡标记的颜色: A 队蓝 / B 队红(普通轨迹没有队号 → 红)。"""
-        return COLOR_DEAD_MARK_A if getattr(rec, "side", "") == "A" else COLOR_DEAD_MARK_B
+        """阵亡标记的颜色: 跟**该队重生点在画面上显示的颜色**一致。
+
+        以前写死 A 队蓝 / B 队红, 但 A/B 是两次独立观战(每次都是“我方=蓝”),
+        两队记录的 `side` 是反的 → 播放时叉的颜色会和重生点对不上(用户 2026-10-22)。
+        算不出重生点颜色时才退回旧口径。
+        """
+        side = getattr(rec, "side", "")
+        got = self._side_spawn_color(side)
+        if got is not None:
+            return got
+        return COLOR_DEAD_MARK_A if side == "A" else COLOR_DEAD_MARK_B
 
     def _draw_dead_mark(self, p: QPainter, rec, head: float) -> None:
         """阵亡位置的叉: 画在线路末端(最后一个采样点), 大小与回放光标白点相当。
@@ -1676,17 +1752,20 @@ class RouteMapView(QWidget):
                 self._draw_time_label(p, center, fmt_time(mk.t), color)
 
     def _draw_play_cursor(self, p: QPainter, rec: RouteRecord, head: float) -> None:
-        """回放光标: **只有一个实心白点**(位置由时间插值得到, 移动才平滑)。
+        """回放光标: **只有一个实心点**(位置由时间插值得到, 移动才平滑)。
 
         以前是“一个环套一个小实心圆”, 多条轨迹一起回放时十几个环挤在一起太乱
         (2026-10-21 用户要求) —— 现在只保留实心圆, 朝向仍用那根白线表示。
+        点的颜色 = 该队重生点的颜色(用户 2026-10-22: 这样一眼能看出哪个点是哪边的);
+        算不出重生点颜色时用原来的白色。
         """
         cur = point_at(rec.points, head)
         if cur is None:
             return
         c = self._to_px(cur.x, cur.y)
+        color = self._side_spawn_color(getattr(rec, "side", ""))
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QBrush(QColor("#f8fafc")))
+        p.setBrush(QBrush(color if color is not None else QColor("#f8fafc")))
         p.drawEllipse(c, PLAY_CURSOR_R, PLAY_CURSOR_R)
         # 录制时存过朝向就一起画出来(旧轨迹的点没有朝向 → 只画那个点)
         self._draw_cursor_dir(p, c, cur.dx, cur.dy)

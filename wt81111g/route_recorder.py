@@ -674,6 +674,16 @@ class RouteRecorder(QObject):
         log.info("全局录制: hudmsg 游标 = %d", self._hud_cursor)
         if created:
             rec.zone_states = []
+        elif rec.lives(side):
+            # **重录某一队** → 这次的 hudmsg 要重新采一遍(用户 2026-10-22:
+            # “对已经录制过的全局路线重新录制, 那就再收集一遍击杀信息然后覆盖”)。
+            # 不覆盖的话旧击毁会和新一局的击毁混在一起, 阵亡次数/时间轴对齐都会错。
+            # 同时把“观战玩家”清零: 换了录像, 之前点的名字不一定还成立。
+            log.info("全局录制: %s 队是重录 → 清空旧的击杀记录(%d 条)与观战玩家设置",
+                     side, len(rec.kills))
+            rec.kills = []
+            rec.watchers = {}
+            rec.fixed = False
         # 锁定地面底图: 录制期间玩家可能上飞机, 8111 会改发空战地图
         self._map_lock = True
         self._map_info_at = 0.0          # 下一次 tick 立刻取一次地图边长

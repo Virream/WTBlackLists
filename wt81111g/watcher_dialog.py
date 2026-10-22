@@ -116,6 +116,12 @@ class WatcherDialog(QDialog):
                 combo.setEnabled(False)
                 combo.blockSignals(False)
                 continue
+            if not self._kills:
+                # 旧版本录的条目可能没存过击毁消息 —— 直说该怎么做, 别让人以为是软件坏了
+                combo.addItem("（本条目没有存到击毁记录 — 请重录 A/B 队后再修正）", "")
+                combo.setEnabled(False)
+                combo.blockSignals(False)
+                continue
             for row in ranked:
                 fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
                 strong = bool(row.get("strong"))

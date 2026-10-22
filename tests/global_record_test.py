@@ -682,6 +682,42 @@ def test_map_paint():
     results.append("地图: 全局线路按速度配色绘制 + 录制中实时预览 OK")
 
 
+def test_spawn_side_color():
+    """阵亡叉/回放白点的颜色跟着“该队重生点在画面上是什么颜色”。
+
+    A/B 是两次独立观战, 每次都是“摄像机那一方 = 我方(蓝)” —— 所以同一个条目里两队
+    的 `side` 是反的, 写死 A=蓝/B=红 会跟画出来的重生点对不上(用户 2026-10-22)。
+    """
+    from PyQt6.QtGui import QColor
+    from wt81111g.route_map_view import COLOR_DEAD_MARK_A, RouteMapView
+
+    view = RouteMapView()
+    view.resize(400, 400)
+    view.set_map_bytes(png_bytes(), key="M")
+    # 这次录制里 A 队是“敌方”(红)、B 队才是“我方”(蓝) —— 故意与默认相反
+    view.set_spawns([{"kind": "tank", "x": 0.2, "y": 0.2, "side": "enemy"},
+                     {"kind": "tank", "x": 0.8, "y": 0.8, "side": "ours"}])
+
+    def life(lid, side, x, y):
+        return UnitLife(life_id=lid, icon="MediumTank", obj_type="ground_model",
+                        map_key="M", side=side,
+                        points=[TrackPoint(x, y, 0.0, 10.0),
+                                TrackPoint(x + 0.05, y, 5.0, 10.0)])
+
+    a = life("A1", "A", 0.21, 0.20)
+    b = life("B1", "B", 0.79, 0.81)
+    view.set_playback([a, b])
+    assert view._side_spawn_color("A") == QColor("#fa0C00"), view._side_spawn_color("A")
+    assert view._side_spawn_color("B") == QColor("#174DFF"), view._side_spawn_color("B")
+    assert view._dead_mark_color(a).name() == "#fa0c00"
+    assert view._dead_mark_color(b).name() == "#174dff"
+    # 认不出重生点(没画重生点)时退回旧口径: A 队蓝
+    view.set_spawns([])
+    view.set_playback([a])
+    assert view._dead_mark_color(a).name() == COLOR_DEAD_MARK_A.name()
+    results.append("地图: 阵亡叉/回放白点颜色跟随该队重生点颜色 OK")
+
+
 def test_only_global(tmpdir: str):
     """一张地图**只有全局录制**、没有单条路线时, 侧栏也要能正常挂出条目。"""
     app = QApplication.instance()
@@ -1321,6 +1357,7 @@ def main() -> int:
     test_frame_align()
     test_store(tmpdir)
     test_map_paint()
+    test_spawn_side_color()
     test_live_layer_no_rebuild()
     test_playback_timeline()
     test_spawn_start_check()
