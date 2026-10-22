@@ -129,6 +129,22 @@ SEG_CAP = Qt.PenCapStyle.FlatCap
 # 又能避免每涨 1 km/h 就重建一次。
 VMAX_REBUILD_RATIO = 0.04
 
+# ---------------------------------------------------------------- 转弯半径
+# 悬停显示的“这个位置过弯要多大半径”。三个时间半宽(秒)的窗口同时算一遍:
+# 中间那个当主值, 两侧的拿来做**一致度** —— 三者差别大就说明这一段半径本身在变
+# (入弯/出弯过渡、或者接近直线), 那时的数只能看趋势。
+# 取 0.45s: 2026-10-22 用真实录制(12.5Hz)做实验, ±0.25s 的噪声放大明显,
+# ±0.8s 在 S 弯又会把两段弯平均掉; 0.4~0.5s 的中位误差最小(~5%)。
+# 注: 窗口按**时间**而不是点数 —— 否则换个采样间隔(40/80/200ms)结果就变了。
+TURN_HALF = 0.45
+TURN_HALF_SMALL = 0.25
+TURN_HALF_LARGE = 0.80
+# 窗口最少凑几个点: 采样间隔大的轨迹(老数据/掉帧)靠时间窗只括到 1~2 个点,
+# 那就继续往外扩。正常录制(12.5~25Hz)下时间窗本来就是主导条件。
+TURN_MIN_POINTS = 5
+TURN_MIN_SPEED = 1.0        # km/h; 低于它视为“静止”(8111 速度≈0 时半径无意义)
+TURN_RADIUS_CAP = 999999.0  # 纯直线会给天文数字, 封顶避免把信息栏撑破
+
 
 def _normalized(x: float, y: float) -> QPointF:
     """`build_speed_segments` 用的“坐标变换”: 原样返回归一化坐标。"""
@@ -2055,64 +2071,110 @@ class RouteMapView(QWidget):
                 best_d2, best = k_d2, (rec, pts[k])
         return best
 
+    def _radius_at(self, pts: list[RoutePoint], idx: int,
+                   half: float) -> float | None:
+        """以 `pts[idx]` 为中心、**时间**半宽 `half` 秒的窗口, 估算转弯半径。
+
+        做法: 窗口内朝向角 θ 做最小二乘回归, 斜率即平均角速度 ω, 再按 R = v/ω
+        换算(v = 窗口内有效速度的平均, km/h → m/s)。
+
+        * 用回归而不是“首末两点差分”: 二者数学上等价于平均值, 但回归把中间每个点
+          都用上了, 白噪声被压掉 √N 倍(2026-10-22 实测: 同一条真实轨迹上
+          ±0.25s 差分与 ±0.45s 回归差 2~3 倍);
+        * 速度用 8111 的 `speed` 而不是位移推算: 实测两者比值 0.977(富尔达),
+          加速/减速时也稳定, 说明**没有滞后**; 而位移推算会带上地图边长常数
+          那 2.3% 的标定误差。
+
+        返回 None 表示算不了(点太少/没有朝向数据/车停着); 纯直线可能返回一个
+        很大的数(由调用方封顶)。
+        """
+        n = len(pts)
+        t0 = pts[idx].t
+        lo = hi = idx
+        while lo > 0 and (t0 - pts[lo - 1].t <= half
+                          or hi - lo + 1 < TURN_MIN_POINTS):
+            lo -= 1
+        while hi < n - 1 and (pts[hi + 1].t - t0 <= half
+                              or hi - lo + 1 < TURN_MIN_POINTS):
+            hi += 1
+        win = pts[lo:hi + 1]
+        if len(win) < 4:
+            return None
+        ts: list[float] = []
+        angs: list[float] = []
+        for p in win:
+            if not p.dx and not p.dy:
+                continue                    # 缺朝向 → 不参与(老轨迹整条都没有)
+            ts.append(p.t)
+            angs.append(math.atan2(p.dy, p.dx))
+        if len(ts) < 4:
+            return None
+        speeds = [p.speed for p in win if p.speed > 0]
+        if not speeds:
+            return None
+        v = (sum(speeds) / len(speeds)) / 3.6          # km/h → m/s
+        if v * 3.6 < TURN_MIN_SPEED:
+            return None
+        # unwrap(处理 ±π 跨越), 再对 θ(t) 做最小二乘直线拟合
+        un = [angs[0]]
+        for a in angs[1:]:
+            d = a - un[-1]
+            while d > math.pi:
+                d -= 2.0 * math.pi
+            while d < -math.pi:
+                d += 2.0 * math.pi
+            un.append(un[-1] + d)
+        tm = sum(ts) / len(ts)
+        am = sum(un) / len(un)
+        den = sum((t - tm) ** 2 for t in ts)
+        if den <= 0.0:
+            return None
+        omega = abs(sum((t - tm) * (a - am) for t, a in zip(ts, un)) / den)
+        if omega < 1e-12:
+            return TURN_RADIUS_CAP                       # 完全直线
+        return v / omega
+
+    @staticmethod
+    def _fmt_radius(radius: float) -> str:
+        """半径文本: 最多 6 位数字, 其中 2 位小数(如 `15.32` / `3637.27`)。
+
+        超过 9999.99 时小数位让给整数位 —— 那种值只可能是接近直线, 多一点小数
+        没有意义, 也免得把悬浮信息栏撑宽。
+        """
+        r = min(max(radius, 0.0), TURN_RADIUS_CAP)
+        if r < 9999.995:
+            return f"{r:.2f}"
+        return f"{r:.0f}"
+
     def _turn_radius_text(self, rec: RouteRecord, pt: RoutePoint) -> str:
-        """悬停点附近的**转弯半径**估算(用于判断这辆车当时怎么过弯)。
+        """悬停点附近的**转弯半径**(用于判断这辆车当时怎么过弯)。
 
-        做法: 取前后各 3 个采样点(25Hz → 约 ±120ms), 用朝向 `dx/dy` 的**累积角变化**
-        求平均角速度 ω, 再按 R = v / ω 换算 —— v 来自采样点自带的速度(km/h)。
-        比“三点外接圆”稳: 朝向是 8111 给的连续量, 而三点外接圆在采样点几乎重合时
-        半径会炸掉(录制时停车采样就会这样)。
+        2026-10-22 用户定下的显示规则:
+        * **不猜“直线”** —— 一直给数值(直线就是很大的数, 自己看得出来);
+        * 数值最多 6 位数字, 其中 2 位小数(见 `_fmt_radius`);
+        * 后面带**多窗口一致度** `±x%`: 用 ±0.25s / ±0.45s / ±0.80s 三个窗口各算一次,
+          主值取中间那个, `x%` = (最大-最小)/主值。`x` 小 → 这一段半径稳定可信;
+          `x` 很大 → 正处于入弯/出弯过渡或者基本是直线, 只能看个趋势。
 
-        没有朝向数据的老轨迹、或 ω 小到几乎直线时, 分别返回空串 / “直线”。
-
-        **注意这是局部平均值, 不是精确几何量**: 窗口只有 ±120ms, 且朝向是 8111
-        按帧给的连续量, 所以两位小数(用户 2026-10-22 要求)体现的是同一窗口内的
-        稳定性, 不代表真实半径精确到厘米级。速度也取窗口内**有效点的平均**
-        (原先是两端点平均, 在加速/刹车时偏差更明显)。
+        算法与数据含义写在「帮助 → 关于」里(用户要求)。
         """
         pts = rec.points
         if len(pts) < 5:
             return ""
         idx = bisect_right(self._times(rec), pt.t) - 1
         idx = max(0, min(len(pts) - 1, idx))
-        k = 3
-        i0, i1 = max(0, idx - k), min(len(pts) - 1, idx + k)
-        if i1 - i0 < 2:
-            return ""
-        total = 0.0
-        used = 0
-        vsum = 0.0
-        vcnt = 0
-        prev: float | None = None
-        for j in range(i0, i1 + 1):
-            p = pts[j]
-            if p.speed > 0:                  # 停车采样点(车没动)不参与平均
-                vsum += p.speed
-                vcnt += 1
-            if not p.dx and not p.dy:
-                prev = None                  # 缺朝向 → 断开, 不要跨过它算转角
-                continue
-            a = math.atan2(p.dy, p.dx)
-            if prev is not None:
-                d = a - prev
-                while d > math.pi:
-                    d -= 2.0 * math.pi       # 处理 ±π 跨越
-                while d < -math.pi:
-                    d += 2.0 * math.pi
-                total += d
-                used += 1
-            prev = a
-        dt = pts[i1].t - pts[i0].t
-        if used < 2 or dt <= 0:
-            return ""                        # 旧轨迹没有朝向数据
-        omega = abs(total) / dt
-        v = (vsum / vcnt) / 3.6 if vcnt else 0.0             # km/h → m/s
-        if omega < 0.02 or v <= 0:           # < 1.15°/s 视为直线
-            return "转弯半径 直线"
-        radius = v / omega
-        if radius > 5000.0:
-            return "转弯半径 直线"
-        return f"转弯半径 ~{radius:.2f} m"
+        mid = self._radius_at(pts, idx, TURN_HALF)
+        if mid is None:
+            return ""                        # 老轨迹没朝向 / 车停着 → 不显示这一项
+        vals = [r for r in (self._radius_at(pts, idx, TURN_HALF_SMALL),
+                            mid,
+                            self._radius_at(pts, idx, TURN_HALF_LARGE))
+                if r is not None]
+        text = f"转弯半径 {self._fmt_radius(mid)} m"
+        if len(vals) >= 2 and mid > 0:
+            spread = (max(vals) - min(vals)) / mid * 100.0
+            text += f" ±{min(spread, 999.0):.0f}%"
+        return text
 
     def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
         """悬停浮层文本。
