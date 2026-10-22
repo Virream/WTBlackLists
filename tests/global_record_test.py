@@ -860,13 +860,15 @@ def test_spawn_start_check():
 
 
 def test_kill_timeline():
-    """用 hudmsg 的击毁时刻"时间差模式"反推摄像机挂着那位玩家的死亡时刻。
+    """用 hudmsg 的击毁时刻 + “每条 Player 线的时间段”反推摄像机那位的死亡时刻。
 
-    背景(用户 2026-10-22): 录制全局路线时视角挂在我方一位玩家身上, 他阵亡后
-    8111 依旧持续上报(icon 不消失) → 那条线拿不到死亡时刻。其余玩家正常消失判死。
-    思路: 本局所有线路的结束时刻 ≈ hudmsg 击毁时刻 + 一个**未知固定偏移**
-    (绝对偏移不可用: 录像从服务器端就开始、准备阶段的 15 秒还是假数字),
-    所以扫一遍偏移量取配对最多的, 对不上的击毁就是那位玩家的死亡。
+    背景(用户 2026-10-22 修正口径): 录制全局路线时视角挂在我方一位玩家身上, 他阵亡后
+    8111 不会让 icon 立刻消失 —— 那条线继续上报残骸, 直到**他重生那一刻**才断;
+    他就此退出对局的话残骸会一直上报到录制结束。其余玩家 icon 正常消失, 判死有效。
+
+    思路: 全局线路的结束时刻 ≈ hudmsg 击毁时刻 + 一个**未知固定偏移**(绝对偏移不可
+    用: 录像从服务器端就开始、准备阶段的 15 秒还是假数字), 先用其他玩家扫出偏移,
+    再把那位的阵亡按“落在哪条 Player 线的时间段”逐段认领。
     """
     from wt81111g import kill_timeline as kt
 
@@ -913,27 +915,14 @@ def test_kill_timeline():
     assert st["乙"]["kills"] == 1 and st["甲"]["kills"] == 1
     assert "weapons/su_r_77_1/short" not in st, st     # 武器/AI 不是玩家
 
-    # ---- 4) “停住不动”的时刻: 心跳点 0.45m 的抖动不能算“还在动”,
-    #         但刹车滑行的 1~3m 必须排除(否则会早报十几秒)
+    # ---- 4) 阵亡按“每条 Player 线的时间段”认领 —— 不再有任何静止/停车判定
     def pts(*rows):
-        """(x, y, t, speed) —— 归一化坐标, 0.0001 ≈ 0.4m(4km 地图)"""
+        """(x, y, t, speed) —— 归一化坐标"""
         return [TrackPoint(x, y, t, v) for x, y, t, v in rows]
 
-    stop_pts = pts((0.5000, 0.5000, 152.0, 0.0), (0.5000, 0.5000, 167.0, 0.0),
-                   (0.5020, 0.5000, 176.0, 8.0), (0.5040, 0.5000, 179.4, 13.0),
-                   (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
-                   (0.5039, 0.5000, 224.4, 0.0))
-    got = kt.tail_stop(stop_pts)
-    assert got is not None and abs(got[0] - 179.4) < 1e-6, got
-
-    creep_pts = pts((0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
-                    (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))
-    got = kt.tail_stop(creep_pts)
-    assert got is not None and abs(got[0] - 364.6) < 1e-6, got   # 351.0 是刹车的 1.6m
-
-    moving_pts = pts((0.1, 0.1, 0.0, 30.0), (0.2, 0.1, 5.0, 30.0),
-                     (0.3, 0.1, 10.0, 30.0))
-    assert kt.tail_stop(moving_pts) is None, "一直在跑的不该被判成残骸"
+    # 一段只收自己的那次阵亡: 比赛 184.4(偏移 +5 → 179.4)在段内, 300 → 295 在段外
+    assert kt.deaths_in([184.4, 300.0], 5.0, 152.0, 224.0) == [179.4]
+    assert kt.deaths_in([], 5.0, 0.0, 100.0) == []
 
     # ---- 5) 按昵称定位死亡时刻(结构仿诺曼底那局: 比赛 = 录制 + 5 秒)
     def life(lid, side, icon, rows, dead=True):
@@ -952,22 +941,31 @@ def test_kill_timeline():
             (0.5020, 0.5000, 176.0, 8.0), (0.5040, 0.5000, 179.4, 13.0),
             (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
             (0.5039, 0.5000, 224.4, 0.0))),
+        # 第一辆车的残骸 icon 在"他重生那一刻"消失 → 线断; 第二辆车是另一条 Player 线
+        life("A4", "A", "Player", (
+            (0.1000, 0.1000, 236.0, 0.0), (0.3000, 0.3000, 260.0, 40.0),
+            (0.3600, 0.3600, 300.0, 0.0))),
     ]
     rec2.sides["B"] = [
         life("B1", "B", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 50.0, 20.0))),
         life("B2", "B", "Player", (
             (0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
             (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))),
+        # 这一段他没阵亡 → 活到录制结束, 不该被截断
+        life("B3", "B", "Player", (
+            (0.1000, 0.1000, 400.0, 0.0), (0.2000, 0.2000, 440.0, 30.0),
+            (0.3000, 0.2000, 480.0, 0.0)), dead=False),
     ]
     rec2.kills = [
         {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A1 结束 10
         {"id": 2, "t": 35.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A2 结束 30
         {"id": 3, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ B1 结束 50
-        # 摄像机挂着的那两位: 停住之后才被打死
+        # 摄像机挂着的那两位: A 队死两次(两段各一次), B 队死一次
         {"id": 4, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
         {"id": 5, "t": 374.6, "msg": "w (ZTZ96) 击毁了 jjh67 (RDF/LT)"},
+        {"id": 6, "t": 250.0, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
         # 对空击杀(我们不录空中单位), 不该影响判定
-        {"id": 6, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"},
+        {"id": 7, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"},
     ]
     shift = kt.pooled_shift(rec2)
     assert abs(shift - 5.0) <= 0.6, shift
@@ -978,12 +976,21 @@ def test_kill_timeline():
 
     got = kt.resolve_deaths(rec2, {"A": "killflik", "B": "jjh67"})
     assert got["A"]["ok"] and got["B"]["ok"], got
-    assert abs(got["A"]["stop"] - 179.4) < 1e-6, got["A"]["stop"]
-    assert abs(got["A"]["death"] - 179.4) < 1.2, got["A"]        # 184.4 - 5
-    assert abs(got["B"]["death"] - 369.6) < 1.2, got["B"]        # 374.6 - 5
-    assert got["B"]["gap"] > 4.0, got["B"]      # 停住之后才死的情形要如实反映
+    # A 队两段(死了两次): 每段各认领自己那次阵亡
+    assert got["A"]["segments"] == 2, got["A"]
+    fix_a = [(f["life_id"], f["death"], f["tail"])
+             for f in got["A"]["fixes"] if f["ok"]]
+    assert [f[0] for f in fix_a] == ["A3", "A4"], fix_a
+    assert abs(fix_a[0][1] - 179.4) < 1.2, fix_a       # 184.4 - 5
+    assert abs(fix_a[1][1] - 245.0) < 1.2, fix_a       # 250.0 - 5
+    assert fix_a[1][2] > 40.0, fix_a                    # 线尾 300 - 245 → 残骸尾巴 55 秒
+    # B 队两段: 第一段有阵亡, 第二段没有 → 那段活到结束, 不修正
+    assert got["B"]["segments"] == 2, got["B"]
+    fix_b = {f["life_id"]: f["death"] for f in got["B"]["fixes"] if f["ok"]}
+    assert list(fix_b) == ["B2"], fix_b
+    assert abs(fix_b["B2"] - 369.6) < 1.2, fix_b   # 374.6 - 5
     text = kt.summarize(got)
-    assert "A 队 killflik" in text and "阵亡" in text, text
+    assert "A 队 killflik" in text and "修正 2/2 段" in text, text
     # 名字不在本局击毁里 / 他没阵亡 → 都要明确说“不修正”, 而不是乱猜一个
     assert not kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["ok"]
     assert "阵亡记录" in kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["note"]
@@ -992,11 +999,13 @@ def test_kill_timeline():
 
 
 def test_watcher_apply(tmpdir: str):
-    """指定观战玩家 → 把那条线截断到死亡时刻; 改回“不修正”能完整还原。
+    """指定观战玩家 → 把每条 Player 线各截断到自己的死亡时刻; 能完整还原。
 
-    为什么要截断而不是只改标记: 摄像机那位阵亡后 8111 还在上报残骸, 那段尾巴
-    能拖到整局结束(实测 201 秒)。不截断的话地图上的阵亡叉与“用时”都会落在
-    整局结束, 看不出他到底什么时候死的。
+    为什么要截断而不是只改标记: 摄像机那位阵亡后 8111 还在上报残骸 —— 下一次重生
+    前拖到“重生那一刻”, 若他退出对局则拖到整局结束(实测 201 秒)。不截断的话
+    地图上的阵亡叉与“用时”都会偏晚, 看不出他到底什么时候死的。
+
+    一局里他可能死两次(换了第二辆车), 那就是两条 Player 线, **两条都要单独截断**。
     """
     from wt81111g import kill_timeline as kt
 
@@ -1010,11 +1019,17 @@ def test_watcher_apply(tmpdir: str):
         UnitLife(life_id=f"{g.route_id}:A1", icon="MediumTank",
                  obj_type="ground_model", map_key="MAP1", side="A", dead=True,
                  points=pts((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 10.0, 20.0))),
+        # 第一辆车: 阵亡后残骸一直上报到“他重生那一刻”(260s)
         UnitLife(life_id=f"{g.route_id}:A2", icon="Player",
                  obj_type="ground_model", map_key="MAP1", side="A", dead=True,
                  points=pts((0.50, 0.50, 152.0, 0.0), (0.5020, 0.50, 176.0, 8.0),
                             (0.5040, 0.50, 179.4, 13.0), (0.5039, 0.50, 194.4, 0.0),
                             (0.5039, 0.50, 224.4, 0.0), (0.5039, 0.50, 260.0, 0.0))),
+        # 第二辆车: 又一条 Player 线, 阵亡后残骸拖到录制结束(420s)
+        UnitLife(life_id=f"{g.route_id}:A3", icon="Player",
+                 obj_type="ground_model", map_key="MAP1", side="A", dead=False,
+                 points=pts((0.10, 0.10, 300.0, 0.0), (0.1500, 0.15, 360.0, 30.0),
+                            (0.1600, 0.16, 380.0, 2.0), (0.1600, 0.16, 420.0, 0.0))),
     ]
     g.sides["B"] = [
         UnitLife(life_id=f"{g.route_id}:B1", icon="MediumTank",
@@ -1025,37 +1040,51 @@ def test_watcher_apply(tmpdir: str):
         {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},
         {"id": 2, "t": 55.0, "msg": "x (T-80) 击毁了 y (M1)"},
         {"id": 3, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+        {"id": 4, "t": 385.0, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
     ]
     store.add_global(g)
     assert not g.fixed, "新条目默认是“待修正”(侧栏会挂感叹号)"
 
     player = g.lives("A")[1]
+    player2 = g.lives("A")[2]
     original = [p.t for p in player.points]
+    original2 = [p.t for p in player2.points]
     resolved = store.set_watchers(g.route_id, {"A": "killflik"})
     assert resolved["A"]["ok"] and not resolved["B"]["ok"], resolved
+    assert resolved["A"]["segments"] == 2, resolved["A"]
+    fix = {f["life_id"]: f["death"] for f in resolved["A"]["fixes"] if f["ok"]}
+    assert list(fix) == [f"{g.route_id}:A2", f"{g.route_id}:A3"], fix
     assert g.fixed and g.watchers == {"A": "killflik"}, (g.fixed, g.watchers)
-    # 截断到死亡时刻(184.4 - 偏移 5 ≈ 179.4), 尾巴收进 trimmed
-    assert player.dead and player.death_t > 0, player.death_t
-    assert abs(player.points[-1].t - resolved["A"]["death"]) < 1e-6, player.points[-1]
+    # 两条线各自截断到自己的死亡时刻(比赛时刻 - 偏移 5), 尾巴收进 trimmed
+    assert player.dead and abs(player.death_t - 179.4) < 1.2, player.death_t
+    assert abs(player.points[-1].t - player.death_t) < 1e-6, player.points[-1]
     assert len(player.points) < len(original), (len(player.points), len(original))
     assert len(player.trimmed) == len(original), "原始点要留一份以便改主意"
-    assert player.points[-1].t < 260.0, "残骸尾巴应被截掉"
+    assert player.points[-1].t < 200.0, "残骸尾巴应被截掉"
+    assert player2.dead and abs(player2.death_t - 380.0) < 1.2, player2.death_t
+    assert player2.points[-1].t < 400.0, "退出后到录制结束的残骸尾巴应被截掉"
+    assert len(player2.trimmed) == len(original2)
 
     # 落盘/读回: 修正结果、原始点、watchers/fixed 都要在
     again = RouteStore(path)
     got = again.get_global(g.route_id)
     assert got is not None and got.fixed and got.watchers == {"A": "killflik"}
-    l2 = got.lives("A")[1]
+    l2, l2b = got.lives("A")[1], got.lives("A")[2]
     assert abs(l2.death_t - player.death_t) < 0.01
     assert abs(l2.points[-1].t - player.points[-1].t) < 0.01
     assert len(l2.trimmed) == len(original)
+    assert abs(l2b.death_t - player2.death_t) < 0.01
+    assert len(l2b.trimmed) == len(original2)
     # 还原后必须和录下来的原始数据一模一样
     again.set_watchers(g.route_id, {"A": "", "B": ""})
     l3 = got.lives("A")[1]
+    l3b = got.lives("A")[2]
     assert l3.death_t == 0.0 and l3.trimmed == [], (l3.death_t, l3.trimmed)
     assert [round(p.t, 2) for p in l3.points] == [round(t, 2) for t in original]
+    assert l3b.death_t == 0.0 and l3b.trimmed == [], (l3b.death_t, l3b.trimmed)
+    assert [round(p.t, 2) for p in l3b.points] == [round(t, 2) for t in original2]
     assert got.fixed and got.watchers == {}
-    results.append("全局录制: 指定观战玩家→截断死亡时刻/可还原/落盘 OK")
+    results.append("全局录制: 指定观战玩家→逐段截断死亡时刻/可还原/落盘 OK")
 
 
 def test_watcher_ui(tmpdir: str):

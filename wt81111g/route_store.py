@@ -958,8 +958,10 @@ class RouteStore:
         """指定“录制时镜头挂在谁身上”, 并按 hudmsg 的击毁时刻修正死亡时刻。
 
         `watchers` 形如 `{"A": "killflik", "B": "jjh67"}`; 某一队留空表示“这一队
-        不用修正”(他活到录制结束)。返回 `kill_timeline.resolve_deaths` 的结果,
-        界面拿它显示“阵亡于 3:28(停住后 0.0 秒)”。
+        不用修正”(他活到录制结束)。返回 `kill_timeline.resolve_deaths` 的结果。
+
+        **逐条 Player 线处理**: 他每死一次重生就会开一条新线, 所以同一队可能有好几条
+        (例如先阵亡再出第二辆车), 每条都要按它自己时间段内那次阵亡单独截断。
         """
         rec = self.get_global(gid)
         if rec is None:
@@ -972,9 +974,12 @@ class RouteStore:
             rec.fixed = True
             for side in GLOBAL_SIDES:
                 row = resolved.get(side) or {}
+                want = {fix["life_id"]: fix["death"]
+                        for fix in row.get("fixes") or [] if fix.get("ok")}
                 for life in kill_timeline.player_lines(rec, side):
-                    if row.get("ok") and life.life_id == row.get("life_id"):
-                        self._apply_death(life, row["death"])
+                    death = want.get(life.life_id)
+                    if death:
+                        self._apply_death(life, death)
                     else:
                         self._reset_death(life)
         self.save()

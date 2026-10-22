@@ -2,18 +2,22 @@
 
 ============================================================= 为什么要手动指定
 录制全局路线时, 镜头必须挂在我方一位玩家身上(8111 才肯报这一方), 于是那位玩家
-阵亡后 8111 **依旧持续上报残骸**, 他的线路一直到录制结束才断 —— 拿不到死亡时刻,
-地图上那一叉会画在"整局结束"的位置。
+(唯一 `icon == "Player"` 的线)的死亡时刻拿不到:
+
+* 他阵亡后 8111 不会让 icon 立刻消失 —— 那条线继续上报残骸, 一直画到“他重生
+  那一刻”才断, 所以线尾 = 重生时刻, 不是死亡时刻;
+* 他若就此退出对局、而比赛还没结束, 残骸会一直上报到录制结束。
 
 `/hudmsg` 的击毁文本里有**双方昵称**(`A (载具) 击毁了 B (载具)`), 只要知道镜头挂在
-谁身上, 就能从本局全部击毁里挑出他唯一那次阵亡。而 8111 不告诉我们这件事 ——
+谁身上, 就能按时间段把他每次阵亡认领到对应的那条线上。而 8111 不告诉我们这件事 ——
 只能问用户。本对话框就是从**本局击毁名单**里点选, 避免手打昵称出错(昵称里还夹着
 军团前缀和零宽空格)。
 
 =============================================================== 交互
-每队一个下拉框: 第一项是「这一队不用修正(他活到录制结束)」, 后面按"阵亡时刻离
-'他停住不动'那一刻有多近"排序 —— 第一位就是最可能的, 默认选中它。下方实时显示
-推算结果("阵亡 3:28, 停住后 0.0 秒"), 选错了能一眼看出来。
+每队一个下拉框: 第一项是「这一队不用修正(他活到录制结束)」, 后面按“他的阵亡命中
+了几段 Player 线”排序(命中越多越可能是他) —— 默认**不预选**, 因为同一时刻往往
+好几个人在死。下方实时显示推算结果(“修正 2/2 段 ｜ 阵亡 3:28、6:07”), 选错了能
+一眼看出来。
 """
 from __future__ import annotations
 
@@ -28,8 +32,8 @@ from .route_store import GLOBAL_SIDE_LABELS, GLOBAL_SIDES, fmt_time
 
 _TIP = (
     "8111 不告诉我们录制时镜头挂在谁身上, 而那位玩家阵亡后 8111 仍会继续上报残骸 ——\n"
-    "他的线路拿不到死亡时刻(线尾是整局结束)。这里从本局击毁名单里点选他, 程序就会\n"
-    "用 `/hudmsg` 的击毁时刻把死亡时刻补上。"
+    "他的线路要到「他重生那一刻」(或整局结束)才断, 所以死亡时刻偏晚。这里从本局\n"
+    "击毁名单里点选他, 程序就会用 `/hudmsg` 的击毁时刻逐段把死亡时刻补上。"
 )
 
 
@@ -112,10 +116,15 @@ class WatcherDialog(QDialog):
                 combo.blockSignals(False)
                 continue
             for row in ranked:
+                fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
                 text = "%s（%s）· 阵亡 %d 次" % (
                     row["watcher"], row.get("vehicle") or "?", len(row["deaths"]))
-                text += (" · 推算 %s" % fmt_time(row["death"]) if row["ok"]
-                         else " · 不适用")
+                if fixed:
+                    text += " · 命中 %s(%d/%d 段)" % (
+                        "、".join(fmt_time(f["death"]) for f in fixed),
+                        len(fixed), row.get("segments") or 0)
+                else:
+                    text += " · 不适用"
                 combo.addItem(text, row["watcher"])
                 combo.setItemData(
                     combo.count() - 1,
@@ -149,12 +158,15 @@ class WatcherDialog(QDialog):
                 note.setStyleSheet("color: #6b7280;")
                 continue
             row = resolved.get(side) or {}
-            if row.get("ok"):
+            fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
+            if fixed:
                 note.setText(
-                    "→ 阵亡 %s ｜ 他停住不动是 %s, 之后 %.1f 秒被打死 ｜ "
-                    "这一队的击毁对齐偏移 %+.1f 秒(配对 %d 条)"
-                    % (fmt_time(row["death"]), fmt_time(row["stop"]),
-                       row["gap"], row["shift"], row["hits"]))
+                    "→ 修正 %d/%d 段 ｜ 阵亡 %s ｜ 线尾多出来的残骸 %s 会被截掉 ｜ "
+                    "这一队时间轴偏移 %+.1f 秒(用其他玩家的 %d 条线对齐)"
+                    % (len(fixed), row.get("segments") or 0,
+                       "、".join(fmt_time(f["death"]) for f in fixed),
+                       "、".join("%.1f 秒" % f["tail"] for f in fixed),
+                       row.get("shift") or 0.0, row.get("hits") or 0))
                 note.setStyleSheet("color: #047857;")
             else:
                 note.setText("→ 不修正: %s" % (row.get("note") or "无法定位"))

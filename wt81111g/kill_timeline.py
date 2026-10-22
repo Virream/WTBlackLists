@@ -2,12 +2,18 @@
 
 ============================================================= 为什么需要它
 8111 的 `/map_obj.json` 只给**摄像机所在那一方**的单位。录制全局 A/B 队路线时,
-会刻意把视角挂在我方一位玩家身上(这样 8111 才会报这一方), 于是:
+会刻意把视角挂在我方一位玩家身上(这样 8111 才会报这一方), 于是"摄像机挂着的那位"
+(唯一 `icon == "Player"` 的线)的死亡时刻拿不到:
 
-* 那位玩家的车**阵亡后 8111 依旧持续上报**(实测), 他的 `icon` 永远不会消失;
-* 其余玩家阵亡后 `icon` 正常消失 → 现有的"消失即击毁"判死对他们完全有效。
+* 他阵亡后 8111 **不会**让 icon 立刻消失 —— 那条线继续上报残骸, 一直画到
+  "他重生那一刻"才断(用户 2026-10-22 实测口径: 他一出新车, 上一条命的残骸 icon
+  才消失);
+* 如果他就此退出对局、而比赛还没结束, 残骸会一直上报到录制结束;
+* **其余玩家 icon 正常消失** → "消失即击毁"的判死对他们完全有效, 不用修正。
 
-于是每队**恰好有 1 条线拿不到死亡时刻**(就是摄像机挂的那位), 表现为"活到录制结束"。
+所以每队**只有** `icon == "Player"` 的那一两条线(一条命一条)需要修正, 表现为
+"阵亡时刻 = 重生时刻 / 录制结束"。而 `icon == "Player"` 本身就把线指出来了 ——
+不需要再去猜哪条线是观战对象。
 
 ============================================================== 为什么能反推
 `/hudmsg` 的 `damage` 里有本局全部击杀文本(回放模式下 `events` 是空的):
@@ -18,19 +24,18 @@
 (第一名玩家重生) 差多少, 而且准备阶段那个"15 秒"是假数字(游戏会在最后几秒把
 时间拉长), 所以**绝对偏移不可用**(用户 2026-10-22 实测确认)。
 
-能用的只有两条线索, 合起来才能算准:
+于是分两步:
 
-1. **位置**: 他阵亡后车变成残骸不再移动 → 这条线的"永久静止段"起点就是
-   "他停住不动"的那一刻(见 `tail_stop`)。实测(诺曼底 2026-10-22): "刚停车就
-   被打死"的情形下这个时刻与真实死亡时刻**完全一致**(179.4s ↔ 3:28)。
-   但它只是**下界**: 停稳之后还可能被打死(实测有一位停了 9.8 秒才死)。
-2. **昵称**: `/hudmsg` 的击毁文本里带**双方昵称**(`A (载具) 击毁了 B (载具)`),
+1. **对齐时间轴**: 用"icon 正常消失那些线的结束时刻 ↔ 击毁时刻"拟合出本队的
+   平移量(见 `estimate_shift` / `side_shift`)。这一步必须拿**其他玩家**的数据
+   当锚点 —— 观战对象的线尾是重生时刻/录制结束, 本来就不是死亡时刻。
+2. **按昵称认领**: `/hudmsg` 的击毁文本里带**双方昵称**(`A (载具) 击毁了 B (载具)`),
    而用户知道录制时镜头挂在谁身上 —— 界面上点点选出来即可(见 `rank_watchers`)。
-   有了昵称就能从本局全部击毁里挑出他唯一的那次阵亡, 不必靠猜。
 
-绝对偏移仍然不可用(回放从服务器端就开始计时、准备阶段的 15 秒还是假数字),
-所以先按"线路结束时刻 ↔ 击毁时刻"拟合出这一队的平移量(见 `estimate_shift`),
-再把击毁时刻换算回本软件的时间轴。
+有了这两样, 每条 `icon == "Player"` 的线取"时间段内**最后一次**属于他的阵亡"即可:
+每段只可能死一次(死了才会重生、才会开下一条线), 所以**不需要任何"停没停"的猜测**
+(早期版本靠"线尾永久静止段"推死亡时刻, 2026-10-22 整体删除 —— 用户指出的三种
+真实情形里它一次都用不上, 反而会把正确答案否掉)。
 
 本模块**只做计算**, 不落盘; 真正截断线路在 `RouteStore.set_watchers` 里。
 """
@@ -44,15 +49,9 @@ log = logging.getLogger("kill_timeline")
 ZW_SPACE = "\u200b"          # 8111 的文本里中文字符之间夹着零宽空格
 KILL_MARK = "击毁了"          # 只认击杀; "引燃了" / "获得嘉奖" 不算死亡
 PLAYER_ICON = "player"       # 8111 给"摄像机挂着的那位玩家"用的 icon(比较时转小写)
-MATCH_TOL = 2.0              # 配对容差(秒): 两队时间轴本身还差 1~2 秒
-# "永久静止"判定半径(归一化坐标)。4km 的地图上 0.00025 ≈ 1m。
-# 太大会把**刹车滑行**当成已经停住: 实测 B2 那条线用 1.6m 会把停车时刻
-# 从 364.6s 提前到 351.6s(多算 13 秒); 太小又会被心跳点 0.45m 的抖动挡住。
-STOP_RADIUS = 0.00025
-# 静止段至少这么长才可能是残骸(死亡后不再动)。真活到最后的玩家一直在跑。
-STATIC_MIN = 5.0
-# 把昵称的阵亡时刻往下限方向放宽这么多秒再找 —— 拟合出的平移量本身有 ±1s 抖动。
-CAND_TOL = 2.0
+# 阵亡时刻与线路时间段比对的容差(秒): 拟合出的平移量本身有 ±1s 抖动, 而线尾
+# (他重生或退出的那一刻)也可能比真实死亡晚几秒。
+CAND_TOL = 3.0
 
 
 def clean_text(text) -> str:
@@ -131,41 +130,26 @@ def raw_points(life) -> list:
     """这条线的**原始**点序列(已修正过的线返回修正前那一份)。
 
     修正的做法是"截断到死亡时刻 + 补一个合成点"(见 `RouteStore.set_watchers`),
-    截断后 `points` 里已经没有残骸尾巴了 —— 重新指定观战玩家时必须基于原始点,
-    否则算不出"他什么时候停住"。
+    截断后 `points` 里已经没有残骸尾巴了 —— 改选另一位观战玩家时必须基于原始点,
+    否则这条线的时间段(起点/终点)会被上一次的修正吃掉, 判断会跟着错。
     """
     trimmed = getattr(life, "trimmed", None)
     return list(trimmed) if trimmed else list(life.points)
 
 
-def tail_stop(points, radius: float = STOP_RADIUS,
-              min_tail: float = STATIC_MIN) -> tuple[float, int] | None:
-    """车"停住不动"的那一刻 = 尾部永久静止段的起点。返回 `(时刻, 下标)`。
-
-    **不能**用"最后一次位置变化": 静止时程序每 15 秒补一个心跳点, 心跳点与残骸
-    之间会有 0.4~0.5m 的抖动, 那一下会被误当成"还在动"(实测 A23: 车 179.4s 就
-    停了, 心跳点却把"最后移动时刻"推迟到 194.4s, 差了整整 15 秒)。
-
-    做法: 取**最后一个点**当锚, 往前一直走到离开 `radius` 为止。只认
-    "从这里到结尾都不动", 中途停一下再开走不会被误判。静止段短于 `min_tail`
-    就返回 None(说明到录制结束他还在动 → 大概率没死)。
-
-    锚必须取**线尾那一个点**, 不能用尾部几点的平均值: 坦克停车前有 1~3m 的
-    刹车滑行, 用平均值会把停车时刻提前十几秒(实测 364.6s → 351.0s)。
-    """
-    n = len(points)
-    if n < 2:
-        return None
-    ax, ay = points[-1].x, points[-1].y
-    i = n - 1
-    while i > 0:
-        p = points[i - 1]
-        if ((p.x - ax) ** 2 + (p.y - ay) ** 2) ** 0.5 > radius:
-            break
-        i -= 1
-    if points[-1].t - points[i].t < min_tail:
-        return None
-    return points[i].t, i
+def deaths_in(deaths, shift: float, t0: float, t1: float,
+              tol: float = CAND_TOL) -> list[float]:
+    """他的阵亡(比赛时刻)里, 换算到录制时间轴后落在 `[t0-tol, t1+tol]` 的那些。"""
+    out = []
+    for d in deaths or []:
+        try:
+            t = float(d) - shift
+        except (TypeError, ValueError):
+            continue
+        if t0 - tol <= t <= t1 + tol:
+            out.append(t)
+    out.sort()
+    return out
 
 
 def split_actor(text) -> tuple[str, str]:
@@ -318,53 +302,73 @@ def side_shift(record, side: str, kills=None, base: float | None = None
 
 
 def player_lines(record, side: str) -> list:
-    """这一队里"摄像机挂着的那位玩家"的线路(`icon` = `Player`)。每队最多 1 条。"""
+    """这一队里"摄像机挂着的那位玩家"的线路(`icon` = `Player`)。
+
+    **一条命一条**: 他一出新车, 上一条命的残骸 icon 就消失、那条线正常结束,
+    新车的线则从重生点重新开始。所以同一队可能有多条(他真的换过车)。
+    """
     return [lf for lf in record.lives(side)
             if (lf.icon or "").lower() == PLAYER_ICON and lf.points]
 
 
-def _resolve_one(record, side: str, name: str, shift: float, hits: int,
-                 stats: dict, ends: list[float] | None = None) -> dict:
-    """算出"这位玩家在什么时刻阵亡"(`side` 队录制时间轴上的秒数)。
+def player_segments(record, side: str) -> list[tuple]:
+    """这一队的 Player 线按起点排好 → `[(line, t0, t1)]`。
 
-    返回 dict: `ok` 成功与否; `stop` 停住时刻; `kill` 对应那次击毁的比赛时刻;
-    `death` 死亡时刻(录制时间轴); `gap` 停住之后多久才死;
-    `note` 一句话说明; 失败时 `note` 写清原因。
+    `t0` = 这一命被 8111 首次上报的时刻, `t1` = 这条线的最后一个点。
+    他阵亡后车身不再动, 线会一直延伸到"他重生那一刻"(残骸尾巴, 比真实死亡
+    晚几秒); 最后一条线如果他是退出对局/活到结束, 尾巴能拖到录制结束。
+
+    这些时间段**互不重叠**、且一段只可能有一次他的阵亡 —— 这就是"按昵称认领
+    阵亡"的全部依据, 不需要任何静止/停车推断。
     """
+    out = []
+    for life in sorted(player_lines(record, side),
+                       key=lambda lf: raw_points(lf)[0].t):
+        pts = raw_points(life)
+        out.append((life, pts[0].t, pts[-1].t))
+    return out
+
+
+def resolve_side(record, side: str, name: str, shift: float, hits: int,
+                 stats: dict) -> dict:
+    """算出 `side` 队"摄像机那位玩家"**每一段**线路的死亡时刻。
+
+    返回 dict: `ok`(至少修正了一段); `segments` 段数; `death` 最后一段的阵亡时刻;
+    `fixes` 逐段结果(`life_id`/`t0`/`t_end`/`deaths`/`death`/`tail`/`ok`/`note`);
+    `shift`/`hits` 是这一队的时间轴对齐信息; `note` 一句话说明。
+    """
+    segs = player_segments(record, side)
     row: dict = {"ok": False, "side": side, "watcher": name, "shift": shift,
-                 "hits": hits, "stop": 0.0, "kill": 0.0, "death": 0.0,
-                 "gap": 0.0, "life_id": "", "note": ""}
-    lines = player_lines(record, side)
-    if not lines:
-        row["note"] = "这一队没有观战玩家的线路(icon=Player), 无法定位"
+                 "hits": hits, "segments": len(segs), "fixes": [],
+                 "death": 0.0, "note": ""}
+    if not segs:
+        row["note"] = "这一队没有观战玩家的线路(icon=Player), 不用修正"
         return row
-    life = max(lines, key=lambda lf: raw_points(lf)[0].t)
-    pts = raw_points(life)
-    row["life_id"] = life.life_id
-    t0, t_end = pts[0].t, pts[-1].t
-    stop = tail_stop(pts)
-    row["stop"] = stop[0] if stop else 0.0
     deaths = (stats.get(name) or {}).get("deaths") or []
     if not deaths:
         row["note"] = "本局没有这位玩家的阵亡记录"
         return row
-    # 只看落在这一段观战时间里的阵亡(把比赛时刻换算到录制时间轴再比)
-    window = [d - shift for d in deaths
-              if t0 - CAND_TOL <= d - shift <= t_end + CAND_TOL]
-    if not window:
-        row["note"] = "他的阵亡不在这一段观战时间里(可能活到录制结束)"
-        return row
-    floor = (stop[0] if stop else t0) - CAND_TOL
-    after = [d for d in window if d >= floor]
-    if not after:
-        # 他的阵亡全部早于“车停住不动”那一刻 —— 而他停下来就是因为被打死,
-        # 所以这个人**不可能是**摄像机挂着的那位(这个信息还能帮用户排除)。
-        row["note"] = "他的阵亡都早于这条线停住的时刻, 不可能是观战对象"
-        return row
-    death = min(after[0], t_end)
-    row.update(ok=True, death=death, kill=death + shift,
-               gap=death - (stop[0] if stop else t0))
-    row["note"] = "阵亡于停住之后 %.1f 秒" % row["gap"]
+    for life, t0, t1 in segs:
+        hit = deaths_in(deaths, shift, t0, t1)
+        fix = {"life_id": life.life_id, "t0": t0, "t_end": t1,
+               "deaths": list(hit), "ok": False, "death": 0.0, "kill": 0.0,
+               "tail": 0.0, "note": ""}
+        if hit:
+            death = hit[-1]         # 段内最后一次(正常一段只有一次)
+            fix.update(ok=True, death=death, kill=death + shift,
+                       tail=max(0.0, t1 - death))
+            fix["note"] = ("阵亡 %.1fs, 这条线之后还上报了 %.1fs 残骸"
+                           % (death, fix["tail"]))
+        else:
+            fix["note"] = "这一段没有他的阵亡 → 他在这段活到结束"
+        row["fixes"].append(fix)
+    fixed = [f for f in row["fixes"] if f["ok"]]
+    if fixed:
+        row["ok"] = True
+        row["death"] = fixed[-1]["death"]
+        row["note"] = "修正 %d/%d 段" % (len(fixed), len(segs))
+    else:
+        row["note"] = "他的阵亡都不在这些线的时间段内 → 不修正(他活到录制结束)"
     return row
 
 
@@ -372,9 +376,10 @@ def rank_watchers(record, side: str, kills=None, shift=None,
                   hits: int | None = None) -> list[dict]:
     """候选观战玩家(界面用), 第一位最可能。
 
-    排序: 先看能不能判定, 再按“他的阵亡时刻离这队停住不动有多近”。注意这只是
-    把可能性高的人往前提 —— 同一时刻往往好几个人在死, 真正的“最可能”也可能
-    排到第三四位, 所以界面不预选, 让用户看一眼名单自己点。
+    排序依据是**时间段命中数**: 观战对象每死一次才会重生、才会开下一条 Player 线,
+    所以"他的阵亡刚好落在这些段里"是最硬的信号(早期那套"离停车时刻多近"的排序
+    2026-10-22 已删除)。但同一时刻往往好几个人在死, 打平很常见, 所以界面
+    **不预选**, 让用户扫一眼名单自己点。
     """
     if kills is None:
         kills = merge_kills(record)
@@ -382,22 +387,24 @@ def rank_watchers(record, side: str, kills=None, shift=None,
         shift, got = side_shift(record, side, kills)
         hits = got if hits is None else hits
     stats = player_stats(kills)
-    ends = side_ends(record, side)
     out = []
     for name, st in stats.items():
         if not st.get("vehicle") or not st.get("deaths"):
             continue            # 只打死过别人、自己没死过的, 不可能是“阵亡待修正”
-        row = _resolve_one(record, side, name, shift, int(hits or 0), stats, ends)
+        row = resolve_side(record, side, name, shift, int(hits or 0), stats)
         row["vehicle"] = st.get("vehicle") or ""
         row["deaths"] = list(st.get("deaths") or [])
         row["kills"] = int(st.get("kills") or 0)
+        row["fixed_count"] = sum(1 for f in row["fixes"] if f["ok"])
         out.append(row)
-    out.sort(key=lambda r: (not r["ok"], abs(r["gap"]) if r["ok"] else 0.0))
+    out.sort(key=lambda r: (-r["fixed_count"],
+                            len(r["deaths"]) - r["fixed_count"],
+                            -len(r["deaths"])))
     return out
 
 
 def resolve_deaths(record, watchers: dict, kills=None) -> dict[str, dict]:
-    """`{"A": 结果, "B": 结果}` —— 两队各自"摄像机那位玩家"的死亡时刻。"""
+    """`{"A": 结果, "B": 结果}` —— 两队各自"摄像机那位玩家"逐段线路的死亡时刻。"""
     if kills is None:
         kills = merge_kills(record)
     stats = player_stats(kills)
@@ -406,23 +413,26 @@ def resolve_deaths(record, watchers: dict, kills=None) -> dict[str, dict]:
     for side in ("A", "B"):
         name = str((watchers or {}).get(side) or "").strip()
         if not name:
-            out[side] = {"ok": False, "side": side, "watcher": "", "note": "未指定"}
+            out[side] = {"ok": False, "side": side, "watcher": "",
+                         "note": "未指定", "segments": 0, "fixes": [],
+                         "death": 0.0, "shift": 0.0, "hits": 0}
             continue
         shift, hits = side_shift(record, side, kills, base)
-        out[side] = _resolve_one(record, side, name, shift, hits, stats,
-                                 side_ends(record, side))
+        out[side] = resolve_side(record, side, name, shift, hits, stats)
     return out
 
 
 def summarize(resolved: dict) -> str:
-    """把 `resolve_deaths` 的结果压成一句话(界面/日志用)。"""
+    """把 `resolve_deaths` 的结果压成一句话(日志用)。"""
     parts = []
     for side in ("A", "B"):
         row = (resolved or {}).get(side) or {}
         name = row.get("watcher") or "?"
-        if row.get("ok"):
-            parts.append("%s 队 %s → 阵亡 %.1fs(停住后 %.1fs)"
-                         % (side, name, row["death"], row["gap"]))
+        fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
+        if row.get("ok") and fixed:
+            parts.append("%s 队 %s → 修正 %d/%d 段, 阵亡 %s"
+                         % (side, name, len(fixed), row.get("segments") or 0,
+                            "、".join("%.1fs" % f["death"] for f in fixed)))
         else:
             parts.append("%s 队 %s → 不修正(%s)"
                          % (side, name, row.get("note") or ""))

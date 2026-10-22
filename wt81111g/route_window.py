@@ -1767,8 +1767,9 @@ class RouteTesterWindow(QMainWindow):
             act_fix = QAction("指定观战玩家(修正死亡时刻)…", self)
             act_fix.setToolTip(
                 "8111 不告诉我们录制时镜头挂在谁身上 —— 而那位玩家阵亡后 8111\n"
-                "仍会继续上报残骸, 导致他的死亡时刻落在整局结束。\n"
-                "在这里从本局击毁名单里点选他, 程序就会把死亡时刻补上。")
+                "仍会继续上报残骸, 他的线路要到“他重生那一刻”或整局结束才断,\n"
+                "所以死亡时刻偏晚。在这里从本局击毁名单里点选他, 程序就会\n"
+                "用 hudmsg 的击毁时刻逐段把死亡时刻补上。")
             act_fix.setEnabled(g is not None and bool(g.count()))
             act_fix.triggered.connect(lambda: self._open_watcher_dialog(gid))
             menu.addAction(act_fix)
@@ -1797,9 +1798,10 @@ class RouteTesterWindow(QMainWindow):
             row = resolved.get(side) or {}
             if not row.get("watcher"):
                 continue
-            if row.get("ok"):
+            fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
+            if fixed:
                 parts.append(f"{side} 队 {row['watcher']} → 阵亡 "
-                             f"{fmt_time(row['death'])}(停住后 {row['gap']:.1f} 秒)")
+                             + "、".join(fmt_time(f["death"]) for f in fixed))
             else:
                 parts.append(f"{side} 队 {row['watcher']} → 不修正({row.get('note')})")
         self._set_status("已按观战玩家修正死亡时刻: " + " | ".join(parts)
