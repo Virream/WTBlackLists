@@ -510,6 +510,16 @@ class RouteMapGlView(RouteMapView):
             self._gl_icons.append(obj)
         return obj
 
+    def _prune_own_caches(self, alive: set) -> None:
+        """除了父类那几份几何缓存, 还要丢掉悬停命中的坐标数组。
+
+        `_gl_hit_cache` 每条轨迹存一份 (n,2) float64 —— 3.6 万点的线路约 0.6 MB,
+        删除/重录之后旧条目也留着, 所以跟父类一起剪。
+        """
+        super()._prune_own_caches(alive)
+        for rid in [k for k in self._gl_hit_cache if k not in alive]:
+            self._gl_hit_cache.pop(rid, None)
+
     def _hit_points(self, rec):
         """轨迹的归一化坐标数组 + 包围盒(悬停命中使用, 按点数缓存)。
 

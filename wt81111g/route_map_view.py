@@ -360,11 +360,46 @@ class RouteMapView(QWidget):
         self._vmax_cache: dict[str, tuple] = {}    # route_id -> (点数, 峰值速度)
         self._times_cache: dict[str, tuple] = {}   # route_id -> (点数, [t...])
         self._bbox_cache: dict[str, tuple] = {}    # route_id -> (点数, 包围盒) 视野裁剪用
+        self._cache_alive: set[str] = set()        # 上次剪枝时的“画面上存在的 id”
 
     def _on_blink_tick(self) -> None:
         """推进闪烁相位并重画。"""
         self._blink_t += BLINK_TICK_MS / 1000.0
         self.update()
+
+    def _cache_ids(self) -> set[str]:
+        """此刻**可能被画/被悬停**的 route_id 集合。"""
+        out: set[str] = set()
+        for seq in (self._visible, self._highlight, self._live_multi,
+                    self._playback_recs):
+            for rec in seq or ():
+                rid = getattr(rec, "route_id", "")
+                if rid:
+                    out.add(rid)
+        return out
+
+    def _prune_caches(self) -> None:
+        """丢掉“已经不在画面上”的轨迹缓存。
+
+        这些缓存都按 `route_id` 存(分桶几何/灰色折线/峰值/包围盒) —— 删除或重录
+        轨迹后旧条目再也不会被用到, 但也不会自己消失。一条 3.6 万点的线路光分桶
+        几何就佰 0.6 MB, 长会话下几十场就能攒到几十 MB。
+
+        只在**画面上的 id 集合变了**时才扫, 所以每帧调也不会成为负担
+        (`set_playback` 是逐帧调的)。
+        """
+        alive = self._cache_ids()
+        if alive == self._cache_alive:
+            return
+        self._cache_alive = alive
+        self._prune_own_caches(alive)
+
+    def _prune_own_caches(self, alive: set[str]) -> None:
+        """子类可重写(GPU 版还有自己的缓存)。"""
+        for cache in (self._seg_cache, self._line_cache, self._times_cache,
+                      self._bbox_cache, self._vmax_cache):
+            for rid in [k for k in cache if k not in alive]:
+                cache.pop(rid, None)
 
     def _sync_blink_timer(self) -> None:
         """按当前战区状态开关闪烁定时器。"""
@@ -544,6 +579,7 @@ class RouteMapView(QWidget):
         ids = {getattr(r, "route_id", "") for r in self._live_multi}
         for rid in [k for k in self._live_seg if k not in ids]:
             self._live_seg.pop(rid, None)      # 录制已结束/被清掉 → 丢掉它的缓存
+        self._prune_caches()
         if not self._live_multi:               # 录完了 → 释放累加层(省一张窗口大小的图)
             self._recycle(self._live_layer)
             self._live_layer = None
@@ -558,12 +594,14 @@ class RouteMapView(QWidget):
     def set_visible_tracks(self, recs: list[RouteRecord] | None) -> None:
         """设置要显示的历史轨迹(可多条, 按给定顺序绘制)。"""
         self._visible = list(recs or [])
+        self._prune_caches()
         self._drop_hover_if_gone()
         self.update()
 
     def set_highlight(self, recs: list[RouteRecord] | None) -> None:
         """设置高亮轨迹(侧栏选中的那几条) —— 用速度配色画在最上面。"""
         self._highlight = list(recs or [])
+        self._prune_caches()
         self._drop_hover_if_gone()
         self.update()
 
@@ -593,6 +631,7 @@ class RouteMapView(QWidget):
             self._play_seg = {}
         self._playback_recs = new
         self._playhead = playhead
+        self._prune_caches()
         self._drop_hover_if_gone()
         self.update()
 
@@ -625,6 +664,7 @@ class RouteMapView(QWidget):
         self._vmax_cache.clear()
         self._times_cache.clear()
         self._bbox_cache.clear()
+        self._cache_alive = set()
         self.update()
 
     # ------------------------------------------------------------------ 几何

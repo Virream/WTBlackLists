@@ -1794,19 +1794,27 @@ class RouteTesterWindow(QMainWindow):
         self._reload_tree()
         self._refresh_map_tracks()
         parts = []
+        fixed_any = False
         for side in GLOBAL_SIDES:
             row = resolved.get(side) or {}
             if not row.get("watcher"):
                 continue
             fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
+            fixed_any = fixed_any or bool(fixed)
             if fixed:
                 parts.append(f"{side} 队 {row['watcher']} → 阵亡 "
                              + "、".join(fmt_time(f["death"]) for f in fixed))
             else:
-                parts.append(f"{side} 队 {row['watcher']} → 不修正({row.get('note')})")
-        self._set_status("已按观战玩家修正死亡时刻: " + " | ".join(parts)
-                         if parts else "已保存(这一局不需要修正死亡时刻)",
-                         sticky=8.0)
+                parts.append(f"{side} 队 {row['watcher']} → 没对上任何线路"
+                             f"({row.get('note')})")
+        if not parts:
+            msg = "已保存(这一局不需要修正死亡时刻)"
+        elif fixed_any:
+            msg = "已按观战玩家修正死亡时刻: " + " | ".join(parts)
+        else:
+            msg = ("已保存, 但没有任何线路被修正 —— 黄色感叹号保留: "
+                   + " | ".join(parts))
+        self._set_status(msg, sticky=8.0)
 
     def _toggle_mark(self, gid: str, side: str, on: bool) -> None:
         """打/清“下次录到这一条”的标记。"""

@@ -980,7 +980,10 @@ class RouteStore:
         resolved = kill_timeline.resolve_deaths(rec, clean)
         with self._lock:
             rec.watchers = {side: name for side, name in clean.items() if name}
-            rec.fixed = True
+            # `fixed` = “这条录制已经没有待修正的死亡时刻” → 侧栏的黄色感叹号。
+            # **只有真的修过才置 True**: 选的名字一条线都没对上(或干脆没选),
+            # 说明那个叉还在错误的位置上, 感叹号应该留着提醒(用户 2026-10-22)。
+            rec.fixed = any((row or {}).get("ok") for row in resolved.values())
             for side in GLOBAL_SIDES:
                 row = resolved.get(side) or {}
                 want = {fix["life_id"]: fix["death"]

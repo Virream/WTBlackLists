@@ -63,6 +63,10 @@ SELF_COLOR = "#faC81E"
 # 阵亡时刻与线路时间段比对的容差(秒): 拟合出的平移量本身有 ±1s 抖动, 而线尾
 # (他重生或退出的那一刻)也可能比真实死亡晚几秒。
 CAND_TOL = 3.0
+# 阵亡→线尾(他重生/退出的那一刻)的正常延迟上限(秒)。
+# 实测: 3.8 ~ 25 秒; 30 秒已经很宽松。超过它说明“这条线的末尾与这次阵亡无关”,
+# 那个人不太可能是观战对象(比如他死在中途, 而线尾还在几百秒之后)。
+TAIL_SLACK = 30.0
 
 
 def clean_text(text) -> str:
@@ -413,6 +417,12 @@ def resolve_side(record, side: str, name: str, shift: float, hits: int,
             fix["note"] = "这一段没有他的阵亡 → 他在这段活到结束"
         row["fixes"].append(fix)
     fixed = [f for f in row["fixes"] if f["ok"]]
+    # “像不像观战对象”: **每一条命(每一段)都有他的阵亡** —— 他只有死了才会重生、
+    # 才会开下一条线。段数 ≥ 2 才有区分度(只有一段时谁都能“1/1”, 没有意义)。
+    row["strong"] = bool(fixed) and len(segs) >= 2 and len(fixed) == len(segs)
+    # 线尾对不上了几次: 阵亡后超过 TAIL_SLACK 秒线才断, 说明这段线的末尾与那次
+    # 阵亡无关 —— 候选排序靠它区分(单段录制时只有这个信号可用)。
+    row["tail_penalty"] = sum(1 for f in fixed if f["tail"] > TAIL_SLACK)
     if fixed:
         row["ok"] = True
         row["death"] = fixed[-1]["death"]
@@ -426,10 +436,9 @@ def rank_watchers(record, side: str, kills=None, shift=None,
                   hits: int | None = None) -> list[dict]:
     """候选观战玩家(界面用), 第一位最可能。
 
-    排序依据是**时间段命中数**: 观战对象每死一次才会重生、才会开下一条 Player 线,
-    所以"他的阵亡刚好落在这些段里"是最硬的信号(早期那套"离停车时刻多近"的排序
-    2026-10-22 已删除)。但同一时刻往往好几个人在死, 打平很常见, 所以界面
-    **不预选**, 让用户扫一眼名单自己点。
+    排序依据: 先看“每一条命都有他的阵亡”(`strong`), 再看命中段数, 再看“线尾对不对
+    得上”(阵亡后很快就重生/退出 → 像观战对象), 最后看阵亡次数是否多于录像里的车。
+    同一时刻往往好几个人在死, 所以界面仍然**不预选**, 让用户扫一眼名单自己点。
     """
     if kills is None:
         kills = merge_kills(record)
@@ -447,7 +456,8 @@ def rank_watchers(record, side: str, kills=None, shift=None,
         row["kills"] = int(st.get("kills") or 0)
         row["fixed_count"] = sum(1 for f in row["fixes"] if f["ok"])
         out.append(row)
-    out.sort(key=lambda r: (-r["fixed_count"],
+    out.sort(key=lambda r: (not r.get("strong"), -r["fixed_count"],
+                            r.get("tail_penalty") or 0,
                             len(r["deaths"]) - r["fixed_count"],
                             -len(r["deaths"])))
     return out

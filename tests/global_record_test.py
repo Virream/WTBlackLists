@@ -671,6 +671,14 @@ def test_map_paint():
     assert count(img, want) > 20, "全局录制时没有边录边画"
     view.set_live_multi(None)
     assert not count(canvas_of(), want), "清空后不该还留着全局线路"
+
+    # 已经不在画面上的轨迹, 它的几何缓存要被丢掉(否则删了很多录制后会一直攒着)
+    view.set_visible_tracks([life])
+    canvas_of()
+    assert view._seg_cache or view._line_cache or view._bbox_cache, "画过之后应有缓存"
+    view.set_visible_tracks([])
+    assert not (view._seg_cache or view._line_cache or view._bbox_cache
+                or view._vmax_cache or view._times_cache), "不在画面上的缓存应被剪掉"
     results.append("地图: 全局线路按速度配色绘制 + 录制中实时预览 OK")
 
 
@@ -1005,6 +1013,13 @@ def test_kill_timeline():
     assert abs(fix_b["B2"] - 369.6) < 1.2, fix_b   # 374.6 - 5
     text = kt.summarize(got)
     assert "A 队 killflik" in text and "修正 2/2 段" in text, text
+    # “像不像观战对象”: A 队两段都有他的阵亡 → strong; B 队只有一段命中有死
+    assert got["A"]["strong"], got["A"]
+    assert got["B"]["ok"] and not got["B"]["strong"], got["B"]
+    # 候选名单: 真正的观战对象排第一
+    ranked_a = kt.rank_watchers(rec2, "A")
+    assert ranked_a[0]["watcher"] == "killflik", ranked_a[:3]
+    assert ranked_a[0]["strong"], ranked_a[0]
     # 名字不在本局击毁里 / 他没阵亡 → 都要明确说“不修正”, 而不是乱猜一个
     assert not kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["ok"]
     assert "阵亡记录" in kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["note"]
@@ -1104,7 +1119,12 @@ def test_watcher_apply(tmpdir: str):
     assert [round(p.t, 2) for p in l3.points] == [round(t, 2) for t in original]
     assert l3b.death_t == 0.0 and l3b.trimmed == [], (l3b.death_t, l3b.trimmed)
     assert [round(p.t, 2) for p in l3b.points] == [round(t, 2) for t in original2]
-    assert got.fixed and got.watchers == {}
+    # 感叹号只在“真的修过”时才消失: 清空后应重新挂上(用户 2026-10-22)
+    assert not got.fixed and got.watchers == {}
+    # 选错名字(一条线都对不上) → 不做任何修改, 感叹号保留
+    again.set_watchers(g.route_id, {"A": "查无此人"})
+    assert not got.fixed, "没匹配到任何线路时不该去掉感叹号"
+    assert got.watchers == {"A": "查无此人"}
     results.append("全局录制: 指定观战玩家→逐段截断死亡时刻/可还原/落盘 OK")
 
 

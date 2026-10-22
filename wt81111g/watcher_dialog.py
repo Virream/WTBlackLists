@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QBrush, QColor, QFont
 from PyQt6.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QFrame, QGridLayout, QLabel,
     QVBoxLayout,
@@ -117,17 +118,35 @@ class WatcherDialog(QDialog):
                 continue
             for row in ranked:
                 fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
-                text = "%s（%s）· 阵亡 %d 次" % (
-                    row["watcher"], row.get("vehicle") or "?", len(row["deaths"]))
+                strong = bool(row.get("strong"))
+                head = "★ " if strong else ("✔ " if fixed else "")
+                text = "%s%s（%s）· 阵亡 %d 次" % (
+                    head, row["watcher"], row.get("vehicle") or "?",
+                    len(row["deaths"]))
                 if fixed:
-                    text += " · 命中 %s(%d/%d 段)" % (
-                        "、".join(fmt_time(f["death"]) for f in fixed),
-                        len(fixed), row.get("segments") or 0)
+                    text += " · 命中 %d/%d 段" % (len(fixed), row.get("segments") or 0)
+                    if strong:
+                        text += "(每一条命都对上)"
                 else:
-                    text += " · 不适用"
+                    text += " · 不适用(他的阵亡不在这几条线上)"
                 combo.addItem(text, row["watcher"])
+                idx = combo.count() - 1
+                # 着重显示: ★ = 看上去就是观战对象(粗体+深绿); ✔ = 能修一部分;
+                # 其余灰色 —— 用户扫一眼就知道哪些名字值得点。
+                if strong:
+                    f = QFont()
+                    f.setBold(True)
+                    combo.setItemData(idx, f, Qt.ItemDataRole.FontRole)
+                    combo.setItemData(idx, QBrush(QColor("#047857")),
+                                      Qt.ItemDataRole.ForegroundRole)
+                elif fixed:
+                    combo.setItemData(idx, QBrush(QColor("#1d4ed8")),
+                                      Qt.ItemDataRole.ForegroundRole)
+                else:
+                    combo.setItemData(idx, QBrush(QColor("#9ca3af")),
+                                      Qt.ItemDataRole.ForegroundRole)
                 combo.setItemData(
-                    combo.count() - 1,
+                    idx,
                     "阵亡时刻: %s\n%s" % (
                         "、".join(fmt_time(t) for t in row["deaths"][:6]),
                         row.get("note") or ""),
@@ -161,9 +180,10 @@ class WatcherDialog(QDialog):
             fixed = [f for f in row.get("fixes") or [] if f.get("ok")]
             if fixed:
                 note.setText(
-                    "→ 修正 %d/%d 段 ｜ 阵亡 %s ｜ 线尾多出来的残骸 %s 会被截掉 ｜ "
+                    "→ %s修正 %d/%d 段 ｜ 阵亡 %s ｜ 线尾多出来的残骸 %s 会被截掉 ｜ "
                     "这一队时间轴偏移 %+.1f 秒(用其他玩家的 %d 条线对齐)"
-                    % (len(fixed), row.get("segments") or 0,
+                    % ("看上去就是观战对象: " if row.get("strong") else "",
+                       len(fixed), row.get("segments") or 0,
                        "、".join(fmt_time(f["death"]) for f in fixed),
                        "、".join("%.1f 秒" % f["tail"] for f in fixed),
                        row.get("shift") or 0.0, row.get("hits") or 0))
@@ -173,7 +193,8 @@ class WatcherDialog(QDialog):
                                  "(hudmsg 里没有) —— 那几段保持原样" % miss)
                 note.setStyleSheet("color: #047857;")
             else:
-                note.setText("→ 不修正: %s" % (row.get("note") or "无法定位"))
+                note.setText("→ 不修正: %s" % (row.get("note") or "无法定位")
+                             + "\n(这一队不会有任何改动, 黄色感叹号会保留)")
                 note.setStyleSheet("color: #b45309;")
         both = [n for n in chosen.values() if n]
         same = len(both) == 2 and both[0] == both[1]
