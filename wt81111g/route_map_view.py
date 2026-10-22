@@ -1564,6 +1564,8 @@ class RouteMapView(QWidget):
             self._recycle(self._play_layer)
             self._play_layer = None
             self._play_key = None
+            # 关掉“变暗”后阵亡线路已经不在画面上 → 它身上的悬停浮层也要清掉
+            self._drop_hover_if_gone()
         self.update()
 
     @property
@@ -1987,7 +1989,21 @@ class RouteMapView(QWidget):
         return out
 
     def _hover_candidates(self) -> list[RouteRecord]:
-        return [r for r in self._drawn_records() if r.points]
+        """**此刻真的画在地图上**的轨迹 —— 悬停只该命中看得见的线。
+
+        2026-10-22: 回放中阵亡的线路如果没勾“被击毁后路线变暗”, 它其实已经被
+        清除不画了(见 `_draw_play_static`), 自然也不该还能被悬停选中; 勾了变暗
+        则整条灰线仍在地上, 可以悬停查看。
+        """
+        out: list[RouteRecord] = []
+        for rec in self._drawn_records():
+            if not rec.points:
+                continue
+            if (self._playback_recs and not self._dead_dim
+                    and self._dead_now(rec, self._playhead)):
+                continue            # 已阵亡且选择“不留灰” → 画面上没有它
+            out.append(rec)
+        return out
 
     def _hit_test(self, mx: float, my: float
                   ) -> tuple[RouteRecord, RoutePoint] | None:
@@ -2070,9 +2086,13 @@ class RouteMapView(QWidget):
         self._hover_pt = None
 
     def _drop_hover_if_gone(self) -> None:
-        """命中的那条线被隐藏/换掉后, 悬停提示不该还留着。"""
+        """命中的那条线被隐藏/换掉后, 悬停提示不该还留着。
+
+        用 `_hover_candidates()` 而不是 `_drawn_records()`: 回放中阵亡且没勾“变暗”的
+        线路已经从画面上清除, 停在它上面的浮层也得跟着消失(用户 2026-10-22)。
+        """
         if self._hover_rec is not None and not any(
-                r is self._hover_rec for r in self._drawn_records()):
+                r is self._hover_rec for r in self._hover_candidates()):
             self._reset_hover()
 
     def leaveEvent(self, event) -> None:  # noqa: N802 - Qt 命名

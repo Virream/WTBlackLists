@@ -1073,10 +1073,10 @@ class RouteMapGlView(RouteMapView):
         dw, dh = self._map_size()
         if dw <= 0 or dh <= 0:
             return
-        # 1) 命中点白环(线条已被隐藏/删除时不画, 与软件版一致)
+        # 1) 命中点白环(仅当这条线此刻真的画在图上才画)
         pt, rec = self._hover_pt, self._hover_rec
         if pt is not None and rec is not None and any(
-                r is rec for r in self._drawn_records()):
+                r is rec for r in self._hover_candidates()):
             ring = self._ring(float(pt.x), 1.0 - float(pt.y),
                               5.0 / dw, 5.0 / dh, Z_PLAYER + 0.006)
             segs = np.empty((2 * (len(ring) - 1), 3), dtype=np.float32)
