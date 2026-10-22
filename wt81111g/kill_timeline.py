@@ -93,21 +93,26 @@ def read_new_kills(client, cursor: int) -> list[dict]:
 
 
 def merge_kills(record) -> list[dict]:
-    """合并 A/B 两次录制各自抓到的消息(同一局的两次观战会重复抓到同一批)。
+    """合并 A/B 两次录制各自抓到的消息(两次回放会抓到同一批事件)。
 
-    按 `id` 去重, 再按 `time` 升序返回。
+    **按 `(time, msg)` 去重, 不能按 `id`** —— 实测诺曼底那局(2026-10-22):
+    两次回放各自**重新编号**, 同一事件在两次录制里的 id 完全不同(A 队 1531~1581、
+    B 队 1623~1795), 73 条里有 36 组是重复的; 只按 id 去重会让同一条击杀出现两遍,
+    把"配对数"虚增, 偏移也可能被带偏。同一时刻真有两起击杀时 msg 必然不同,
+    所以 `(时间, 文本)` 是安全的去重键。
     """
-    seen: dict[int, dict] = {}
+    seen: dict[tuple[float, str], dict] = {}
     for row in getattr(record, "kills", None) or []:
         try:
             rid = int(row.get("id") or 0)
             t = float(row.get("t") or 0.0)
         except (TypeError, ValueError):
             continue
-        if rid <= 0:
-            continue                     # 没有 id 的消息无法去重/排序
-        if rid not in seen:
-            seen[rid] = {"id": rid, "t": t, "msg": str(row.get("msg") or "")}
+        msg = str(row.get("msg") or "")
+        key = (round(t, 1), msg)
+        if key in seen:
+            continue
+        seen[key] = {"id": rid, "t": t, "msg": msg}
     return sorted(seen.values(), key=lambda r: r["t"])
 
 
