@@ -50,6 +50,12 @@ log = logging.getLogger("route_recorder")
 # 全局录制里战区状态时间轴的条数上限(正常一局只有几十条; 异常时也不写爆数据)
 MAX_ZONE_STATES = 4000
 
+# 全局录制期间多久抓一次 /hudmsg 的增量(秒)。
+# `/hudmsg` 的 damage 只保留最近约 50 条: 一局 400 秒大约 50 条击杀, 也就是
+# **每 ~30 秒就有一条被挤出去** —— 只在结束时读一次会丢掉前几分钟的阵亡
+# (用户 2026-10-22 实测: 一位阵亡 3 次的玩家只看到 2 条)。5 秒一次很稳。
+HUD_POLL_INTERVAL = 5.0
+
 # 轮询/采样间隔: 默认 40ms(≈25Hz)。
 # 实测 8111 陆战数据本身約每 40ms 更新一次(rpm 变化间隔 p50=40ms),
 # 再快只能重复采到同一批数据(46Hz 采样时每个数据点被重复采约 1.85 次)。
@@ -189,8 +195,12 @@ class RouteRecorder(QObject):
         self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
         # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
         self._zone_state_key: tuple | None = None
-        # 全局录制开始时抓到的 /hudmsg 游标(录制结束后据它取增量击毁消息)
+        # 全局录制开始时抓到的 /hudmsg 游标(录制期间据它取增量击毁消息)
         self._hud_cursor = 0
+        # 下次读 /hudmsg 的时刻(monotonic)。为什么要**录制期间定期读**:
+        # `/hudmsg` 的 damage 只保留最近约 50 条 —— 只在结束时读一次的话, 前几分钟的
+        # 击杀已经被挤掉了(用户 2026-10-22 实测: 一位阵亡 3 次的玩家只看到 2 条)。
+        self._hud_read_at = 0.0
         # 最近 2 秒内的**实际采样时刻**: 叠加层要显示“每秒真的写入了几个轨迹点”
         # (它和 8111 轮询频率不是一回事 —— 采样还要过“采样间隔 + 最小位移”两道闸)
         self._pt_times: deque[float] = deque()
@@ -415,6 +425,10 @@ class RouteRecorder(QObject):
                 self._map_info_at = now
                 self._update_map_size()
             global_elapsed = self._global_feed(now, objects)
+            # 定期把 /hudmsg 的增量存进条目 —— 不能等到结束时才读(损坏窗口只有 ~50 条)
+            if now >= self._hud_read_at:
+                self._hud_read_at = now + HUD_POLL_INTERVAL
+                self._poll_kills(self._global)
 
         self.tick.emit({
             "connected": connected,
@@ -650,10 +664,10 @@ class RouteRecorder(QObject):
         self._global_waiting = True
         self._global_t0 = 0.0
         self._zone_state_key = None      # 新录制 → 时间轴从头记(重录时清空旧时间轴)
-        # 抓一次 /hudmsg 的游标: 录制结束后取增量, 用来反推"摄像机挂着那位玩家"
-        # 到底什么时候死的(他的 icon 永远不会消失, 见 `kill_timeline` 模块说明)。
-        # 只在开/停各抓一次, 不是持续轮询 —— 对游戏几乎无影响。
+        # 抓一次 /hudmsg 的游标: 录制期间每 5 秒据它取一次增量, 用来反推
+        # “摄像机挂着那位玩家”到底什么时候死的(见 `kill_timeline` 模块说明)。
         self._hud_cursor = kill_timeline.read_cursor(self.client)
+        self._hud_read_at = 0.0          # 下一个 tick 立刻开始轮询
         log.info("全局录制: hudmsg 游标 = %d", self._hud_cursor)
         if created:
             rec.zone_states = []
@@ -786,30 +800,43 @@ class RouteRecorder(QObject):
         log.info("全局录制 时间轴: %s", rec.timeline_note())
         self.global_finished.emit(rec, side)
 
+    def _poll_kills(self, rec) -> int:
+        """把 `/hudmsg` 里比游标新的击毁消息存进条目, 返回这次取到几条。
+
+        **录制期间每 `HUD_POLL_INTERVAL` 秒调一次** —— `/hudmsg` 的 damage 只保留
+        最近约 50 条, 只在结束时读一次会把前几分钟的击杀挤掉(用户 2026-10-22 实测:
+        一位阵亡 3 次的玩家只能看到 2 条)。取到后把游标推到最大 id, 下次只取增量。
+
+        去重按 `(时间, 文本)`: 两次回放的 id 各自重新编号, 不能按 id 去重
+        (见 `kill_timeline.merge_kills`)。
+        """
+        try:
+            new = kill_timeline.read_new_kills(self.client, self._hud_cursor)
+        except Exception as exc:  # noqa: BLE001 - 抓不到也不能影响录制/落盘
+            log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
+            return 0
+        if not new:
+            return 0
+        rec.kills.extend(new)
+        rec.kills = kill_timeline.merge_kills(rec)
+        try:
+            self._hud_cursor = max(self._hud_cursor,
+                                   max(int(k.get("id") or 0) for k in new))
+        except ValueError:
+            pass
+        return len(new)
+
     def _collect_kills(self, rec) -> None:
-        """录制结束: 取本局新增的击毁消息, 并做一次"时间差对齐"诊断。
+        """录制结束: 补取最后一次增量, 并做一次“时间差对齐”诊断。
 
         **只写日志, 不改任何 `dead` 判定** —— 真正的死亡时刻修正要等用户在界面上
         指定“镜头挂在谁身上”(见 `RouteStore.set_watchers`)。这里只顺带报一下
         对齐质量, 便于事后从日志里判断数据是否可信。
-
-        为什么要等两队都录完才分析: A/B 是两次独立观战, 每队各有一位玩家被摄像机
-        挂着(他的 icon 永不消失), 只有两队的线路凑在一起才看得出整体对齐情况。
         """
-        try:
-            new = kill_timeline.read_new_kills(self.client, self._hud_cursor)
-        except Exception as exc:  # noqa: BLE001 - 抓不到也不能影响落盘
-            log.warning("全局录制: 读取 hudmsg 增量失败: %s", exc)
-            new = []
+        new = self._poll_kills(rec)
         if new:
-            known = {int(k.get("id") or 0) for k in rec.kills}
-            for row in new:
-                if int(row["id"]) not in known:
-                    rec.kills.append(row)
-            known = {int(k.get("id") or 0) for k in rec.kills}
-            rec.kills = [k for k in rec.kills if int(k.get("id") or 0) in known]
-            log.info("全局录制: 本局新增击毁消息 %d 条(累计 %d 条)",
-                     len(new), len(rec.kills))
+            log.info("全局录制: hudmsg 最后一段新增击毁 %d 条(累计 %d 条)",
+                     new, len(rec.kills))
         else:
             log.info("全局录制: hudmsg 没有新击毁消息(累计 %d 条)", len(rec.kills))
         sides_done = [s for s in GLOBAL_SIDES if rec.lives(s)]

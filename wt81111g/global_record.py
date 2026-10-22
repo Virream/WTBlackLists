@@ -56,7 +56,7 @@ import math
 from dataclasses import dataclass, field
 
 from .route_store import GlobalRecord, TrackPoint, UnitLife
-from .zones import SIDE_ENEMY, _color_of, side_of
+from .zones import COLOR_SELF, SIDE_ENEMY, _color_of, side_of
 
 log = logging.getLogger("global_record")
 
@@ -144,6 +144,21 @@ def is_protected(color: str) -> bool:
     不必重新实测色值(2026-10-21 实测: 深蓝 `#1839A7`, 约 20s, 移动会缩短)。
     """
     return str(color or "").strip().lower() == "#1839a7"
+
+
+def is_watcher_unit(icon: str, color: str) -> bool:
+    """这一帧的这个单位是不是“摄像机挂着的那辆车”。
+
+    两个线索都要认(2026-10-22 用户重录诺曼底时实测):
+
+    * `icon == "Player"` —— 8111 文档里的口径, 但**并不可靠**: 同一辆观战车有时
+      给 `Player`、有时给它的真实类别(实测他第三辆车被报成 `icon=SAM`);
+    * `color == #faC81E`(自己黄) —— 实测**始终都在**, 而且同一条线里只要出现过
+      一次就说明摄像机上过他(所以 `_touch` 里把它记成 `UnitLife.watched`, 不清除)。
+    """
+    if (str(icon or "").strip().lower() == "player"):
+        return True
+    return str(color or "").strip().lower() == COLOR_SELF.lower()
 
 
 def _f(value) -> float | None:
@@ -633,6 +648,7 @@ class GlobalTracker:
             color=u.color,
             map_key=self.record.map_key,
             side=self.side,
+            watched=is_watcher_unit(u.icon, u.color),
         )
         life.points.append(TrackPoint(x=u.x, y=u.y, t=t, speed=0.0))
         self.lives.append(life)
@@ -693,6 +709,10 @@ class GlobalTracker:
         lv.x, lv.y = u.x, u.y
         lv.last_seen = t
         lv.life.color = u.color
+        if not lv.life.watched and is_watcher_unit(u.icon, u.color):
+            # 摄像机可能中途才切到他(或 8111 中途才把 icon 改成 Player) —— 一旦认到
+            # 就不再清除: 这条线是不是“观战对象”是个回溯性的事实。
+            lv.life.watched = True
         moved = math.hypot(u.x - lv.last_x, u.y - lv.last_y)
         if moved < MIN_MOVE:
             # 一动不动: 只保留偶尔的心跳点(“在这儿停了 5 分钟”也要留痕)

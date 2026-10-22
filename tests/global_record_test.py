@@ -925,9 +925,14 @@ def test_kill_timeline():
     assert kt.deaths_in([], 5.0, 0.0, 100.0) == []
 
     # ---- 5) 按昵称定位死亡时刻(结构仿诺曼底那局: 比赛 = 录制 + 5 秒)
-    def life(lid, side, icon, rows, dead=True):
+    #  `icon` 不可靠: 8111 对同一辆观战车有时给 Player、有时给真实类别(实测给过 SAM),
+    #  所以“摄像机那辆”也认 `color == #faC81E`(自己黄)。
+    YELLOW = "#faC81E"
+
+    def life(lid, side, icon, rows, dead=True, color=""):
         return UnitLife(life_id=lid, icon=icon, obj_type="ground_model",
-                        map_key="M", points=pts(*rows), side=side, dead=dead)
+                        map_key="M", points=pts(*rows), side=side, dead=dead,
+                        color=color)
 
     rec2 = GlobalRecord(route_id="g21", map_key="M", map_name="地图", created_at="",
                         duration=100.0)
@@ -942,9 +947,10 @@ def test_kill_timeline():
             (0.5039, 0.5000, 194.4, 0.0), (0.5039, 0.5000, 209.4, 0.0),
             (0.5039, 0.5000, 224.4, 0.0))),
         # 第一辆车的残骸 icon 在"他重生那一刻"消失 → 线断; 第二辆车是另一条 Player 线
-        life("A4", "A", "Player", (
+        # (8111 这次给它的是 `icon=SAM`、只有颜色是自己黄 —— 所以不能只认 icon)
+        life("A4", "A", "SAM", (
             (0.1000, 0.1000, 236.0, 0.0), (0.3000, 0.3000, 260.0, 40.0),
-            (0.3600, 0.3600, 300.0, 0.0))),
+            (0.3600, 0.3600, 300.0, 0.0)), color=YELLOW),
     ]
     rec2.sides["B"] = [
         life("B1", "B", "MediumTank", ((0.2, 0.2, 0.0, 20.0), (0.3, 0.2, 50.0, 20.0))),
@@ -952,9 +958,9 @@ def test_kill_timeline():
             (0.4000, 0.4000, 300.0, 30.0), (0.4005, 0.4000, 351.0, 2.0),
             (0.4009, 0.4000, 364.6, 0.5), (0.4009, 0.4000, 379.6, 0.0))),
         # 这一段他没阵亡 → 活到录制结束, 不该被截断
-        life("B3", "B", "Player", (
+        life("B3", "B", "LightTank", (
             (0.1000, 0.1000, 400.0, 0.0), (0.2000, 0.2000, 440.0, 30.0),
-            (0.3000, 0.2000, 480.0, 0.0)), dead=False),
+            (0.3000, 0.2000, 480.0, 0.0)), dead=False, color=YELLOW),
     ]
     rec2.kills = [
         {"id": 1, "t": 15.0, "msg": "x (T-80) 击毁了 y (M1)"},        # ↔ A1 结束 10
@@ -1025,9 +1031,10 @@ def test_watcher_apply(tmpdir: str):
                  points=pts((0.50, 0.50, 152.0, 0.0), (0.5020, 0.50, 176.0, 8.0),
                             (0.5040, 0.50, 179.4, 13.0), (0.5039, 0.50, 194.4, 0.0),
                             (0.5039, 0.50, 224.4, 0.0), (0.5039, 0.50, 260.0, 0.0))),
-        # 第二辆车: 又一条 Player 线, 阵亡后残骸拖到录制结束(420s)
-        UnitLife(life_id=f"{g.route_id}:A3", icon="Player",
+        # 第二辆车: 又一条观战线(8111 给的是 `icon=SAM`, 靠录制时记下的 watched 认)
+        UnitLife(life_id=f"{g.route_id}:A3", icon="SAM",
                  obj_type="ground_model", map_key="MAP1", side="A", dead=False,
+                 watched=True,
                  points=pts((0.10, 0.10, 300.0, 0.0), (0.1500, 0.15, 360.0, 30.0),
                             (0.1600, 0.16, 380.0, 2.0), (0.1600, 0.16, 420.0, 0.0))),
     ]
@@ -1075,6 +1082,7 @@ def test_watcher_apply(tmpdir: str):
     assert len(l2.trimmed) == len(original)
     assert abs(l2b.death_t - player2.death_t) < 0.01
     assert len(l2b.trimmed) == len(original2)
+    assert l2b.watched, "“摄像机那辆”这个事实要落盘(下次打开还能认出来)"
     # 还原后必须和录下来的原始数据一模一样
     again.set_watchers(g.route_id, {"A": "", "B": ""})
     l3 = got.lives("A")[1]
@@ -1221,6 +1229,51 @@ def test_zone_layout_pick(tmpdir: str):
     results.append("全局录制回放: 战区用条目自己的布局(不是最新那套) + 归属随时间轴变化 OK")
 
 
+def test_hud_poll(tmpdir: str):
+    """录制期间定期读 /hudmsg —— 只在结束时读一次会漏掉被挤出缓冲区的击杀。
+
+    背景(用户 2026-10-22): 一局阵亡 3 次的玩家, 修正界面里只显示 2 次。
+    实测 `/hudmsg` 的 `damage` 只保留最近约 50 条, 而程序原先**只在录制结束时读
+    一次** —— 前几分钟的击杀那时已经被挤掉了。改成录制期间每 5 秒取增量后, 只要
+    两次读取的间隔内滚动不超过 50 条(一局里绝不可能)就不会丢。
+
+    这里用假 client 模拟"缓冲区往前滚", 并验证按 `(时间, 文本)` 去重
+    (两次回放的 `id` 各自重新编号, 不能按 id 去重)。
+    """
+    from wt81111g.route_recorder import RouteRecorder
+
+    class FakeClient:
+        def __init__(self):
+            self.window: list[dict] = []
+
+        def hudmsg(self, _a, cursor):
+            return {"events": [],
+                    "damage": [r for r in self.window if int(r["id"]) > int(cursor)]}
+
+    path = os.path.join(tmpdir, "hud.json")
+    store = RouteStore(path)
+    rec = store.new_global("MAPH", "地图 H")
+    store.add_global(rec)
+    run = RouteRecorder(store)
+    fake = FakeClient()
+    run.client = fake
+
+    # 第一次: 两条击杀(比赛 10s / 20s)
+    fake.window = [{"id": 1, "time": 10, "msg": "a (T-80) 击毁了 b (M1)"},
+                   {"id": 2, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
+    assert run._poll_kills(rec) == 2, rec.kills
+    # 缓冲区往前滚: id=1 被挤出去, 又来一条
+    fake.window = [{"id": 2, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"},
+                   {"id": 3, "time": 30, "msg": "e (T-80) 击毁了 f (M1)"}]
+    assert run._poll_kills(rec) == 1
+    assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    # 模拟"另一队回放时 id 重新编号": 同一条事件换了 id → 不能重复入库
+    fake.window = [{"id": 900, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
+    run._poll_kills(rec)
+    assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
+    results.append("全局录制: hudmsg 录制期间定期取增量 + 按(时间,文本)去重 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -1238,6 +1291,7 @@ def main() -> int:
     test_playback_timeline()
     test_spawn_start_check()
     test_kill_timeline()
+    test_hud_poll(tmpdir)
     test_watcher_apply(tmpdir)
     test_watcher_ui(tmpdir)
     test_zone_layout_pick(tmpdir)

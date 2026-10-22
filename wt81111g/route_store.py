@@ -219,6 +219,12 @@ class UnitLife:
     death_t: float = 0.0
     # 修正前的**原始点序列**(便于改主意时重新指定观战玩家); 未修正时为空。
     trimmed: list[TrackPoint] = field(default_factory=list)
+    # 这条线**曾经是摄像机挂着的那辆车**(至少有1帧 icon == Player 或颜色是自己黄)。
+    # 为什么要记这个布尔值而不是直接看 `color`: `color` 每帧都被覆盖, 摄像机离开后
+    # 就变回普通蓝色了; 而“观战对象”这个事实必须留下来(2026-10-22 实测: 他第三辆
+    # 车的线 8111 给的是 `icon=SAM`、只有颜色是自己黄, 而 B 队整队一条 `icon=Player`
+    # 都没有 —— 只按 icon 认会全漏)。
+    watched: bool = False
 
     @property
     def route_id(self) -> str:
@@ -272,6 +278,8 @@ class UnitLife:
         }
         if self.death_t:
             out["death_t"] = round(self.death_t, 2)
+        if self.watched:
+            out["w"] = 1
         if self.trimmed:
             # 只存被截掉的尾巴 —— 未修正的线没有这个字段, 旧数据也不需要兼容
             out["trim"] = [[round(p.t, 2), round(p.x, 5), round(p.y, 5),
@@ -316,6 +324,7 @@ class UnitLife:
             dead=bool(data.get("dead")),
             death_t=death_t,
             trimmed=read_points(data.get("trim")),
+            watched=bool(data.get("w")),
         )
 
 

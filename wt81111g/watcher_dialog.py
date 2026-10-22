@@ -167,6 +167,10 @@ class WatcherDialog(QDialog):
                        "、".join(fmt_time(f["death"]) for f in fixed),
                        "、".join("%.1f 秒" % f["tail"] for f in fixed),
                        row.get("shift") or 0.0, row.get("hits") or 0))
+                miss = (row.get("segments") or 0) - len(fixed)
+                if miss > 0:
+                    note.setText(note.text() + "\n⚠ 还有 %d 段没找到他的阵亡记录"
+                                 "(hudmsg 里没有) —— 那几段保持原样" % miss)
                 note.setStyleSheet("color: #047857;")
             else:
                 note.setText("→ 不修正: %s" % (row.get("note") or "无法定位"))

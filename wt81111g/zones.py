@@ -50,6 +50,11 @@ _SIG_DIGITS = 4
 COLOR_OURS = "#174DFF"      # 蓝 = 我方
 COLOR_ENEMY = "#fa0C00"     # 红 = 敌方
 COLOR_NEUTRAL = "#ffFFFA"   # 白 = 未被占领
+# 黄 = **自己** —— 也就是“摄像机挂着的那辆车”。注意: 地图对象里的 `icon` 不一定
+# 同时是 `Player`(2026-10-22 实测: 同一个观战对象有时给 `icon=SAM`, 有时给
+# `icon=Player`), 所以认“观战对象”要**颜色和 icon 两个线索都算**。
+COLOR_SELF = "#faC81E"
+COLOR_TEAM = "#67D756"      # 绿 = 队友(仅参考)
 
 SIDE_OURS = "ours"
 SIDE_ENEMY = "enemy"

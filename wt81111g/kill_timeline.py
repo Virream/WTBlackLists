@@ -2,8 +2,8 @@
 
 ============================================================= 为什么需要它
 8111 的 `/map_obj.json` 只给**摄像机所在那一方**的单位。录制全局 A/B 队路线时,
-会刻意把视角挂在我方一位玩家身上(这样 8111 才会报这一方), 于是"摄像机挂着的那位"
-(唯一 `icon == "Player"` 的线)的死亡时刻拿不到:
+会刻意把视角挂在我方一位玩家身上(这样 8111 才会报这一方), 于是“摄像机挂着的那位”
+的死亡时刻拿不到:
 
 * 他阵亡后 8111 **不会**让 icon 立刻消失 —— 那条线继续上报残骸, 一直画到
   "他重生那一刻"才断(用户 2026-10-22 实测口径: 他一出新车, 上一条命的残骸 icon
@@ -11,9 +11,10 @@
 * 如果他就此退出对局、而比赛还没结束, 残骸会一直上报到录制结束;
 * **其余玩家 icon 正常消失** → "消失即击毁"的判死对他们完全有效, 不用修正。
 
-所以每队**只有** `icon == "Player"` 的那一两条线(一条命一条)需要修正, 表现为
-"阵亡时刻 = 重生时刻 / 录制结束"。而 `icon == "Player"` 本身就把线指出来了 ——
-不需要再去猜哪条线是观战对象。
+所以每队**只有**“摄像机挂着那位”的一两条线(一条命一条)需要修正, 表现为
+“阵亡时刻 = 重生时刻 / 录制结束”。认这几条线靠**颜色和 icon 两个线索**
+(见 `is_player_line`): `icon` 不可靠(8111 同一辆车有时给 `Player`、有时给真实
+类别), 而自己黄 `#faC81E` 一直在。
 
 ============================================================== 为什么能反推
 `/hudmsg` 的 `damage` 里有本局全部击杀文本(回放模式下 `events` 是空的):
@@ -49,6 +50,8 @@ log = logging.getLogger("kill_timeline")
 ZW_SPACE = "\u200b"          # 8111 的文本里中文字符之间夹着零宽空格
 KILL_MARK = "击毁了"          # 只认击杀; "引燃了" / "获得嘉奖" 不算死亡
 PLAYER_ICON = "player"       # 8111 给"摄像机挂着的那位玩家"用的 icon(比较时转小写)
+# 自己(摄像机那辆车)的黄。`icon` 不可靠时靠它认人, 见 `is_player_line`。
+SELF_COLOR = "#faC81E"
 # 阵亡时刻与线路时间段比对的容差(秒): 拟合出的平移量本身有 ±1s 抖动, 而线尾
 # (他重生或退出的那一刻)也可能比真实死亡晚几秒。
 CAND_TOL = 3.0
@@ -255,15 +258,15 @@ def estimate_shift(ends, kill_times, lo: float = -30.0, hi: float = 900.0,
 def side_ends(record, side: str) -> list[float]:
     """这一队里**icon 正常消失**那些线路的结束时刻(录制时间轴)。
 
-    故意排除 `icon=Player` 那条: 摄像机那位阵亡后 8111 继续上报残骸, 他的线尾是
-    录制结束而不是死亡时刻 —— 拿它拟合偏移会把整队的对齐拉歪。
+    故意排除观战对象那几条(见 `is_player_line`): 他阵亡后 8111 继续上报残骸,
+    线尾是重生/录制结束而不是死亡时刻 —— 拿它拟合偏移会把整队的对齐拉歪。
     """
     ends = []
     for life in record.lives(side):
         pts = raw_points(life)
         if not pts or not getattr(life, "dead", False):
             continue
-        if (life.icon or "").lower() == PLAYER_ICON:
+        if is_player_line(life):
             continue
         ends.append(pts[-1].t)
     return ends
@@ -301,14 +304,29 @@ def side_shift(record, side: str, kills=None, base: float | None = None
     return shift, hits
 
 
+def is_player_line(life) -> bool:
+    """这条线是不是“摄像机挂着的那辆车”。
+
+    三条线索任一命中就算(2026-10-22 用户重录诺曼底时实测, 只认 `icon` 会漏):
+
+    1. `watched` —— 录制时记的持久标记(任何一帧 icon=Player 或颜色是自己黄);
+    2. `color == #faC81E` —— 旧数据没有 `watched` 字段时的兵底 (实测一直准确);
+    3. `icon == "Player"` —— 8111 文档口径, 但不可靠(同一辆车会变成 `SAM` 等)。
+    """
+    if bool(getattr(life, "watched", False)):
+        return True
+    if (life.icon or "").strip().lower() == PLAYER_ICON:
+        return True
+    return (life.color or "").strip().lower() == SELF_COLOR.lower()
+
+
 def player_lines(record, side: str) -> list:
-    """这一队里"摄像机挂着的那位玩家"的线路(`icon` = `Player`)。
+    """这一队里“摄像机挂着的那位玩家”的线路。
 
     **一条命一条**: 他一出新车, 上一条命的残骸 icon 就消失、那条线正常结束,
-    新车的线则从重生点重新开始。所以同一队可能有多条(他真的换过车)。
+    新车的线则从重生点重新开始。所以同一队可能有多条(他换过几次车就有几条)。
     """
-    return [lf for lf in record.lives(side)
-            if (lf.icon or "").lower() == PLAYER_ICON and lf.points]
+    return [lf for lf in record.lives(side) if lf.points and is_player_line(lf)]
 
 
 def player_segments(record, side: str) -> list[tuple]:
@@ -455,7 +473,7 @@ def analyze(record, tol: float = 1.5) -> dict:
             pts = raw_points(life)
             if not pts or not getattr(life, "dead", False):
                 continue
-            if (life.icon or "").lower() == PLAYER_ICON:
+            if is_player_line(life):
                 players.append((side, life.life_id))
                 continue
             ends.append(pts[-1].t)
