@@ -382,6 +382,16 @@ W,H = /map_info.json 的 map_max - map_min(米; 实测陆战图 4096×4096)
 - 产物: `dist\WTRouteTester\WTRouteTester.exe`(目录版整份拷走);
   发布时把整个目录压成 `dist\WTRouteTester_<版本>_win64.zip`( **不含 `data\`** ——
   那是用户自己的录制数据与地图缓存, 首次运行会自动建);
+  ⚠ 压包用 `Compress-Archive` 会稳倒 —— `_internal\base_library.zip` 刚拷完时
+  还在被扫描/占用, 报“文件正由另一进程使用”且中途报废。改用 .NET:
+  ```powershell
+  robocopy dist\WTRouteTester dist\_stage\WTRouteTester /E /XD data /NFL /NDL /NJH /NJS /NP
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::CreateFromDirectory("$PWD\dist\_stage",
+      "$PWD\dist\WTRouteTester_x.y.z_win64.zip",
+      [System.IO.Compression.CompressionLevel]::Optimal, $false)   # ← includeBase=false,
+  ```                                                              #   否则根目录多一层 _stage\
+- 发布: 在 `d:\course\VSCODE\WTRouteTester` 里 `gh release create v<版本> <zip> --notes-file ...`;
 - 版本号: `wt81111g/config.py` 的 `ROUTE_VERSION`(关于界面显示它),
   exe 文件属性用 `version_info_route.txt` —— **两处要一起改**;
 - **用户数据保护**: 重建会清掉 `dist\WTRouteTester`, 脚本先把 `data\` 暂存到 `dist\_data_backup`
