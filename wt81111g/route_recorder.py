@@ -681,15 +681,7 @@ class RouteRecorder(QObject):
             self.global_started.emit(rec, self._global_side)
         elapsed = now - self._global_t0
         if tracker.feed(elapsed, objects):
-            if tracker.camera_handover:
-                # 我方全灭 → 游戏把摄像机自动移到敌方, 8111 从那一刻起报的是敌方单位。
-                # 不停下来的话, 敌方的车会被记成本队的一条线路(用户 2026-10-22 实测)。
-                log.info("全局录制: 我方全灭后摄像机被自动切到敌方 → 自动停止(避免录进敌方载具)")
-                self.notice.emit(
-                    "本队已全灭、摄像机被游戏自动移到敌方 → 已自动停止录制"
-                    "(否则会把敌方载具记成本队线路)")
-            else:
-                log.info("全局录制: 全场已无可录单位超过阈值, 自动停止")
+            log.info("全局录制: 全场已无可录单位超过阈值, 自动停止")
             self._do_global_stop()
             return max(0.0, elapsed)
         rec.duration = elapsed

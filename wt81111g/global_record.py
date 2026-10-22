@@ -81,20 +81,6 @@ MAX_SPEED_KMH = 200.0
 # 实测正常重生 0.1~2.3m, 而用户 2026-10-22 报的那条异常线是 183m —— 阈值取 40m
 # (0.01) 既不误报, 又能把“中途才开始被上报”的线一次子抓出来。
 SPAWN_START_TOL = 0.01
-
-# ---------------------------------------------------- 摄像机被自动移交敌方
-# 用户 2026-10-22 看回放确认的 8111 行为(两个 bug 叠在一起):
-#   ① 摄像机挂着的车就算已经被击毁, 8111 依旧一直上报它(icon == "Player"),
-#      于是那条线永远“活着”;
-#   ② 我方全部阵亡后, 游戏**自动把摄像机移到敌方一辆车上** —— 而 `/map_obj.json`
-#      只给“摄像机所在那一方”的单位, 于是整批单位换成了敌方的车,
-#      我们照单全收 → 敌方的轻坦被记成了本队的一条线路(起点还在路中间)。
-#
-# 能认出来的信号: `icon == "Player"` 就是**摄像机所在单位**。它单帧大幅跳位
-# (任何载具单帧都跑不了几十米) 就说明观战目标被换了一辆; 若那一刻本队已经
-# 只剩 ≤1 条活线, 就是我方全灭后被游戏强制移交 → 后面的数据全不可信。
-CAM_JUMP_TOL = 0.01          # 摄像机单帧跳位超过这个距离(归一化 ≈ 40m) → 换了目标
-CAM_HANDOVER_MAX_ACTIVE = 1  # 跳位时本队活线 ≤ 这个数 → 判定为“全灭后被移交”
 # 拿不到 /map_info.json 时的地图边长(米)。实测陆战图 map_max-map_min = 4096。
 DEFAULT_MAP_SIZE = (4096.0, 4096.0)
 
@@ -497,11 +483,6 @@ class GlobalTracker:
             if getattr(s, "x", None) is not None and getattr(s, "y", None) is not None]
         # 起点不像重生的线: [(life_id, 时刻, 离最近重生点米数, icon)]
         self.suspicious: list[tuple[str, float, float, str]] = []
-        # 摄像机被游戏自动移到敌方(我方全灭) → 后面的单位不再属于本队。
-        # 一旦置 True, `feed()` 就返回 True, 录制应当立即停下。
-        self.camera_handover = False
-        self.handover_at: float | None = None
-        self._cam_prev: tuple[float, float] | None = None
         # 坐标系对齐(陆战图 ↔ 空战图): 参考坐标系 = 录制开始时那一帧的静态锚点
         self.aligner = FrameAligner()
         self._view_changed_at: float | None = None      # 上一次“坐标系变了”的时刻
@@ -537,18 +518,11 @@ class GlobalTracker:
         return len(self.lives)
 
     def feed(self, t: float, objects) -> bool:
-        """喂一帧数据。
-
-        返回 True 表示该停止录制: 要么“全场已经没有可录单位够久了”,
-        要么**摄像机被游戏自动移交给了敌方**(我方全灭, 见 `camera_handover`)。
-        """
+        """喂一帧数据。返回 True 表示“全场已经没有可录单位够久了” → 该停止录制。"""
         units, skipped = extract_units(objects)
         for key, n in skipped.items():
             self.seen_skipped[key] = self.seen_skipped.get(key, 0) + n
         self._align(t, objects, units)
-        self._check_camera(t, objects)
-        if self.camera_handover:
-            return True
         self._match(t, units)
         # 这一帧还有可录单位 → 此时断掉的线是“被击毁”; 全场空 → 是回到车库/录制结束
         self._expire(t, alive=bool(units), allow_dead=self._dead_allowed(t))
@@ -558,47 +532,6 @@ class GlobalTracker:
             return (t - self._empty_since) >= EMPTY_STOP
         self._empty_since = None
         return False
-
-    def _check_camera(self, t: float, objects) -> None:
-        """盯住“摄像机所在的那辆车”(`icon == "Player"`), 识破我全灭后被自动移交。
-
-        `_align()` 已经算好了这一帧的坐标变换, 这里把摄像机坐标也换算到参考坐标系
-        再比 —— 否则切到空中视角时坐标尺度会变, 跳位判断就失去意义。
-        """
-        cam: tuple[float, float] | None = None
-        for obj in objects or []:
-            if not isinstance(obj, dict):
-                continue
-            icon = str(obj.get("icon") or "").strip().lower()
-            typ = str(obj.get("type") or "").strip().lower()
-            if icon != "player" and typ != "player":
-                continue
-            x, y = _f(obj.get("x")), _f(obj.get("y"))
-            if x is None or y is None:
-                continue
-            fit = self.aligner.fit
-            cam = fit.apply(x, y) if (fit is not None and not fit.same_as_reference) \
-                else (x, y)
-            break
-        if cam is None:
-            return
-        prev = self._cam_prev
-        self._cam_prev = cam
-        if prev is None:
-            return
-        jump = math.hypot(cam[0] - prev[0], cam[1] - prev[1])
-        if jump <= CAM_JUMP_TOL:
-            return
-        # 观战目标换了一辆车。只有“本队快没人了”才能断定是全灭后被游戏移交 ——
-        # 用户自己手动切去看别人时, 本队还有好几条活线, 不能算。
-        if self.active <= CAM_HANDOVER_MAX_ACTIVE:
-            self.camera_handover = True
-            self.handover_at = t
-            w, _h = self.map_size
-            log.warning(
-                "全局录制: 摄像机被自动移交(%.1fs, 跳了 %.0f m, 本队活线 %d 条) —— "
-                "本队已全灭, 8111 从这一刻起报的是**敌方**单位, 立即停止录制",
-                t, jump * w, self.active)
 
     # ---------------------------------------------------------- 坐标系对齐
     def _align(self, t: float, objects, units: list[Unit]) -> None:
