@@ -48,7 +48,15 @@ import logging
 log = logging.getLogger("kill_timeline")
 
 ZW_SPACE = "\u200b"          # 8111 的文本里中文字符之间夹着零宽空格
-KILL_MARK = "击毁了"          # 只认击杀; "引燃了" / "获得嘉奖" 不算死亡
+# 两种“有人没了”的固定文本(用户 2026-10-22 实测):
+#
+#   击毁了:   `击杀者 (载具) 击毁了 受害者 (载具)`   → 受害者在动词**后面**
+#   已被摧毁: `玩家 (载具) 已被摧毁`                → 玩家就在动词**前面**
+#
+# “已被摧毁” = 弃车 / 被河流淹死 / 撞地坠毁 —— 没有击杀者, 但确实阵亡。
+KILL_MARK = "击毁了"
+DESTROYED_MARK = "已被摧毁"
+DEATH_MARKS = (KILL_MARK, DESTROYED_MARK)
 PLAYER_ICON = "player"       # 8111 给"摄像机挂着的那位玩家"用的 icon(比较时转小写)
 # 自己(摄像机那辆车)的黄。`icon` 不可靠时靠它认人, 见 `is_player_line`。
 SELF_COLOR = "#faC81E"
@@ -78,10 +86,13 @@ def read_cursor(client) -> int:
     return max(ids, default=0)
 
 
-def read_new_kills(client, cursor: int) -> list[dict]:
-    """取比 `cursor` 新的**击毁**消息: `[{id, t, msg}]`(按 id 升序)。
+def read_damage(client, cursor: int) -> list[dict]:
+    """取比 `cursor` 新的**全部** damage 消息: `[{id, t, msg}]`(按 id 升序)。
 
-    只认 `击毁了` —— `引燃了`(只是着火, 不一定死) 与 `获得嘉奖` 都要排除。
+    不只看击毁: 8111 的 `damage` 里还混着“引燃了 / 获得嘉奖”这类条目, 以及
+    **弃车、被淹死、坠毁**这类“不是被别人打死”的阵亡(用户 2026-10-22 实测: 它们
+    同样是一行“<昵称> (载具) 已被摧毁”)。先原样取回来, 由调用方按
+    `DEATH_MARKS` 分捡。
     """
     try:
         data = client.hudmsg(0, int(cursor))
@@ -97,12 +108,23 @@ def read_new_kills(client, cursor: int) -> list[dict]:
             continue
         if rid <= int(cursor):
             continue
-        msg = clean_text(row.get("msg"))
-        if KILL_MARK not in msg:
-            continue
-        out.append({"id": rid, "t": t, "msg": msg})
+        out.append({"id": rid, "t": t, "msg": clean_text(row.get("msg"))})
     out.sort(key=lambda r: r["id"])
     return out
+
+
+def is_death_msg(msg) -> bool:
+    """这条消息是不是“有人阵亡”(击毁了 / 已被摧毁)。
+
+    `引燃了`(只是着火, 不一定死) 与 `获得嘉奖` 都不算。
+    """
+    text = clean_text(msg)
+    return any(mark in text for mark in DEATH_MARKS)
+
+
+def read_new_deaths(client, cursor: int) -> list[dict]:
+    """取比 `cursor` 新的**阵亡**消息: `[{id, t, msg}]`(按 id 升序)。"""
+    return [r for r in read_damage(client, cursor) if is_death_msg(r["msg"])]
 
 
 def merge_kills(record) -> list[dict]:
@@ -172,7 +194,12 @@ def split_actor(text) -> tuple[str, str]:
 def player_stats(kills) -> dict[str, dict]:
     """`{昵称: {"deaths": [...], "kills": n, "vehicle": "..."}}`。
 
-    `deaths` 是**他被打死**的比赛时刻(升序), 用来精确指定"哪一次是他的死亡"。
+    `deaths` 是**他死了**的比赛时刻(升序), 用来精确指定“哪一次是他的死亡”。
+    两种文本都算阵亡(用户 2026-10-22 实测格式):
+
+    * `击杀者 (载具) 击毁了 他 (载具)` —— 受害者在动词**后面**;
+    * `他 (载具) 已被摧毁` —— 弃车 / 被淹死 / 坠毁, **没有击杀者**, 他就在动词前面。
+
     打死别人的次数只用来给候选名单排序(往往和谁被摄像机挂着没关系)。
     """
     out: dict[str, dict] = {}
@@ -188,6 +215,11 @@ def player_stats(kills) -> dict[str, dict]:
         try:
             t = float(k.get("t") or 0.0)
         except (TypeError, ValueError):
+            continue
+        if DESTROYED_MARK in msg:
+            victim, vvehicle = split_actor(msg.partition(DESTROYED_MARK)[0])
+            if victim and vvehicle and not victim.startswith("weapons/"):
+                row_of(victim, vvehicle)["deaths"].append(t)
             continue
         head, sep, tail = msg.partition(KILL_MARK)
         if not sep:

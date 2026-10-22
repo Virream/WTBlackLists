@@ -890,7 +890,7 @@ def test_kill_timeline():
     ]
     client = FakeClient(rows)
     assert kt.read_cursor(client) == 13
-    new = kt.read_new_kills(client, 10)
+    new = kt.read_new_deaths(client, 10)
     assert [r["id"] for r in new] == [13], new          # 11/12 不是击杀, 10 等于游标
     assert "\u200b" not in new[0]["msg"], new[0]["msg"]
 
@@ -911,9 +911,17 @@ def test_kill_timeline():
         {"t": 20.0, "msg": "乙 (M1) 击毁了 甲 (T-80)"},
         {"t": 30.0, "msg": "丙 (红旗-11) 击毁了 weapons/su_r_77_1/short"},
     ])
-    assert st["乙"]["deaths"] == [10.0], st["乙"]       # 只记“他被打死”的时刻
+    assert st["乙"]["deaths"] == [10.0], st["乙"]       # 只记“他死了”的时刻
     assert st["乙"]["kills"] == 1 and st["甲"]["kills"] == 1
     assert "weapons/su_r_77_1/short" not in st, st     # 武器/AI 不是玩家
+    # 弃车 / 被淹死 / 坠毁: `他 (载具) 已被摧毁` —— 受害者在动词前面, 没有击杀者
+    st3 = kt.player_stats([
+        {"t": 10.0, "msg": "=AZUR2= 目击而道存矣 (豹 2A4 (第 123 装甲营)) 已被摧毁"},
+        {"t": 20.0, "msg": "甲 (T-80) 击毁了 乙 (M1)"},
+    ])
+    assert st3["=AZUR2= 目击而道存矣"]["deaths"] == [10.0], st3
+    assert st3["=AZUR2= 目击而道存矣"]["kills"] == 0, st3
+    assert st3["=AZUR2= 目击而道存矣"]["vehicle"].startswith("豹 2A4"), st3
 
     # ---- 4) 阵亡按“每条 Player 线的时间段”认领 —— 不再有任何静止/停车判定
     def pts(*rows):
@@ -969,7 +977,7 @@ def test_kill_timeline():
         # 摄像机挂着的那两位: A 队死两次(两段各一次), B 队死一次
         {"id": 4, "t": 184.4, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
         {"id": 5, "t": 374.6, "msg": "w (ZTZ96) 击毁了 jjh67 (RDF/LT)"},
-        {"id": 6, "t": 250.0, "msg": "z (BMPT) 击毁了 killflik (FK-2000)"},
+        {"id": 6, "t": 250.0, "msg": "killflik (FK-2000) 已被摧毁"},
         # 对空击杀(我们不录空中单位), 不该影响判定
         {"id": 7, "t": 33.0, "msg": "x (Bf 109) 击毁了 y (伊尔-2)"},
     ]
@@ -1001,6 +1009,11 @@ def test_kill_timeline():
     assert not kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["ok"]
     assert "阵亡记录" in kt.resolve_deaths(rec2, {"A": "查无此人"})["A"]["note"]
     assert not kt.resolve_deaths(rec2, {"A": ""})["A"]["ok"]
+    # 两种固定格式都要认(docs/8111自定义对局实测分析.md §2)
+    assert kt.is_death_msg("[VsEG] Tacovac (BMPT) 击毁了 killflik (ZTZ96B)")
+    assert kt.is_death_msg("=AZUR2= 目击而道存矣 (豹 2A4 (第 123 装甲营)) 已\u200b被\u200b摧\u200b毁")
+    assert not kt.is_death_msg("甲 (T-80) 的攻击引燃了 乙 (M1)")
+    assert not kt.is_death_msg("甲 (T-80) 获得嘉奖“装甲克星”")
     results.append("全局录制: 按观战玩家昵称精确定位死亡时刻 OK")
 
 
@@ -1258,13 +1271,14 @@ def test_hud_poll(tmpdir: str):
     fake = FakeClient()
     run.client = fake
 
-    # 第一次: 两条击杀(比赛 10s / 20s)
+    # 第一次: 两条击杀(比赛 10s / 20s) + 一条“引燃了”(不是阵亡, 只统计动词)
     fake.window = [{"id": 1, "time": 10, "msg": "a (T-80) 击毁了 b (M1)"},
-                   {"id": 2, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
+                   {"id": 2, "time": 12, "msg": "e (T-80) 引燃了 f (M1)"},
+                   {"id": 3, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"}]
     assert run._poll_kills(rec) == 2, rec.kills
-    # 缓冲区往前滚: id=1 被挤出去, 又来一条
-    fake.window = [{"id": 2, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"},
-                   {"id": 3, "time": 30, "msg": "e (T-80) 击毁了 f (M1)"}]
+    # 缓冲区往前滚: id=1/2 被挤出去, 又来一条
+    fake.window = [{"id": 3, "time": 20, "msg": "c (T-80) 击毁了 d (M1)"},
+                   {"id": 4, "time": 30, "msg": "g (T-80) 击毁了 h (M1)"}]
     assert run._poll_kills(rec) == 1
     assert [k["t"] for k in rec.kills] == [10.0, 20.0, 30.0], rec.kills
     # 模拟"另一队回放时 id 重新编号": 同一条事件换了 id → 不能重复入库
