@@ -2107,21 +2107,23 @@ class RouteMapView(QWidget):
     def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
         """悬停浮层文本。
 
-        第一行 = **这是哪条线路**(录制时刻 + 车型 + 用时; 与侧栏条目一一对应),
-        第二行 = 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差),
-        第三行 = 该处的转弯半径(由朝向变化率反算, 见 `_turn_radius_text`)。
+        2026-10-22 用户要求: 不再显示路线**创建时刻**(第一条信息没意义),
+        并把“时间/速度”排到“用时”前面。现在的行序:
+
+        1. 车型(录制中的那条额外标注“录制中”);
+        2. 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差);
+        3. 整条路线的用时 + 该处的转弯半径(由朝向变化率反算, 见 `_turn_radius_text`)。
         """
-        if rec is self._live:
-            head = f"录制中 | 车型 {getattr(rec, 'vehicle', '?')}"
-        else:
-            created = getattr(rec, "created_at", "") or ""
-            ts = created[11:16] if len(created) >= 16 else ""
-            head = " | ".join(x for x in (ts, f"车型 {getattr(rec, 'vehicle', '?')}",
-                                          f"用时 {fmt_time(rec.duration)}") if x)
-        text = (f"{head}\n"
-                f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h")
+        vehicle = f"车型 {getattr(rec, 'vehicle', '?')}"
+        head = f"{vehicle}（录制中）" if rec is self._live else vehicle
+        lines = [head,
+                 f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h"]
+        tail = [f"用时 {fmt_time(rec.duration)}"]
         turn = self._turn_radius_text(rec, pt)
-        return f"{text}\n{turn}" if turn else text
+        if turn:
+            tail.append(turn)
+        lines.append(" | ".join(tail))
+        return "\n".join(lines)
 
     def _set_hover(self, rec: RouteRecord | None, pt: RoutePoint | None) -> None:
         """更新悬停状态(文本 + 命中点), 有变化才重画。"""
