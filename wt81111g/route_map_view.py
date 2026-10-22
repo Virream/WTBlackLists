@@ -2055,11 +2055,61 @@ class RouteMapView(QWidget):
                 best_d2, best = k_d2, (rec, pts[k])
         return best
 
+    def _turn_radius_text(self, rec: RouteRecord, pt: RoutePoint) -> str:
+        """悬停点附近的**转弯半径**估算(用于判断这辆车当时怎么过弯)。
+
+        做法: 取前后各 3 个采样点(25Hz → 约 ±120ms), 用朝向 `dx/dy` 的**累积角变化**
+        求平均角速度 ω, 再按 R = v / ω 换算 —— v 来自采样点自带的速度(km/h)。
+        比“三点外接圆”稳: 朝向是 8111 给的连续量, 而三点外接圆在采样点几乎重合时
+        半径会炸掉(录制时停车采样就会这样)。
+
+        没有朝向数据的老轨迹、或 ω 小到几乎直线时, 分别返回空串 / “直线”。
+        """
+        pts = rec.points
+        if len(pts) < 5:
+            return ""
+        idx = bisect_right(self._times(rec), pt.t) - 1
+        idx = max(0, min(len(pts) - 1, idx))
+        k = 3
+        i0, i1 = max(0, idx - k), min(len(pts) - 1, idx + k)
+        if i1 - i0 < 2:
+            return ""
+        total = 0.0
+        used = 0
+        prev: float | None = None
+        for j in range(i0, i1 + 1):
+            p = pts[j]
+            if not p.dx and not p.dy:
+                prev = None                  # 缺朝向 → 断开, 不要跨过它算转角
+                continue
+            a = math.atan2(p.dy, p.dx)
+            if prev is not None:
+                d = a - prev
+                while d > math.pi:
+                    d -= 2.0 * math.pi       # 处理 ±π 跨越
+                while d < -math.pi:
+                    d += 2.0 * math.pi
+                total += d
+                used += 1
+            prev = a
+        dt = pts[i1].t - pts[i0].t
+        if used < 2 or dt <= 0:
+            return ""                        # 旧轨迹没有朝向数据
+        omega = abs(total) / dt
+        v = 0.5 * (pts[i0].speed + pts[i1].speed) / 3.6      # km/h → m/s
+        if omega < 0.02 or v <= 0:           # < 1.15°/s 视为直线
+            return "转弯半径 直线"
+        radius = v / omega
+        if radius > 5000.0:
+            return "转弯半径 直线"
+        return f"转弯半径 ~{radius:.0f} m"
+
     def _hover_text_for(self, rec: RouteRecord, pt: RoutePoint) -> str:
         """悬停浮层文本。
 
         第一行 = **这是哪条线路**(录制时刻 + 车型 + 用时; 与侧栏条目一一对应),
-        第二行 = 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差)。
+        第二行 = 鼠标所在位置的用时与速度(毫秒精度, 便于对比微小时差),
+        第三行 = 该处的转弯半径(由朝向变化率反算, 见 `_turn_radius_text`)。
         """
         if rec is self._live:
             head = f"录制中 | 车型 {getattr(rec, 'vehicle', '?')}"
@@ -2068,8 +2118,10 @@ class RouteMapView(QWidget):
             ts = created[11:16] if len(created) >= 16 else ""
             head = " | ".join(x for x in (ts, f"车型 {getattr(rec, 'vehicle', '?')}",
                                           f"用时 {fmt_time(rec.duration)}") if x)
-        return (f"{head}\n"
+        text = (f"{head}\n"
                 f"时间 {fmt_time_ms(pt.t)} | 速度 {fmt_speed(pt.speed)} km/h")
+        turn = self._turn_radius_text(rec, pt)
+        return f"{text}\n{turn}" if turn else text
 
     def _set_hover(self, rec: RouteRecord | None, pt: RoutePoint | None) -> None:
         """更新悬停状态(文本 + 命中点), 有变化才重画。"""

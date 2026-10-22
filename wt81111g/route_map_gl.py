@@ -26,7 +26,7 @@ import numpy as np
 
 # 必须先导入 PyQt6, rendercanvas 靠它判断用哪个 Qt 绑定
 from PyQt6.QtCore import QEvent, QPointF
-from PyQt6.QtGui import QColor, QImage
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QImage
 from PyQt6.QtWidgets import QApplication, QVBoxLayout
 
 import pygfx as gfx
@@ -153,6 +153,29 @@ def _register_cjk_font() -> None:
 # 超过时先用 ~这个数量的粗点定位, 再在命中点邻域精查 —— 结果与全量逐点一致
 # (实测误差 0.000000px), 只是把 64 条 x 36000 点的极端场景从 9.2ms 降到 2.0ms。
 _HIT_COARSE = 2000
+
+
+def _rounded_rect_geometry(w: float, h: float, r: float, seg: int = 4):
+    """圆角矩形几何(中心在原点) → (positions, indices)。
+
+    自造几何的 `indices` 必须是 **(N,3)** 形状(每行一个三角形) —— 传一维数组会报
+    GPUValidationError, 这是之前踩过的坑。
+    """
+    r = max(0.0, min(r, w / 2.0, h / 2.0))
+    cx, cy = w / 2.0, h / 2.0
+    pts: list[tuple[float, float, float]] = []
+    # 四个角: 右上 → 左上 → 左下 → 右下(y 向上, 逆时针)
+    for ox, oy, a0 in ((cx - r, cy - r, 0.0),
+                       (-cx + r, cy - r, math.pi / 2),
+                       (-cx + r, -cy + r, math.pi),
+                       (cx - r, -cy + r, 3 * math.pi / 2)):
+        for i in range(seg + 1):
+            a = a0 + (math.pi / 2) * i / seg
+            pts.append((ox + r * math.cos(a), oy + r * math.sin(a), 0.0))
+    n = len(pts)
+    pos = np.array(pts + [(0.0, 0.0, 0.0)], dtype=np.float32)     # 末点 = 中心
+    idx = np.array([(n, i, (i + 1) % n) for i in range(n)], dtype=np.uint32)
+    return pos, idx
 
 
 def _rgba(c: QColor, mul: float = 1.0) -> tuple[float, float, float, float]:
@@ -1041,7 +1064,7 @@ class RouteMapGlView(RouteMapView):
                                     color=_rgba(rmv.COLOR_PLAYER))), O_PLAYER_DIR)
 
     def _build_cursor(self) -> None:
-        """回放光标: 每条线路一个白点 + **点内部的黑色朝向短线**(与软件版一致)。"""
+        """回放光标: 每条线路一个白点 + **点内部的主题色朝向短线**(与软件版一致)。"""
         self._gl_cursor = self._gl_cursor_dir = None
         n = len(self._playback_recs)
         if not n:
@@ -1101,12 +1124,14 @@ class RouteMapGlView(RouteMapView):
         text = self._hover_text
         if not text:
             return
-        # 2) 左下角浮层: 与软件版同尺寸(字号 9, 行高~17, 内边距 7/4)
+        # 2) 左下角浮层: 尺寸与文字位置**与软件版完全一致** ——
+        # 都用同一套 QFontMetrics(之前 GPU 端按“9px/中文”粗估, 框宽只有实测的一半,
+        # 文字直接溢出框外; 行高还写死了 17px, 而 9pt 雅黑的行高不是 17)。
         lines = text.split("\n")
-        th = 17.0
-        tw = 0.0
-        for ln in lines:
-            tw = max(tw, sum(9.0 if ord(ch) > 127 else 5.6 for ch in ln))
+        font = QFont(_CJK_FAMILY, 9)
+        fm = QFontMetrics(font)
+        th = float(fm.height())
+        tw = float(max(fm.horizontalAdvance(ln) for ln in lines))
         box_w = min(tw + 14.0, max(80.0, float(self.width() - 20.0)))
         box_h = th * len(lines) + 8.0
         r = self._map_rect()
@@ -1116,18 +1141,20 @@ class RouteMapGlView(RouteMapView):
         ny = 1.0 - (y - r.top()) / dh
         w, h = box_w / dw, box_h / dh
         z = Z_PLAYER + 0.008
+        box_pos, box_idx = _rounded_rect_geometry(w, h, 4.0 / dw)
         box = self._add(gfx.Mesh(
-            gfx.plane_geometry(w, h),
+            gfx.Geometry(positions=box_pos, indices=box_idx),
             gfx.MeshBasicMaterial(color=_rgba(QColor(15, 23, 42, 215)), side="both")),
             O_HOVER_BOX)
         box.local.position = (nx + w / 2.0, ny - h / 2.0, z)
         self._gl_hover_box = box
         self._gl_hover_px = (x, y, w, h)
-        # 软件版: 文字左对齐、垂直居中, 内边距左 7 / 上 4;
-        # 行高要与 QFontMetrics.height() 一致(9pt ≈ 17px), pygfx 默认 1.2×字号 只有 10.8px
+        # pygfx 的 font_size 是**像素**: Qt 的 9pt 在 96dpi 下 ≈ 12px;
+        # 行距用 fm.height()(行高 = font_size × line_height)
         self._hover_obj = self._add(gfx.Text(
-            text="\n".join(lines), font_size=9, screen_space=True,
-            family=_CJK_FAMILY, anchor="top-left", line_height=17.0 / 9.0,
+            text="\n".join(lines), font_size=12, screen_space=True,
+            family=_CJK_FAMILY, anchor="top-left",
+            line_height=max(0.8, th / 12.0),
             material=gfx.TextMaterial(color="#e2e8f0")), O_HOVER_TEXT)
         self._hover_obj.local.position = (nx + 7.0 / dw, ny - 4.0 / dh, z + 0.002)
 
@@ -1307,7 +1334,7 @@ class RouteMapGlView(RouteMapView):
                         darr[2 * i] = darr[2 * i + 1] = (far, far, 0.0)
                     continue
                 ca, sa = math.cos(ang), math.sin(ang)
-                # 点内部的黑色短线(不需要再内缩: 已经是平头且完全落在白点里)
+                # 点内部的朝向短线(不需要再内缩: 已经是平头且完全落在白点里)
                 b0 = rmv.CURSOR_DIR_BACK
                 b1 = rmv.CURSOR_DIR_BACK + rmv.CURSOR_DIR_LEN
                 if darr is not None:
