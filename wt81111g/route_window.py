@@ -22,7 +22,9 @@ import os
 import time
 
 from PyQt6.QtCore import QSettings, QSize, Qt
-from PyQt6.QtGui import QAction, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QBrush, QCloseEvent, QColor, QFont, QIcon, QPalette,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFrame,
     QGridLayout, QHeaderView, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu,
@@ -41,6 +43,10 @@ from .map_cache import MapCache
 from .map_manager import MapManagerDialog
 from .route_map_view import RouteMapView
 from .route_playback import PLAYBACK_SPEEDS, RoutePlayer
+from .record_overlay import (
+    ANCHORS, COLOR_TEXT, COLOR_TITLE, RecordOverlay, RecordOverlaySettings,
+)
+from .record_overlay_dialog import RecordOverlayDialog
 from .route_recorder import DEFAULT_INTERVAL_MS, RouteRecorder
 from .route_store import (
     GLOBAL_SIDES, GLOBAL_SIDE_LABELS, PLACEHOLDER_MAP_KEY, GlobalRecord, RouteRecord,
@@ -167,6 +173,8 @@ class RouteTesterWindow(QMainWindow):
             self._show_spawns = int(self._settings.value("show_spawns", 1)) != 0
         except (TypeError, ValueError):
             self._show_spawns = True
+        # 录制叠加层(独立透明置顶窗, 显示录制进度/实际采集率; 默认关闭)
+        self._overlay_settings = self._load_overlay_settings()
 
         # 快捷键设置必须先读(菜单里的「同时使用按键轮询」勾选状态要用), 监控对象在后面再建
         self._hotkey_bindings = load_bindings(self._settings)
@@ -178,6 +186,9 @@ class RouteTesterWindow(QMainWindow):
 
         self._build_ui()
         self._build_menu()
+        # 叠加层对象必须在 _build_menu 之后建(菜单要读 _overlay_settings),
+        # 且必须在 recorder 之前 —— _on_tick 每帧都会用到它
+        self.overlay = RecordOverlay(self._overlay_settings, parent=None)
         self.map_view.set_show_zones(self._show_zones)
         self.map_view.set_show_spawns(self._show_spawns)
         self.map_view.set_dead_style(dim=self._saved_dead_dim, mark=self._saved_dead_mark)
@@ -280,6 +291,40 @@ class RouteTesterWindow(QMainWindow):
         self.act_spawns.toggled.connect(self._on_show_spawns)
         setting.addAction(self.act_spawns)
 
+        # ---- 叠加层(录制时浮在屏幕角落的小窗)
+        setting.addSeparator()
+        ov_menu = setting.addMenu("叠加层(&O)")
+        self.act_overlay = QAction("启用录制叠加层", self)
+        self.act_overlay.setCheckable(True)
+        self.act_overlay.setChecked(self._overlay_settings.enabled)
+        self.act_overlay.setToolTip(
+            "勾选后, 开始录制(单条 / A·B 队)时在屏幕角落浮出小块信息:\n"
+            "状态与用时、**实际采集率**(每秒写入多少个轨迹点)、8111 轮询频率、\n"
+            "轨迹点数、标记数、当前速度与载具; 结束录制自动隐藏。\n"
+            "它是独立的外部置顶窗(点击穿透), 不注入游戏 —— "
+            "要浮在游戏上请用「全屏窗口(无边框)」模式。")
+        self.act_overlay.toggled.connect(self._on_overlay_enabled)
+        ov_menu.addAction(self.act_overlay)
+        ov_menu.addSeparator()
+
+        # 位置: 四角之一(动作组互斥)
+        pos_menu = ov_menu.addMenu("位置")
+        self._overlay_pos_group = QActionGroup(self)
+        self._overlay_pos_group.setExclusive(True)
+        self._overlay_pos_actions: dict[str, QAction] = {}
+        for key, name in ANCHORS.items():
+            act = QAction(name, self)
+            act.setCheckable(True)
+            act.setChecked(key == self._overlay_settings.anchor)
+            act.triggered.connect(lambda _c=False, k=key: self._on_overlay_anchor(k))
+            self._overlay_pos_group.addAction(act)
+            self._overlay_pos_actions[key] = act
+            pos_menu.addAction(act)
+
+        act_ov_set = QAction("叠加层设置(边距 / 背景不透明度 / 圆角 / 字号)…", self)
+        act_ov_set.triggered.connect(self._open_overlay_settings)
+        ov_menu.addAction(act_ov_set)
+
         hk_menu = self.menuBar().addMenu("快捷键(&K)")
         act_hk_set = QAction("快捷键设置(按键 / 修饰键)…", self)
         act_hk_set.setToolTip("给“开始录制 / 结束录制 / 标记位置”分别指定按键, 改动立即生效。")
@@ -337,6 +382,125 @@ class RouteTesterWindow(QMainWindow):
         buttons.accepted.connect(dlg.accept)
         layout.addWidget(buttons)
         dlg.exec()
+
+    # ------------------------------------------------------------ 录制叠加层
+    def _load_overlay_settings(self) -> RecordOverlaySettings:
+        """从 QSettings 读叠加层外观(读不到/值损坏就退回默认)。"""
+        s = self._settings
+
+        def _int(key: str, default: int) -> int:
+            try:
+                return int(s.value(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        return RecordOverlaySettings(
+            enabled=_int("overlay_enabled", 0) != 0,
+            anchor=str(s.value("overlay_anchor", "") or ""),
+            margin=_int("overlay_margin", 24),
+            opacity=_int("overlay_opacity", 62),
+            corner=_int("overlay_corner", 10),
+            font_size=_int("overlay_font_size", 10),
+        ).normalized()
+
+    def _save_overlay_settings(self) -> None:
+        o = self._overlay_settings
+        s = self._settings
+        s.setValue("overlay_enabled", 1 if o.enabled else 0)
+        s.setValue("overlay_anchor", o.anchor)
+        s.setValue("overlay_margin", int(o.margin))
+        s.setValue("overlay_opacity", int(o.opacity))
+        s.setValue("overlay_corner", int(o.corner))
+        s.setValue("overlay_font_size", int(o.font_size))
+
+    def _on_overlay_enabled(self, on: bool) -> None:
+        self._overlay_settings.enabled = bool(on)
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        self._set_status(
+            "录制叠加层已启用: 开始录制时会在屏幕%s显示"
+            % ANCHORS.get(self._overlay_settings.anchor, "角落")
+            if on else "录制叠加层已关闭", sticky=3.0)
+
+    def _on_overlay_anchor(self, key: str) -> None:
+        self._overlay_settings.anchor = key
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        act = self._overlay_pos_actions.get(key)
+        if act is not None and not act.isChecked():
+            act.setChecked(True)
+
+    def _open_overlay_settings(self) -> None:
+        """「设置 → 叠加层 → 叠加层设置…」: 改动实时预览, 取消则回滚。"""
+        before = RecordOverlaySettings(**vars(self._overlay_settings))
+        dlg = RecordOverlayDialog(self._overlay_settings, self)
+
+        def on_changed() -> None:
+            self._overlay_settings = dlg.settings
+            self.overlay.apply_settings(self._overlay_settings)
+
+        dlg.settings_changed.connect(on_changed)
+        ok = dlg.exec() == QDialog.DialogCode.Accepted
+        if not ok:
+            self._overlay_settings = before          # 取消 → 回到打开前的样子
+            self.overlay.apply_settings(self._overlay_settings)
+            return
+        self._overlay_settings = dlg.settings
+        self.overlay.apply_settings(self._overlay_settings)
+        self._save_overlay_settings()
+        if self.act_overlay.isChecked() != self._overlay_settings.enabled:
+            self.act_overlay.setChecked(self._overlay_settings.enabled)
+        act = self._overlay_pos_actions.get(self._overlay_settings.anchor)
+        if act is not None:
+            act.setChecked(True)
+        self._set_status("叠加层设置已保存", sticky=3.0)
+
+    def _update_overlay(self, info: dict) -> None:
+        """把当前录制状态推给叠加层(由 `_on_tick` 的 ~12Hz 文本节流块驱动)。
+
+        显示的内容:
+
+        * 第一行: 状态 + 用时(准备录制 / 录制中 / A·B 队);
+        * **采集 x 点/秒**: 最近 2 秒真正写进轨迹的点数率 —— 这才是"实际采样率",
+          它低于轮询频率是正常的(采样还要过“采样间隔 + 最小位移”两道闸,
+          车不动时一个点也不写); 两个数并排显示就能一眼看出是哪一边的问题;
+        * 点数 / 标记数 / 当前速度 / 载具。
+        """
+        if not self._overlay_settings.enabled:
+            return
+        if not info.get("recording"):
+            self.overlay.set_active(False)
+            return
+        rate = float(info.get("rate") or 0.0)
+        g = info.get("global")
+        if g:
+            side = str(g.get("side") or "?")
+            if g.get("waiting"):
+                head = f"● {side} 队: 等待第一名玩家重生…"
+                elapsed = 0.0
+            else:
+                head = f"● {side} 队录制中"
+                elapsed = float(g.get("elapsed") or 0.0)
+            lines = [
+                (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
+                (f"线路 {int(g.get('lives') or 0)} 条 · 进行中 "
+                 f"{int(g.get('active') or 0)} 辆", COLOR_TEXT),
+                (f"8111 轮询 {rate:.1f} Hz", COLOR_TEXT),
+            ]
+        else:
+            elapsed = float(info.get("elapsed") or 0.0)
+            head = "● 准备录制 等待载具移动…" if info.get("armed") else "● 录制中"
+            lines = [
+                (f"{head}  {fmt_time(elapsed)}", COLOR_TITLE),
+                (f"采集 {float(info.get('point_rate') or 0.0):.1f} 点/秒 · "
+                 f"轮询 {rate:.1f} Hz", COLOR_TEXT),
+                (f"点数 {int(info.get('points') or 0)} · "
+                 f"标记 {int(info.get('marks') or 0)} 个", COLOR_TEXT),
+                (f"{fmt_speed(float(info.get('speed') or 0.0))} km/h · "
+                 f"{info.get('vehicle') or '未知载具'}", COLOR_TEXT),
+            ]
+        self.overlay.set_lines(lines)
+        self.overlay.set_active(True)
 
     def _on_show_zones(self, checked: bool) -> None:
         """菜单开关: 是否在地图上画战区。"""
@@ -1855,6 +2019,7 @@ class RouteTesterWindow(QMainWindow):
     def _on_global_finished(self, rec: GlobalRecord, side: str) -> None:
         self._last_global = rec
         self._last_duration = rec.duration
+        self.overlay.set_active(False)      # 录完就收掉叠加层
         self._update_buttons()
         # 刚录完的这一队自动点亮, 否则侧栏看起来“什么都没发生”
         self._visible_lives = {life.life_id for life in rec.lives(side)}
@@ -1866,6 +2031,7 @@ class RouteTesterWindow(QMainWindow):
             f" | 用时 {fmt_time(rec.duration)}", sticky=8.0)
 
     def _on_global_cancelled(self) -> None:
+        self.overlay.set_active(False)
         self._update_buttons()
         self._reload_tree()
         self._set_status("已取消全局录制(没有录到任何线路, 条目已丢弃)", sticky=4.0)
@@ -2199,6 +2365,8 @@ class RouteTesterWindow(QMainWindow):
             if self.map_view.map_key is None and now - self._last_map_try >= 1.0:
                 self._last_map_try = now
                 self._restore_map_for_current_view()
+            # 录制叠加层(与上面那批文本同一个 ~12Hz 节流)
+            self._update_overlay(info)
 
         self.map_view.set_player(info.get("player"), info.get("dir"))
         # 全局录制: 边录边画(新点一多就重画一次模型层, 见 _tracks_key)
@@ -2378,6 +2546,7 @@ class RouteTesterWindow(QMainWindow):
     def _on_recording_cancelled(self) -> None:
         """等待移动期间被结束 → 本次录制被丢弃(全程速度为 0)。"""
         self.map_view.set_live(None)
+        self.overlay.set_active(False)
         self._update_buttons(False)
         self._set_status("已取消录制: 未检测到载具移动(速度全程为 0)", sticky=3.0)
 
@@ -2387,6 +2556,7 @@ class RouteTesterWindow(QMainWindow):
     def _on_recording_finished(self, rec: RouteRecord) -> None:
         self._last_duration = rec.duration
         self._last_record = rec
+        self.overlay.set_active(False)      # 录完就收掉叠加层
         # 刚录完的这条仍然显示在地图上 → 眼睛必须同步点亮(显示状态统一由 _visible_ids 决定)
         self._visible_ids.add(rec.route_id)
         self._update_buttons(False)
@@ -2406,6 +2576,7 @@ class RouteTesterWindow(QMainWindow):
             self.sys_hotkeys.stop()
             self.player.pause()
             self.recorder.stop()
+            self.overlay.close()          # 叠加层是独立顶层窗, 不关会留在屏幕上
             self.store.save()
         except Exception as exc:  # noqa: BLE001 - 退出时尽力清理
             log.warning("退出清理异常: %s", exc)

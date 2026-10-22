@@ -3112,6 +3112,115 @@ def test_dead_style(tmpdir: str):
     results.append("回放阵亡样式(变灰/红叉/两个开关/无阵亡信息不变灰) OK")
 
 
+def test_record_overlay(tmpdir: str):
+    """录制叠加层: 默认不显示, 启用后录制时才出现; 位置/圆角/不透明度都生效。
+
+    这是用户 2026-10-22 要的功能: 录制时在屏幕角落看“实际采集情况”。
+    已确认它是**独立外部置顶窗**(与黑名单程序的 `overlay.py` 同一套做法),
+    不注入游戏、不读写游戏内存、只读 8111。
+    """
+    from PyQt6.QtCore import QSettings
+    from PyQt6.QtGui import QPainter
+
+    app = QApplication.instance()
+    win = make_window(tmpdir, "overlay.json")
+    win.recorder.stop()
+    win.hotkeys.stop()
+    win.sys_hotkeys.stop()
+    # 隔离 QSettings, 否则会改到用户真实设置(也可能让“默认关闭”断言失败)
+    win._settings = QSettings(os.path.join(tmpdir, "overlay.ini"),
+                              QSettings.Format.IniFormat)
+    win._overlay_settings = win._load_overlay_settings()
+    win.overlay.apply_settings(win._overlay_settings)
+    ov = win.overlay
+
+    info = {"recording": True, "elapsed": 83.4, "rate": 24.5, "points": 1042,
+            "point_rate": 12.6, "marks": 3, "speed": 42.0,
+            "vehicle": "Leopard 2PL", "global": None}
+
+    # 1) 默认关闭 → 录制中也不出现
+    assert not win._overlay_settings.enabled, "叠加层应默认关闭"
+    assert not win.act_overlay.isChecked()
+    win._update_overlay(info)
+    app.processEvents()
+    assert not ov.isVisible(), "没启用时不该出现叠加层"
+
+    # 2) 启用 + 录制中 → 出现, 内容含“实际采集率”与轮询频率
+    win.act_overlay.setChecked(True)
+    app.processEvents()
+    win._update_overlay(info)
+    app.processEvents()
+    assert ov.isVisible(), "启用后录制中应该显示叠加层"
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "采集 12.6 点/秒" in text and "轮询 24.5 Hz" in text, text
+    assert "点数 1042" in text and "标记 3 个" in text, text
+    assert "42 km/h" in text and "Leopard 2PL" in text, text
+    assert ov._panel.width() > 60 and ov._panel.height() > 30
+
+    # 3) 录制结束 → 立即隐藏
+    win._update_overlay({"recording": False, "global": None})
+    app.processEvents()
+    assert not ov.isVisible(), "录制结束应自动隐藏叠加层"
+
+    # 4) 位置: 四个锚点各自落到对应角(按可用区域 + 边距)
+    win._update_overlay(info)
+    app.processEvents()
+    geo = ov.geometry()
+    for key, want in (("tl", (False, False)), ("tr", (True, False)),
+                     ("bl", (False, True)), ("br", (True, True))):
+        win._on_overlay_anchor(key)
+        px, py = ov._panel.x(), ov._panel.y()
+        assert (px > geo.width() // 2) == want[0], (key, px, geo.width())
+        assert (py > geo.height() // 2) == want[1], (key, py, geo.height())
+        assert px >= 0 and py >= 0, (key, px, py)
+
+    # 5) 圆角/不透明度: 画到透明底图上验证(与实机同一条 draw() 路径)
+    def snap():
+        w, h = ov._panel.width(), ov._panel.height()
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(QColor(0, 0, 0, 0))
+        p = QPainter(img)
+        ov._panel.draw(p)
+        p.end()
+        return img
+
+    win._overlay_settings.opacity = 100
+    win._overlay_settings.corner = 18
+    ov.apply_settings(win._overlay_settings)
+    win._update_overlay(info)
+    app.processEvents()
+    img = snap()
+    w, h = ov._panel.width(), ov._panel.height()
+    bg_x, bg_y = w - 5, h // 2            # 右侧内边距: 只有背景
+    assert img.pixelColor(0, 0).alpha() == 0, "圆角处应该是透明的"
+    assert img.pixelColor(bg_x, bg_y).alpha() == 255, "100% 不透明度应是实底"
+    win._overlay_settings.opacity = 40
+    ov.apply_settings(win._overlay_settings)
+    win._update_overlay(info)
+    app.processEvents()
+    assert 80 <= snap().pixelColor(bg_x, bg_y).alpha() <= 120, "40% 不透明度应≈102"
+
+    # 6) 全局录制(A/B 队) → 内容换成队伍/线路数
+    win._update_overlay({"recording": True, "rate": 5.0, "global": {
+        "side": "A", "waiting": False, "elapsed": 12.0,
+        "lives": 7, "active": 3}})
+    app.processEvents()
+    text = "\n".join(t for t, _c in ov._panel._lines)
+    assert "A 队录制中" in text and "线路 7 条" in text and "5.0 Hz" in text, text
+
+    # 7) 设置落盘
+    win._save_overlay_settings()
+    again = QSettings(os.path.join(tmpdir, "overlay.ini"), QSettings.Format.IniFormat)
+    assert int(again.value("overlay_enabled")) == 1
+    assert again.value("overlay_anchor") == "br"
+    assert int(again.value("overlay_opacity")) == 40
+
+    ov.close()
+    win.close()
+    app.processEvents()
+    results.append("录制叠加层: 默认关闭/随录制显示、采集率与轮询、四角位置、圆角与不透明度 OK")
+
+
 def main() -> int:
     app = QApplication([])
     tmpdir = tempfile.mkdtemp()
@@ -3142,6 +3251,7 @@ def main() -> int:
     test_eye_visibility_opacity(tmpdir)
     test_playback_lock(tmpdir)
     test_recording_end_eye(tmpdir)
+    test_record_overlay(tmpdir)
     test_playback_source_selection(tmpdir)
     test_map_cache(tmpdir)
     test_map_resolution_alias(tmpdir)

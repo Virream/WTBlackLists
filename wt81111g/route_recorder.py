@@ -188,6 +188,9 @@ class RouteRecorder(QObject):
         self._spawns_saved: tuple = ()  # 已落盘的那份重生点状态
         # 全局录制: 已记进时间轴的战区状态(字母/坐标/归属/是否被占)
         self._zone_state_key: tuple | None = None
+        # 最近 2 秒内的**实际采样时刻**: 叠加层要显示“每秒真的写入了几个轨迹点”
+        # (它和 8111 轮询频率不是一回事 —— 采样还要过“采样间隔 + 最小位移”两道闸)
+        self._pt_times: deque[float] = deque()
 
     # ------------------------------------------------------------------ 生命周期
     def start(self) -> None:
@@ -423,6 +426,8 @@ class RouteRecorder(QObject):
             "elapsed": elapsed,
             "marks": len(self._rec.marks) - 1 if self._rec is not None else 0,
             "rate": self._current_rate(),
+            "points": len(self._rec.points) if self._rec is not None else 0,
+            "point_rate": self.point_rate(),
             "zones": self._zones,
             "spawns": self._spawns,
             "mode": self.mode_name,
@@ -813,6 +818,7 @@ class RouteRecorder(QObject):
                 break
         self._last_pt_t = 0.0
         self._last_xy = (sx, sy)
+        self._pt_times.clear()          # 新一次录制 → 点数率窗口从头算
         for pt in extra or []:   # 起点之后已有的位移点(最多回溯窗口内的几帧)
             rec.points.append(pt)
             self._last_pt_t = pt.t
@@ -919,6 +925,25 @@ class RouteRecorder(QObject):
                                      dx=dx, dy=dy))
         self._last_pt_t = elapsed
         self._last_xy = player
+        # 维护“实际采样时刻”窗口(只留最近 2 秒), 供 `point_rate()` 算真实点数率
+        self._pt_times.append(elapsed)
+        cutoff = elapsed - 2.0
+        while self._pt_times and self._pt_times[0] < cutoff:
+            self._pt_times.popleft()
+
+    def point_rate(self) -> float:
+        """最近 2 秒**真的写入了多少个轨迹点**(点/秒)。
+
+        与 `_current_rate()`(8111 轮询频率)不同: 采样还要过“采样间隔 + 最小位移”
+        两道闸, 所以实际点数率会**低于**轮询频率 —— 低速或停着不动时尤其明显
+        (车不动 → 位移不够 → 一个点也不写)。叠加层把它和轮询 Hz 并排显示,
+        就是为了让人一眼看出“8111 在给数据, 但轨迹没在长”。
+        """
+        q = self._pt_times
+        if len(q) < 2:
+            return 0.0
+        span = q[-1] - q[0]
+        return (len(q) - 1) / span if span > 0 else 0.0
 
     def _dir_xy(self) -> tuple[float, float]:
         """当前车头朝向的 (dx, dy); 没拿到时为 (0, 0)(= 不画朝向箭头)。"""
