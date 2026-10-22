@@ -1662,20 +1662,33 @@ def test_eye_visibility_opacity(tmpdir: str):
 
 
 def test_store_bom(tmpdir: str):
-    """带 BOM 的 routes.json 也要能读(否则会被当成损坏 → 记录全丢, 下次 save 还会覆盖掉)。"""
-    path = os.path.join(tmpdir, "bom_routes.json")
+    """存储格式: `data/routes.json` 是 **gzip 压缩的 JSON**(2026-10-22 起)。
+
+    动机是体积与加载速度: 实测 3.49MB → 0.47MB(7.4 倍), 加载 80ms → 63ms
+    (磁盘少读 7.4 倍, 省下的 IO 多于解压)。
+    **不做旧格式兼容**(自用软件, 数据可随时重录) —— 所以这里只验证 gzip 往返:
+    写出来的必须是 gzip 魔数, 存进去的东西一字不差地读回来。
+    """
+    path = os.path.join(tmpdir, "fmt_routes.json")
     store = RouteStore(path)
     rec = store.new_route("AAA", "地图 A", "T", 0.2, 0.2)
     rec.duration = 5.0
     rec.points = [RoutePoint(0.2, 0.2, 0.0, 0.0), RoutePoint(0.3, 0.3, 5.0, 30.0)]
     store.add(rec)
+
     raw = open(path, "rb").read()
-    open(path, "wb").write(b"\xef\xbb\xbf" + raw)      # 手工加 UTF-8 BOM
+    assert raw[:2] == b"\x1f\x8b", "save() 应该写 gzip"
     again = RouteStore(path)
     assert len(again.routes) == 1, again.routes
     assert again.routes[0].route_id == rec.route_id
     assert again.routes[0].points[-1].speed == 30.0
-    results.append("带 BOM 的 routes.json 可正常读取 OK")
+    assert abs(again.routes[0].points[-1].x - 0.3) < 1e-9
+
+    # 写坏了(不是 gzip) → 当没有数据, 不抛异常、不拿半截数据当完整数据
+    open(path, "wb").write(b"not a gzip file")
+    broken = RouteStore(path)
+    assert not broken.routes and not broken.globals, broken.routes
+    results.append("存储: routes.json 为 gzip(往返一致 / 损坏文件当空数据) OK")
 
 
 def test_playback_lock(tmpdir: str):

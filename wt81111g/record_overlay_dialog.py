@@ -1,12 +1,10 @@
 """录制叠加层的设置对话框(改动实时生效, 主窗口负责保存)。"""
 from __future__ import annotations
 
-from dataclasses import replace
-
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QSlider, QSpinBox, QVBoxLayout,
+    QHBoxLayout, QSlider, QSpinBox, QVBoxLayout,
 )
 
 from .record_overlay import ANCHORS, RecordOverlaySettings
@@ -25,7 +23,7 @@ class RecordOverlayDialog(QDialog):
         super().__init__(parent)
         self.settings = settings.normalized()
         self.setWindowTitle("录制叠加层设置")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(360)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
@@ -75,16 +73,6 @@ class RecordOverlayDialog(QDialog):
         self.spn_font.setValue(self.settings.font_size)
         form.addRow("字号", self.spn_font)
         root.addWidget(box)
-
-        hint = QLabel(
-            "叠加层内容是: 状态与用时、<b>实际采集率</b>(每秒写入多少个轨迹点)、"
-            "8111 轮询频率、轨迹点数、标记数、当前速度与载具。<br>"
-            "它是独立的外部窗口(点击穿透), 不注入游戏、不读写游戏内存 —— "
-            "要浮在游戏之上, 游戏需使用「全屏窗口(无边框)」模式。", self)
-        hint.setWordWrap(True)
-        hint.setTextFormat(Qt.TextFormat.RichText)
-        hint.setStyleSheet("color:#9aa7bd;")
-        root.addWidget(hint)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)

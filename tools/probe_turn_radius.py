@@ -23,6 +23,7 @@
     * 朝向抖动 p90 超过 2~3° → 半径会跟着抖, 该考虑加大窗口;
     * 只有带 dx/dy 的轨迹才能算半径(老数据/全局录制没有朝向, 会被跳过)。
 """
+import gzip
 import io
 import json
 import math
@@ -63,13 +64,22 @@ def unwrap_delta(a0, a1):
     return d
 
 
+def load_routes(path: str) -> dict:
+    """读数据文件(2026-10-22 起是 gzip 压缩的 JSON, 老文件是明文, 都支持)。"""
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if raw[:2] == b"\x1f\x8b":            # gzip 魔数
+        raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8-sig"))
+
+
 def main() -> int:
     path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT
     if not os.path.exists(path):
         print("找不到数据文件: %s" % path)
         print("用法: python tools/probe_turn_radius.py [routes.json]")
         return 2
-    data = json.load(io.open(path, encoding="utf-8"))
+    data = load_routes(path)
     routes = [r for r in data.get("routes") or [] if r.get("points")]
     print("=== 轨迹清单 (%s) ===" % path)
     for r in routes:

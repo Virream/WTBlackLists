@@ -282,7 +282,9 @@ def about_html(bindings: dict | None = None) -> str:
 
 <h3>数据存在哪</h3>
 <ul>
-<li>轨迹与地图名: <code>data/routes.json</code>(原子写入, 断电不会写坏);</li>
+<li>轨迹与地图名: <code>data/routes.json</code>(原子写入, 断电不会写坏;
+    **内容是 gzip 压缩的 JSON**, 虽然扩展名还是 .json —— 体积小 7 倍, 加载也更快。
+    想看内容可用 <code>python -m gzip -dc data/routes.json</code>);</li>
 <li>地图图片缓存: <code>data/maps/</code>;</li>
 <li>运行日志: <code>data/route_tester.log</code>(快捷键触发、换图、录制起止都会记, 排查问题看它);</li>
 <li>目录版(onedir)的数据在 exe 同级 <code>data\\</code>; 源码运行则在项目根目录。</li>
