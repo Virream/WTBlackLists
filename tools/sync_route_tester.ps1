@@ -45,6 +45,8 @@ $manifest = @(
     "tools\probe_watcher_fix.py",
     "tools\probe_frame_align.py",
     "tools\probe_turn_radius.py",
+    "tools\probe_map_quality.py",
+    "tools\probe_map_upscale.py",
     # 源码模块(黑名单不用, 只在跑图测试器里)
     "wt81111g\global_hotkey.py",
     "wt81111g\global_record.py",

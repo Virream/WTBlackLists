@@ -43,6 +43,8 @@ WTRTI/
 /tools/probe_frame_align.py
 /tools/probe_turn_radius.py
 /tools/make_app_icon.py
+/tools/probe_map_quality.py
+/tools/probe_map_upscale.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
 /wt81111g/help_text.py
