@@ -69,15 +69,17 @@ class MonitorWorker(QObject):
                  nickname_cache: NicknameCache | None = None,
                  base_url: str = WT_BASE_URL,
                  poll_interval: float = 1.0,
-                 msg_interval: float = 3.0,
+                 msg_interval: float = 0.5,
                  shared_repo_url: str | None = None):
         super().__init__()
         self.store = store
         self.nickname_cache = nickname_cache or NicknameCache()
         self.poll_interval = poll_interval
-        # /hudmsg + /gamechat 的最小请求间隔(秒): 实测“软件一开就偶尔漏一条 HUD 消息”
-        # (id 连续无缺口 = 游戏没生成它), 而关掉软件反复打都不漏 —— 怀疑就是这两个每秒
-        # 轮询在打扰游戏。降低频率后消息仍留在 8111 的滚动窗口里(游标不推进即可), 不会丢。
+        # /hudmsg + /gamechat 的最小请求间隔(秒)。
+        # **改成 0.5(即每个 tick 都取)**: `/hudmsg` 的 damage 是**滚动窗口**,
+        # 以前抩到 3 秒是为了“别打扰游戏”, 但 8111 自己的网页首页就是
+        # `setInterval(updateSlow, 500)` —— 官方就是这么频率取的, 0.5 秒不会
+        # 打扰到游戏; 抩到 3 秒反而会把交火期的消息挤出窗口(实际漏采)。
         self.msg_interval = msg_interval
         self._last_msg_poll = 0.0
         # 公开仓库共享表(nickname.json)地址: 自动刷新优先查此表, 命中则免访问 WTLive/官网
