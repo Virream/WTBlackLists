@@ -45,6 +45,7 @@ WTRTI/
 /tools/make_app_icon.py
 /tools/probe_map_quality.py
 /tools/probe_map_upscale.py
+/tools/probe_split_sam.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
 /wt81111g/help_text.py
