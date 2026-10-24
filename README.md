@@ -99,7 +99,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 **源码不再另外打包**(源码就在本仓库, 1.0 版见 `1.0` 分支)。
 
 > **跑图线路测试器是另一个独立程序**, 已单独发布在
-> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.1.1**),
+> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.2.0**),
 > 代码与它自己的文档都在那个仓库里, **本仓库不再包含它**。
 > 两者只是共用 8111 的调用封装(`wt81111g/api8111.py`)与地图/战区缓存格式。
 > 能力概览: 单条线路录制(速度配色 / 标记 / 转弯半径)、**A/B 队全局录制**(整局所有玩家
