@@ -8,7 +8,7 @@ APP_NAME = "WTBlackList"
 APP_VERSION = "2.0.5"
 # 跑图线路测试器(`route_tester.py`)是**独立程序**, 版本号与黑名单分开走 ——
 # 打包(`build_route_tester.ps1`)、exe 文件属性、关于界面都用这个。
-ROUTE_VERSION = "1.1.1"
+ROUTE_VERSION = "1.2.0"
 
 # 战争雷霆 8111 本地接口
 # 用 127.0.0.1 而非 localhost: Windows 上 localhost 可能先解析到 IPv6(::1)再回退 IPv4,
