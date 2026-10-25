@@ -43,6 +43,7 @@ WTRTI/
 /docs/跑图线路测试器.md
 /docs/WTRouteTester-FEATURES.md
 /tools/route_map_gl_demo.py
+/tools/wrpl/
 /tools/probe_playback_stutter.py
 /tools/probe_vram.py
 /tools/probe_watcher_fix.py
@@ -72,5 +73,12 @@ WTRTI/
 /wt81111g/sound.py
 /wt81111g/sound_dialog.py
 /wt81111g/tree_view.py
-/wt81111g/watcher_dialog.py
+# 回放(.wrpl)解析: 自研, 只服务跑图线路测试器
+/wt81111g/wrpl_reader.py
+/wt81111g/wrpl_events.py
+/wt81111g/wrpl_air.py
+/wt81111g/wrpl_entities.py
+/wt81111g/replay_import.py
+/wt81111g/map_calib.py
+/wt81111g/calib_capture.py
 /wt81111g/zones.py
