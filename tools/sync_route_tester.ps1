@@ -110,6 +110,7 @@ $manifest = @(
     "tools\wrpl\probe_orphan_uids.py",
     "tools\wrpl\probe_kill_window.py",
     "tools\wrpl\probe_frozen_tail.py",
+    "tools\wrpl\probe_alive_end.py",
     # 源码模块(黑名单不用, 只在跑图测试器里)
     "wt81111g\global_hotkey.py",
     "wt81111g\global_record.py",
