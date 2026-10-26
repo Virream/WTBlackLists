@@ -4,6 +4,65 @@
 
 > 主题: 用**回放文件**代替 A/B 两次实况录制。
 
+### 重构: 侧栏改成三层(地图 → 模式 → 轨迹), 并删掉全部兼容代码(用户 2026-10-26)
+
+**① 游戏里一张地图的模式与子区域**(用户口述, 记下来当设计依据):
+
+| 战区数量 | 模式 | 子区域 |
+|---|---|---|
+| 3 | 战区控制 | 大国/小国两套(**同一个模式, 只是作战范围不同**) |
+| 2 | 战区攻陷 | 同上 |
+| 1 | 战区争夺 | 那个单战区会从 3 个位置里**随机**出现 |
+
+也就是说: 「3 个战区」一定是战区控制, 「大图/小图」**不是另一个模式**,
+战区争夺的「3 个随机点位」也**不是三种模式**。以前把战区坐标指纹当"版本"
+单独列一层, 于是同一张图会出现 `区域 1 / 区域 2 / 点位 1 / 点位 2 / 点位 3`
+一堆条目 —— 用户明确要求: **只按战区数量分成 3 类, 不再细分子区域**。
+
+```python
+RouteRecord.mode_label / GlobalRecord.mode_label
+    """模式显示名 —— 优先按战区数量推。"""
+    by_count = zone_mode_name(self.zone_count)     # 1/2/3 → 争夺/攻陷/控制
+    if by_count and by_count != "未知模式":
+        return by_count
+    return self.mode_name or by_count              # 回放没有 zone_count 时用头里的
+```
+
+侧栏因此从四层变三层:
+
+```
+地图名(图片哈希)
+    战区控制          ← mode_label, 唯一的第二层
+        全局 10-24 22:45 / 单条录制 ...
+```
+
+* `route_window._tree_modes()` 不再遍历"版本", 直接吃
+  `store.grouped_by_mode()` / `store.globals_by_mode()`;
+* `_group_of(rec)` = `(canon(map_key), rec.mode_label)` —— 基准(锚)的判断也跟着走模式;
+* 右键菜单去掉了「重命名版本」(`_rename_variant`), 只剩「显示/隐藏本模式全部轨迹」;
+* 提示文字 `_mode_tip()` 仍然把"见过几种作战范围、各自战区坐标"列出来(信息不丢, 只是不占层级)。
+
+**② 顺手删掉的兼容代码**(用户 2026-10-26 明确要求:
+「不要动不动考虑旧数据, 在我确定当前版本已经稳定之前不考虑兼容性问题」):
+
+| 删掉的 | 原因 |
+|---|---|
+| `layout_names` 字段 + `layout_display_name` / `name_of_layout` / `rename_layout` / `layout_info` / `_layout_auto_names` | 已没有"版本"层, 无处可显示 |
+| `grouped_by_variant()` | 四层树的产物, 三层树用 `grouped_by_mode()` |
+| `globals_by_group()` | 同上, 用 `globals_by_mode()` |
+| `_migrate_replay_keys()`(`wrpl:` → `wrpl_`) | 早期冒号键的数据本来就不该留着 |
+| `GlobalRecord.watchers` / `.fixed` | 「修正死亡时刻」功能早已删除, 字段没人读写 |
+| `_infer_legacy_deaths()` + `LEGACY_DEAD_MARGIN` | 给老数据猜 `dead`, 现在每条线都自己存 |
+| `zones.layout_spread` 的导入 | 随 `_layout_auto_names` 一起没了用处 |
+
+**保留**的 `map_zones` / `zone_layouts()` / `layout_for()` / `remember_zones()` /
+`_recover_layouts()` 不是兼容代码 —— 它们是**画战区**要用的数据(战局结束后
+仍要能在地图上画出 A/B/C), 与"版本层"无关。
+
+**验证**: `tests/route_tester_test.py` 46 项、`tests/global_record_test.py` 30 项、
+`tools/wrpl/probe_map_link.py`、`tools/wrpl/probe_fill_calib_ui.py`、
+`tools/probe_map_zoom.py` 全绿。
+
 ### 重构: 地图身份 = 图片哈希 + 可改的回放关卡代号(用户 2026-10-26)
 
 **要解决的问题**: 同一张地图会以**两种身份**进来 ——
@@ -29,10 +88,10 @@ def canon(self, map_key):
     return self._level_owner.get(map_key[len(MAP_KEY_PREFIX):], map_key)
 ```
 
-走 `canon` 的地方: `ordered_map_keys` / `grouped` / `grouped_by_variant` /
-`grouped_by_mode` / `globals_by_group` / `display_name` / `name_of` / `rename_map` /
+走 `canon` 的地方: `ordered_map_keys` / `grouped` / `grouped_by_mode` /
+`globals_by_mode` / `display_name` / `name_of` / `rename_map` /
 `is_map_hidden` / `calib_of` / `set_calib` / `clear_calib` / `zone_layouts` /
-`layout_*` / `renormalize_map_records`, 以及主窗口的换图清理
+`layout_for` / `renormalize_map_records`, 以及主窗口的换图清理
 (`_drop_tracks_of_other_map` / `_show_cached_map` / `_current_view_key` 等)。
 
 > ⚠ **只做映射, 绝不搬数据**: 记录的 `map_key` 一个字节都没动。
@@ -249,7 +308,8 @@ avg_finland                 ← 地图(回放头里的关卡名)
             A 队 / B 队 → 玩家 → 各台车
 ```
 
-8111 实况录制仍然保留「版本」层(那里有真实战区坐标, 大地图/小地图能分开)。
+8111 实况录制当时还保留「版本」层(那里有真实战区坐标, 大地图/小地图能分开),
+**后来按用户要求整层删掉了**(见上面「侧栏改成三层」一节)。
 
 **验证**(离屏探针, 不解析回放也能验):
 
