@@ -92,6 +92,7 @@ $manifest = @(
     "tools\wrpl\probe_player_lives.py",
     "tools\wrpl\probe_store_life.py",
     "tools\wrpl\probe_fill_calib_ui.py",
+    "tools\wrpl\probe_map_link.py",
     "tools\wrpl\probe_wreck_stats.py",
     "tools\wrpl\probe_uid_half.py",
     "tools\wrpl\probe_uid_repair.py",
