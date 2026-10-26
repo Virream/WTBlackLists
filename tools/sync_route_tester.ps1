@@ -52,6 +52,7 @@ $manifest = @(
     "tools\probe_store_v2.py",
     "tools\probe_tree_scale.py",
     "tools\probe_import_parallel.py",
+    "tools\probe_points_speed.py",
     # 回放(.wrpl)解析探针: 自研解析器, 不依赖任何外部工具
     "tools\wrpl\probe_wrpl.py",
     "tools\wrpl\probe_signatures.py",

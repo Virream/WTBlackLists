@@ -57,6 +57,7 @@ WTRTI/
 /tools/probe_store_v2.py
 /tools/probe_tree_scale.py
 /tools/probe_import_parallel.py
+/tools/probe_points_speed.py
 /tools/probe_split_sam.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
