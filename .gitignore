@@ -56,12 +56,14 @@ WTRTI/
 /tools/probe_map_upscale.py
 /tools/probe_store_v2.py
 /tools/probe_tree_scale.py
+/tools/probe_import_parallel.py
 /tools/probe_split_sam.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
 /wt81111g/help_text.py
 /wt81111g/hotkey_dialog.py
 /wt81111g/icons.py
+/wt81111g/import_pool.py
 /wt81111g/kill_timeline.py
 /wt81111g/map_cache.py
 /wt81111g/map_manager.py
