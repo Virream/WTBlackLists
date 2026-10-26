@@ -99,14 +99,14 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 **源码不再另外打包**(源码就在本仓库, 1.0 版见 `1.0` 分支)。
 
 > **跑图线路测试器是另一个独立程序**, 已单独发布在
-> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.3.0**),
+> [Virream/WTRouteTester](https://github.com/Virream/WTRouteTester)(当前 **v1.3.1**),
 > 代码与它自己的文档都在那个仓库里, **本仓库不再包含它**。
 > 两者只是共用 8111 的调用封装(`wt81111g/api8111.py`)与地图/战区缓存格式。
 > 能力概览: 单条线路录制(8111 实况, 速度配色 / 时间标记 / 转弯半径)、
 > **从回放文件解析整局**(本地 `.wrpl` 或服务器回放分片文件夹, 一次解出两队全部地面单位,
 > 自带战斗时钟、无需对轴)、侧栏三层分组(地图 → 模式 → 线路, 基准锁定同图同模式)、
 > 地图身份(图片哈希 + 可逆的回放关卡代号)与**地图校准**、机场跑道示意(两队长条/直升机坪方块)、
-> 录制叠加层。
+> **GPU 渲染(可在设置里指定用哪块显卡, 用不了会弹窗说明原因)**、录制叠加层。
 
 运行后会在可写目录自动创建 `data\blacklist.json` 与 `evidences\` 文件夹;
 若安装到受保护的 Program Files 目录, 数据会自动改存到 `%LOCALAPPDATA%\WTBlackList`。

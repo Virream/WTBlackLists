@@ -53,6 +53,9 @@ $manifest = @(
     "tools\probe_tree_scale.py",
     "tools\probe_import_parallel.py",
     "tools\probe_points_speed.py",
+    # 显卡: 能不能用 GPU 画布 / 能不能指定某一块(用户报"卡"时先跑这两个)
+    "tools\probe_gpu_caps.py",
+    "tools\probe_pick_adapter.py",
     # 回放(.wrpl)解析探针: 自研解析器, 不依赖任何外部工具
     "tools\wrpl\probe_wrpl.py",
     "tools\wrpl\probe_signatures.py",
