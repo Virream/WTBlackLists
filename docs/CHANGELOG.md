@@ -4,6 +4,130 @@
 
 > 主题: 战区图标压在线上看不见 + 把机场跑道画出来 + **修 1.3.0 起的卡顿**。
 
+### 新增: 「设置 → 图形」—— 可以指定显卡了, 显卡用不了会弹窗告诉你(用户 2026-10-27)
+
+**先定用户画像**(用户 2026-10-27 明确, 以后不用再讨论):
+
+| 项 | 结论 |
+|---|---|
+| 操作系统 | **只支持 Windows 桌面**。macOS 不做 —— 用 macOS 的人不需要这个工具(本来也从未支持过) |
+| 显卡 | 2012 年之后的卡(DX12 那一代); 再早的驱动早已停更, 不提供支持 |
+| 远程桌面 / 云电脑 / 虚拟机 | **明确不支持**(反作弊本身就过不去) |
+| 兜底 | **仍然保留**, 而且有两条: 软件绘制(QPainter) 与 WARP |
+
+**关键发现: "支持率百分之几"这种数字给不出来, 也不该按年份判。**
+程序里唯一可靠的判据是适配器支不支持 **`float32-filterable`** —— 那是 pygfx 在
+import 时就写死的 `required_features`, 拿不到的适配器**根本建不出 device**。
+所以老显卡不是"按年份拒绝", 而是"建 device 时失败 → 弹窗让用户更新驱动"。
+
+**另一个关键发现: 没显卡时 wgpu 照样"成功"。** 本机实测枚举到 4 块适配器:
+
+```
+[1] NVIDIA GeForce RTX 3060 Laptop GPU (DiscreteGPU) via Vulkan     float32-filterable ✅
+[2] NVIDIA GeForce RTX 3060 Laptop GPU (DiscreteGPU) via D3D12      float32-filterable ✅
+[3] Microsoft Basic Render Driver (CPU) via D3D12                   float32-filterable ✅  ← WARP
+[4] NVIDIA GeForce RTX 3060 Laptop GPU/PCIe/SSE2 via OpenGL         float32-filterable ✅
+```
+
+第 3 块是 Windows 的 **WARP**(D3D12 的 CPU 光栅化), 它**也满足** pygfx 的硬要求、
+**也能跑起来** —— 只是比 QPainter 还慢。所以判"有没有显卡"必须看
+`info["adapter_type"] == "CPU"`, 不能只看"拿到了适配器没有"。
+
+**能不能"自由指定显卡"? 能, 已实测。** pygfx 的 device 是全局单例
+(`Shared._instance` 里还有 `assert ... is None`), 但 wgpu 官方留了注入口:
+
+```python
+wgpu.preconfigure_default_device("wt81111g", adapter=选中的那块)
+# 之后再 gfx.WgpuRenderer(canvas) → 用的就是它
+```
+
+实测(`tools/probe_pick_adapter.py`, 逐块验证):
+
+| 目标 | `preconfigure_default_device` | pygfx 实际用的 | 渲染一帧并读回像素 |
+|---|---|---|---|
+| `Microsoft Basic Render Driver (CPU) via D3D12` | ✅ | ✅ 就是它 | ✅ ndarray |
+| `NVIDIA RTX 3060 Laptop (DiscreteGPU) via D3D12` | ✅ | ✅ 就是它 | ✅ ndarray |
+
+⚠ 三条硬约束(写在 `route_map_gl.py` 的注释里):
+
+1. 只能在**第一次**建 renderer 之前调 —— device 建好后再调是 `RuntimeError`。
+   所以"改设置"只能**存起来 + 提示重启**, 不能热切换(菜单里明写了这一条);
+2. 不用 `PYGFX_WGPU_ADAPTER_NAME` 环境变量: 它找不到适配器时会让 pygfx
+   **在 import 时就抛 ValueError**(整个模块炸), 一律走 API;
+3. 判"有没有显卡"看 `adapter_type`(见上)。
+
+**菜单长这样**:
+
+```
+设置 → 图形
+    [✓] 自动选择(推荐)            ← 只认真显卡, 优先 D3D12 → Vulkan → OpenGL
+        NVIDIA GeForce RTX 3060 Laptop GPU (D3D12)
+        NVIDIA GeForce RTX 3060 Laptop GPU (Vulkan)
+        Microsoft Basic Render Driver (D3D12)   ← 标"软件模拟, 很慢", 只在排查时选
+    ─────────
+    [ ] 强制软件绘制(不用 GPU, 最慢但最保险)
+        当前用的渲染方式…
+```
+
+* **自动模式永远不选 WARP**(它比软件绘制还慢); 但**用户显式选它就照办** ——
+  这是"我知道会很慢, 我要试试"的入口;
+* 指定的卡如果已经不存在了(换驱动/拔了显卡/换机器) → 自动回退 + 一条提示,
+  **不瘫**;
+* 「当前用的渲染方式…」把**本次实际**用了哪块卡、本机枚举到哪些适配器全列出来 ——
+  用户报"卡"时让他点这里, 一眼分出"走了 WARP / 走了软件绘制 / 显卡正常但卡在别处"。
+
+**以前是静默回退软件渲染**, 用户只会觉得"为什么这么卡", 完全不知道原因。现在分类弹窗:
+
+| 情形 | 弹窗标题 | 建议 |
+|---|---|---|
+| 枚举不到非 CPU 适配器 | 没有找到可用的显卡 | 更新显卡驱动 |
+| 枚举时抛异常 | 无法访问显卡 | 更新显卡驱动(附技术细节) |
+| 建 device 失败 | 显卡初始化失败 | 换一块显卡或更新驱动 |
+| 建渲染窗口失败 | 显卡能识别, 但画不出来 | 多半驱动太旧 |
+| 指定的卡没了 | 指定的显卡换了 | (只提示, 程序照常用 GPU) |
+| GPU 组件加载失败 | GPU 加速组件缺失 | 打包漏了 wgpu DLL 时用 |
+
+**崩溃回退(应对抓不住的 Rust panic)**: wgpu 配置 surface 失败会在 **Rust 层 panic**,
+`try/except` 抓不住, 而打包版是 `--windowed`(无控制台) —— 用户看到的就是"闪退"。
+现在启动时先留一个 `gfx_pending=1` 的标记并 `sync()` 落盘, 画布**活过 4 秒**才抹掉
+(panic 常发生在渲染头几帧, 那一刻之前的代码都已经"成功返回"了);
+下次启动发现标记还在 ⇒ 判上次崩了 ⇒ **自动改软件绘制 + 持久化 + 弹窗说明**。
+用户修好驱动后到「设置 → 图形」取消「强制软件绘制」就能再试一次。
+
+**顺手修了一个测试污染**: `RouteTesterWindow` 的 `QSettings` 以前写死
+`QSettings("WTBlackList", "RouteTester")`, 于是**跑一遍测试就会改掉用户真实的
+轮询间隔/显示开关**(而且新增的崩溃标记会让测试把用户的设置改成"强制软件绘制")。
+现在 `QSettings` 可注入, `make_window()` 一律指向临时 ini —— `test_dead_style`
+也从"读真实设置"改成读同一个临时文件。
+
+**落地的代码**:
+
+* `wt81111g/gfx_info.py`(新) —— **纯数据**, 不 import wgpu 所以谁都能顶层导入:
+  `AdapterOption` / `GpuNotice` / `adapter_option()` / `enumerate_adapters()` /
+  `gpu_usable()` / `PREF_AUTO` / `PREF_SOFTWARE` / `PYGFX_REQUIRED`;
+* `wt81111g/route_map_gl.py` —— `create_map_view(parent, prefer=…, force_software=…)`,
+  内部 `_pick_adapter()` 按设置挑卡并注入; 返回值上挂 `gpu_notice`(该弹的窗)与
+  `gpu_adapter`(实际用的哪块);
+* `wt81111g/route_window.py` —— 「设置 → 图形」菜单、`_on_pick_adapter()` /
+  `_show_gfx_info()` / `_show_gpu_notice()` / `_clear_gfx_pending()`;
+  设置项 `gfx_adapter` / `gfx_software` / `gfx_pending`;
+* `wt81111g/help_text.py` —— 关于页新增「显卡与渲染(设置 → 图形)」一节,
+  把支持范围、菜单用法、"启动时的显卡提示是什么意思"全写进去;
+* 探针: `tools/probe_gpu_caps.py`(每块适配器支不支持 float32-filterable + 能否建
+  device)、`tools/probe_pick_adapter.py`(指定适配器能不能真的生效)。
+
+**注意「本次生效」与「下次生效」是两个值**: `_gfx_prefer/_gfx_software` 是**本次**
+真正在用的(菜单勾选、崩溃标记都看它), `_gfx_prefer_saved/_gfx_software_saved` 才是
+存进设置的值。混成一个的话, 用户改完设置还没重启时 `_clear_gfx_pending` 会以为
+走的是软件渲染、不去抹崩溃标记, 下次启动就会被误判成"上次崩了"。
+
+58 + 30 项测试全过, 新增 `test_gfx_settings`: 适配器折叠成选项(真显卡/WARP/老版
+只给属性的 API)、**自动模式不选 WARP**、只有 WARP 时按"没有显卡"处理(抛
+`LookupError`)、显式选了 WARP 就照办、指定的卡不存在时回退并返回说明、
+`force_software` 时 `gpu_notice` 必须为空(是他自己选的, 别打扰)、
+崩溃标记 → 强制软件 + 落盘 + 弹窗 + 菜单勾在「强制软件绘制」上、
+改设置会清掉崩溃标记(让下次真的去试)、选同一个值不写盘、枚举本身不抛。
+
 ### 重构: 存储改成一局一个二进制会话文件(为 500~600 局准备, 用户 2026-10-26)
 
 **先把账算清**。实测一局服务器回放约 **80 万点、217 条线**, 于是 500 局 = **4 亿点**:

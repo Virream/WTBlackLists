@@ -58,7 +58,10 @@ WTRTI/
 /tools/probe_tree_scale.py
 /tools/probe_import_parallel.py
 /tools/probe_points_speed.py
+/tools/probe_gpu_caps.py
+/tools/probe_pick_adapter.py
 /tools/probe_split_sam.py
+/wt81111g/gfx_info.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
 /wt81111g/help_text.py
