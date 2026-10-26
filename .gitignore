@@ -54,6 +54,8 @@ WTRTI/
 /tools/make_app_icon.py
 /tools/probe_map_quality.py
 /tools/probe_map_upscale.py
+/tools/probe_store_v2.py
+/tools/probe_tree_scale.py
 /tools/probe_split_sam.py
 /wt81111g/global_hotkey.py
 /wt81111g/global_record.py
@@ -71,6 +73,7 @@ WTRTI/
 /wt81111g/route_playback.py
 /wt81111g/route_recorder.py
 /wt81111g/route_store.py
+/wt81111g/session_store.py
 /wt81111g/route_window.py
 /wt81111g/sound.py
 /wt81111g/sound_dialog.py

@@ -49,6 +49,8 @@ $manifest = @(
     "tools\probe_map_quality.py",
     "tools\probe_map_zoom.py",
     "tools\probe_map_upscale.py",
+    "tools\probe_store_v2.py",
+    "tools\probe_tree_scale.py",
     # 回放(.wrpl)解析探针: 自研解析器, 不依赖任何外部工具
     "tools\wrpl\probe_wrpl.py",
     "tools\wrpl\probe_signatures.py",
@@ -135,6 +137,7 @@ $manifest = @(
     "wt81111g\route_playback.py",
     "wt81111g\route_recorder.py",
     "wt81111g\route_store.py",
+    "wt81111g\session_store.py",
     "wt81111g\route_window.py",
     "wt81111g\sound.py",
     "wt81111g\sound_dialog.py",
