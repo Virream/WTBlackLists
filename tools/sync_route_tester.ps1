@@ -45,6 +45,7 @@ $manifest = @(
     "tools\probe_frame_align.py",
     "tools\probe_turn_radius.py",
     "tools\probe_map_quality.py",
+    "tools\probe_map_zoom.py",
     "tools\probe_map_upscale.py",
     # 回放(.wrpl)解析探针: 自研解析器, 不依赖任何外部工具
     "tools\wrpl\probe_wrpl.py",
