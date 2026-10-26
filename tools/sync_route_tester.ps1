@@ -37,6 +37,8 @@ $manifest = @(
     "docs\跑图线路测试器.md",
     "docs\WTRouteTester-FEATURES.md",
     "docs\8111使用经验.md",
+    # 「回放能解析出什么」速查表 —— 动手凿 .wrpl 前先看这个
+    "docs\回放能解析什么.md",
     # 诊断/辅助工具
     "tools\make_app_icon.py",
     "tools\route_map_gl_demo.py",
