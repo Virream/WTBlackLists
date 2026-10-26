@@ -4,6 +4,59 @@
 
 > 主题: 用**回放文件**代替 A/B 两次实况录制。
 
+### 修: 同图同模式的「轨迹 + 全局线路」混选会被打掉一半(用户 2026-10-26)
+
+侧栏改成三层之后, 分组口径是 `(地图键, 模式名)`:
+
+```python
+def _group_of(self, rec):        # 单条轨迹
+    return (self.store.canon(rec.map_key or ""), rec.mode_label or "")
+```
+
+但**可播放线路**(单条轨迹 + 全局线路)那条 `_playable_group()` 漏改了 ——
+全局线路分支还返回四层树时代的“版本指纹”:
+
+```python
+return (g.map_key or "", g.zone_signature or "")      # ← 旧语义
+```
+
+于是同一张图、同一个模式下:
+
+| 选中 | `_playable_group` |
+|---|---|
+| 单条轨迹 | `("c59f768c0fde", "战区控制")` |
+| 全局线路(`UnitLife`) | `("c59f768c0fde", "A@0.3838,0.3873;B@…")` |
+
+两者**永远不相等** ⇒ 混选时被判成“跨分组”, 一半选中被默默取消, 状态栏还弹
+“同一张地图的同一版本才能一起回放”。附带后果: `_anchor` 被设成
+`(原始 map_key, 战区指纹)`, 而 `_refresh_anchor_icon_in()` 拿 `(canon(key), 模式名)`
+去比 → **图钉永远标不到模式行上**。
+
+改成跟单条轨迹同一口径(`canon` 过的地图键 + `GlobalRecord.mode_label`),
+顺手把散落的“版本”措辞统一成“模式”:
+
+```python
+if isinstance(r, RouteRecord):
+    return self._group_of(r)
+for g in self.store.globals:                       # UnitLife 只有 map_key,
+    if ...:                                        # 模式在所属全局条目上
+        return (self.store.canon(g.map_key or ""), g.mode_label or "")
+```
+
+另外「显示本模式全部轨迹」在地图行上点的时候没优先跟基准(直接取 `groups[0]`),
+现在与 `_show_all_tracks` 一致: **基准在就只用基准那个分组**。
+
+**验证**: 新增 `test_selection_group_mix`(**48 项**):
+
+```
+_group_of(轨迹) == _playable_group(全局线路) == (key_a, "战区控制")
+选中「轨迹 + 全局线路」          → 两条都在, 状态栏没有“已只保留”
+再 Ctrl 点别的地图的轨迹         → 只取消那一条, 基准那组不动
+图钉行                          = {(key_a, "战区控制")}   ← 只有模式行带图钉
+```
+
+`tests/global_record_test.py` 30 项同步回归通过。
+
 ### 改: 启动时的「同图不同分辨率」合并判得更严了(用户 2026-10-26)
 
 8111 同一个关卡会以 1024²/2048²/4096² 不同分辨率发底图(实测), 按字节哈希当地图身份
