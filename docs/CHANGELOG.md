@@ -103,9 +103,13 @@ GIL 把线程挡死了, 所以只有**多进程**才是真并行; 而按局又�
 * **打包版硬要求 `multiprocessing.freeze_support()`**: 已加在 `route_tester.py` 的
   `__main__` 第一行 —— 没它的话每个子进程都会把 `main()` 重跑一遍(开一堆窗口)。
 
-验证: `tests/route_tester_test.py` **53 项**(新增 `test_adopt_and_import_pool`:
-接管子进程写好的会话文件 / 临时文件被挪走不留垃圾 / 坏文件返回 None 不炸 /
-地图名与已知地图登记上 / 重启后还在 / 并行度 / 发号 / 校准表按关卡代号也能展开)。
+验证: `tests/route_tester_test.py` **54 项**, 新增两条:
+
+* `test_adopt_and_import_pool` —— 接管子进程写好的会话文件 / 临时文件被**挪走**
+  (不是复制) / 坏文件返回 `None` 不炸 / 地图名与已知地图登记上 / 重启后还在 /
+  并行度 / 发号 / 校准表按关卡代号也能展开;
+* `test_import_wiring` —— 两局以上**真的走并行分支**、单局仍走串行、`expect_server`
+  透传、失败照常汇总(把 `import_many` 换成假的测接线 —— 那段代码平时没机会被执行到)。
 真正的加速比要拿真回放量: `python tools\probe_import_parallel.py <路径…>`
 —— 它会先串行跑一遍、再并行跑一遍, 对比总耗时并校验两条路径的产物完全一致。
 ⚠ 探针**要求你在命令行上手写路径**, 不会去扫游戏目录(那是禁止的)。
