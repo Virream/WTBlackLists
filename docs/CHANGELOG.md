@@ -138,6 +138,38 @@ def canon(self, map_key):
 
 `route_tester_test.py` 46 项 + `global_record_test.py` 30 项全绿。
 
+### 改: 「可选」下拉框里被别的图占走的关卡代号变灰不可选(用户 2026-10-26)
+
+先做的是**直接从列表里移除**, 用户当场否掉:
+
+> "直接移除也会让用户感到疑惑, 改成被其他的选项使用后在另一个选项中选择时
+> 已被其他选项使用的标签变灰不可选择"
+
+现在的行为:
+
+```
+条目 A(芬兰)     可选: [未选择 / avg_finland(已选) / avg_netherlands]
+条目 B(荷兰)     可选: [未选择 / avg_finland ← 灰的, 点不了 / avg_netherlands]
+                         悬停: 已经被「芬兰」用了 —— 一个关卡代号只能归一张图
+```
+
+* 实现: `QComboBox` 换成显式的 `QStandardItemModel`,
+  被占用的项 `setEnabled(False)` —— Qt 自己会画成灰的(主题自适应, 不用手动调色),
+  鼠标点不动、键盘上下也会跳过;
+* 本行**自己**选着的那个永远可用(否则就改不掉了);
+* 关联一变 `_refresh_level_choices()` 只改**其它行**对应项的 `enabled`/tooltip,
+  不重建 model: 不抢焦点、不丢当前选中、不覆盖底部提示。
+
+**验证**(`probe_map_link.py` 第 9 组, 两张图):
+
+```
+别人占的代号**仍然列出来**(不藏)      items = ['', 'avg_finland', 'avg_netherlands']
+但它是灰的、点不了                    isEnabled = False
+提示里写明被谁用了                    '已经被「芬兰」用了 —— …'
+另一行选走 avg_netherlands 后, 本行里它立刻变灰
+解除后本行又能选了
+```
+
 ### 修: 「▶ 回放」一直是灰的 + 侧栏层级(地图名 / 模式名)不对(用户 2026-10-26)
 
 **① 播放按钮灰着不能点。** 启动时 `store` 是空的 ⇒ `_update_buttons()` 算出
