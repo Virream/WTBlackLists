@@ -39,6 +39,8 @@ $manifest = @(
     "docs\8111使用经验.md",
     # 「回放能解析出什么」速查表 —— 动手凿 .wrpl 前先看这个
     "docs\回放能解析什么.md",
+    # .wrpl 格式调研与实测结论(§2.6 出生包查证 / §2.7 位置流是硬事实)
+    "docs\录像解析调研.md",
     # 诊断/辅助工具
     "tools\make_app_icon.py",
     "tools\route_map_gl_demo.py",

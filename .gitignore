@@ -42,8 +42,9 @@ WTRTI/
 /tests/global_record_test.py
 /docs/跑图线路测试器.md
 /docs/WTRouteTester-FEATURES.md
-# 「.wrpl 能解析出什么」速查表 —— 只服务跑图线路测试器
+# 「.wrpl 能解析出什么」速查表 + 格式调研 —— 只服务跑图线路测试器
 /docs/回放能解析什么.md
+/docs/录像解析调研.md
 /tools/route_map_gl_demo.py
 /tools/wrpl/
 /tools/probe_playback_stutter.py
