@@ -127,6 +127,8 @@ $manifest = @(
     "tools\wrpl\probe_playback.py",
     "tools\wrpl\probe_playback_ui.py",
     "tools\wrpl\probe_play_button.py",
+    # 「出生/部署事件包」普查: MPI 报文 id 分布 + 真报文头/假签名区分(见 docs/录像解析调研.md §2.6)
+    "tools\wrpl\probe_mpi_sigs.py",
     # 源码模块(黑名单不用, 只在跑图测试器里)
     "wt81111g\gfx_info.py",
     "wt81111g\global_hotkey.py",
