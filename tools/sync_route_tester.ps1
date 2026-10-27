@@ -156,6 +156,7 @@ $manifest = @(
     "wt81111g\wrpl_events.py",
     "wt81111g\wrpl_air.py",
     "wt81111g\wrpl_entities.py",
+    "wt81111g\wrpl_results.py",
     "wt81111g\replay_import.py",
     "wt81111g\map_calib.py",
     "wt81111g\calib_capture.py",
