@@ -55,6 +55,8 @@ $manifest = @(
     "tools\probe_tree_scale.py",
     "tools\probe_import_parallel.py",
     "tools\probe_points_speed.py",
+    # 选轮询间隔: 模拟"8111 每帧才更新"与游戏帧率的对拍(采到率 / 点间隔抖动)
+    "tools\probe_poll_alias.py",
     # 路线解析质量基线: 改切段逻辑前后对比用(阵营/条数/瞬移/残骸/空名)
     "tools\probe_route_quality.py",
     # 显卡: 能不能用 GPU 画布 / 能不能指定某一块(用户报"卡"时先跑这两个)
