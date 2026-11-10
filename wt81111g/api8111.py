@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 
 import requests
 
@@ -12,17 +14,97 @@ from .config import WT_BASE_URL
 # 误判成“没回答”。
 _TIMEOUT = 2.0
 
+# 请求优先级(数字越小越优先):
+#   0 = 关键 —— 录制轮询(单条/全局的主循环), **永远不避让**;
+#   1 = 普通 —— 状态探测、hudmsg、聊天等;
+#   2 = 可等待 —— 整张地图图片、校准采集这类又大又不急的请求。
+PRIO_KEY, PRIO_NORMAL, PRIO_IDLE = 0, 1, 2
+
+
+class _Hub:
+    """8111 请求的统一闸门 —— **关键请求(录制轮询)优先**。
+
+    8111 是单线程服务: 谁先到谁先被处理。以前三个模块(录制 / 地图图片 / 校准采集)
+    各发各的, 一张几百 KB 的地图图片或一次校准采集插进录制那一帧, 就能把那次 tick
+    从 5 ms 拖到几十毫秒 —— 表现出来就是“点数率莫名掉一截”。
+
+    这里只做两件事:
+      1. 记住“关键轮询”的节奏(`mark_key`);
+      2. 低优先级请求**先等一等**, 尽量落在两次关键请求之间的空隙里。
+
+    只在本进程内生效; 两个程序同时开时的互相抢占没法从这里协调
+    (见 `docs/8111使用经验.md` §4.3)。
+    """
+
+    def __init__(self) -> None:
+        self.period = 0.0          # 关键轮询周期(秒); 0 = 录制器没在跑
+        self.last_key = 0.0        # 上一次关键请求的时刻(monotonic)
+        self.keys = 0
+        self.stats: dict[str, list] = {}    # path -> [次数, 累计耗时 ms, 最近一次 ms]
+
+    def mark_key(self, period: float | None = None) -> None:
+        """录制主循环每帧调用一次。"""
+        if period is not None:
+            self.period = max(0.0, float(period))
+        self.last_key = time.monotonic()
+        self.keys += 1
+
+    def yield_slot(self, priority: int) -> None:
+        """低优先级请求避让: 等到关键帧之后的空隙。"""
+        if priority <= PRIO_KEY or self.period <= 0.0:
+            return
+        slot = self.last_key + self.period * 0.35
+        now = time.monotonic()
+        if now < slot:
+            # 最多等一个周期, 避免低优先级请求被饿死
+            time.sleep(min(slot - now, self.period))
+
+    def note(self, path: str, ms: float) -> None:
+        row = self.stats.get(path)
+        if row is None:
+            self.stats[path] = [1, ms, ms]
+        else:
+            row[0] += 1
+            row[1] += ms
+            row[2] = ms
+
+    def summary(self) -> str:
+        """一行统计(调试/日志用)。"""
+        items = sorted(self.stats.items(), key=lambda kv: -kv[1][1])
+        return "; ".join(f"{p}×{v[0]} 均{v[1] / v[0]:.1f}ms" for p, v in items[:6])
+
+
+_HUB = _Hub()
+
+
+def hub() -> _Hub:
+    """取进程级闸门(拿它调 `mark_key` 或读统计)。"""
+    return _HUB
+
 
 class WT8111:
-    """封装对 8111 本地接口(127.0.0.1:8111)的 HTTP 请求(全部端点)。"""
+    """封装对 8111 本地接口(127.0.0.1:8111)的 HTTP 请求(全部端点)。
 
-    def __init__(self, base_url: str = WT_BASE_URL, timeout: float = _TIMEOUT):
+    `priority` 是这个实例的默认优先级(见 `PRIO_*`), 单次调用也能覆盖。
+    """
+
+    def __init__(self, base_url: str = WT_BASE_URL, timeout: float = _TIMEOUT,
+                 priority: int = PRIO_NORMAL):
         self.base = base_url.rstrip("/")
         self.timeout = timeout
+        self.priority = int(priority)
         self.session = requests.Session()
+        # 诊断用: 累计经 `get()` 发出的请求数。录制循环取帧内增量, 判断
+        # “一帧到底发了几个请求”(见 route_recorder._diag_add)。
+        self.req_count = 0
 
-    def get(self, path: str, params: dict | None = None, timeout: float | None = None):
+    def get(self, path: str, params: dict | None = None, timeout: float | None = None,
+            priority: int | None = None):
         url = self.base + path
+        pri = self.priority if priority is None else int(priority)
+        _HUB.yield_slot(pri)                # 低优先级的先让开录制那一帧
+        self.req_count += 1                 # 诊断计数(见 __init__)
+        t0 = time.perf_counter()
         try:
             resp = self.session.get(url, params=params, timeout=timeout or self.timeout)
             resp.raise_for_status()
@@ -32,6 +114,8 @@ class WT8111:
             # 关掉连接池后下一次请求会重新建连, 立刻恢复。
             self.session.close()
             raise
+        finally:
+            _HUB.note(path, (time.perf_counter() - t0) * 1000.0)
         text = resp.text.strip()
         if not text:
             return None
@@ -122,6 +206,8 @@ class WT8111:
         `/map.img` 可能要好几秒才回应, 把它当成“不在地图里”会误判回车库。
         """
         try:
+            _HUB.yield_slot(self.priority)      # 整张图很重, 让开录制那一帧
+            t0 = time.perf_counter()
             resp = self.session.get(self.base + "/map.img", timeout=timeout or self.timeout,
                                     stream=bool(limit))
             resp.raise_for_status()
@@ -135,6 +221,7 @@ class WT8111:
                 data = bytes(buf)
             else:
                 data = resp.content or b""
+            _HUB.note("/map.img", (time.perf_counter() - t0) * 1000.0)
         except requests.RequestException:
             self.session.close()    # 见 get(): 丢掉可能已经死掉的连接
             if raise_on_error:
