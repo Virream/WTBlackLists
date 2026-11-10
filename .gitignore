@@ -47,6 +47,8 @@ WTRTI/
 /docs/录像解析调研.md
 # 赛道检查点(计时门)的想法与设计草案 —— 同样只属于跑图线路测试器
 /docs/赛道检查点设想.md
+# statshark 回放查看器的调查记录 —— 同上
+/docs/statshark回放器调查.md
 /tools/route_map_gl_demo.py
 /tools/wrpl/
 /tools/probe_playback_stutter.py

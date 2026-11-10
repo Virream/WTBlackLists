@@ -43,6 +43,8 @@ $manifest = @(
     "docs\录像解析调研.md",
     # 赛道检查点(计时门)的想法与设计草案 —— 用户 2026-11-10 提出, 未实现
     "docs\赛道检查点设想.md",
+    # statshark 回放查看器的调查记录(服务端解析 / schema / 资产 / 出生阵亡口径)
+    "docs\statshark回放器调查.md",
     # 诊断/辅助工具
     "tools\make_app_icon.py",
     "tools\route_map_gl_demo.py",
